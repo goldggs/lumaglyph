@@ -1,6 +1,6 @@
 [package]
 name = "lumaglyph"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 rust-version = "1.75"
 description = "High-throughput 95-character color ASCII art and streaming video workstation"

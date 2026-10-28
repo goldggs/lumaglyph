@@ -218,7 +218,7 @@ console_attach_tests! {
     win_cli_version_short => (&["lumaglyph.exe", "-V"], true),
     win_cli_version_long => (&["lumaglyph.exe", "--version"], true),
     win_cli_studio_help => (&["lumaglyph.exe", "studio", "--help"], true),
-    win_cli_image_subcmd => (&["lumaglyph.exe", "image", "sample:cyber"], true),
+    win_cli_image_subcmd => (&["lumaglyph.exe", "image", "input.png"], true),
     win_cli_video_subcmd => (&["lumaglyph.exe", "video", "in.mp4", "-o", "out.mp4"], true),
     win_cli_bench_subcmd => (&["lumaglyph.exe", "bench"], true),
     win_cli_build_info => (&["lumaglyph.exe", "build-info"], true),
@@ -249,14 +249,16 @@ clap_parse_tests! {
         "--oled-black", "--black-gate", "0.05", "--split", "0.4", "--zoom", "1.5"
     ], true),
     clap_image_full => (&[
-        "lumaglyph", "image", "sample:cyber", "-o", "out.png", "--cols", "160",
+        "lumaglyph", "image", "input.png", "-o", "out.png", "--cols", "160",
         "--charset", "genuine95", "--color", "tritone", "--tritone", "tokyo",
         "--oled-black", "--bloom", "--scanlines"
     ], true),
     clap_image_wireframe_alpha => (&[
-        "lumaglyph", "image", "sample:orbs", "-o", "out.svg", "--transparent",
+        "lumaglyph", "image", "input.png", "-o", "out.svg", "--transparent",
         "--wireframe", "--wireframe-sens", "1.4"
     ], true),
+    clap_reject_removed_studio_preset_flag => (&["lumaglyph", "studio", "--preset", "cyber"], false),
+    clap_reject_removed_studio_live_flag => (&["lumaglyph", "studio", "--live-motion"], false),
     clap_video_full => (&[
         "lumaglyph", "video", "in.mp4", "-o", "out.webm", "--cols", "140", "--fps", "30",
         "--transparent", "--wireframe", "--audio-reactive", "1.2", "--stability", "0.2"

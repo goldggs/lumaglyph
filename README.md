@@ -8,14 +8,22 @@
 
 Unlike basic 10-character brightness ramps (`@%#*+=-:. `), **LumaGlyph** treats every printable 7-bit ASCII glyph (`0x20..=0x7E`) as 2D geometry. Each font is dynamically calibrated into 32-byte-aligned **8D shape + structure-tensor orientation vectors**, locking `/ \ | _ ( ) [ ] < > ^ ~ , ' ; ! ? $ & % W M # @` directly onto curves, diagonals, silhouettes, and tonal gradients at **500+ FPS** (`< 2 ms/frame`) and **`~7-9 MB` CLI RSS**.
 
-![LumaGlyph Pro Grading Suite Workstation (Graphite Pro)](docs/screenshots/v030-studio-graphite.png)
+![LumaGlyph v0.3.2 — Clean Default Empty Workstation](docs/screenshots/v032-default-empty.png)
 
 ---
 
-## New in `v0.3.1` — Single-Window Windows Subsystem, 8-Layer Verified Updater & 1,229 Tests
+## New in `v0.3.2` — Clean Default Empty Workstation
+
+- **Pure Empty Default Startup (Zero Preloaded Samples):**
+  - Launching `lumaglyph` opens directly into a clean, blank calibrated workstation (`SourceKind::Empty`) with zero synthetic demo plates, zero sample menus, zero idle CPU usage, and zero pre-allocated frame textures (`~32 MB` GPU workstation RSS at idle).
+  - Open media via **Open Image** (`Ctrl+O`), **Open Video** (`Ctrl+Shift+O`), OS **drag-and-drop** (images, videos, or `.ttf`/`.otf` fonts), or pass a path directly (`lumaglyph photo.png`). Press `Ctrl+W` (**File -> Close Media**) at any time to release buffers and return to the empty canvas, and toggle **Split-Wipe** (`W`) on demand when comparing against source media.
+
+---
+
+## `v0.3.1` Highlights — Single-Window Windows Subsystem, 8-Layer Verified Updater & 1,232 Tests
 
 - **Standalone Single-App Windows GUI (`IMAGE_SUBSYSTEM_WINDOWS_GUI`):**
-  - Windows `lumaglyph.exe` is compiled under `windows_subsystem = "windows"` (`PE Optional Header Subsystem == 2`, verified automatically in CI and Release builds) so double-clicking `lumaglyph.exe` opens **only** the native GPU workstation with **zero attached console/terminal window**.
+  - Windows `lumaglyph.exe` is compiled under `windows_subsystem = "windows"` (`PE Optional Header Subsystem == 2`, verified automatically in CI and Release builds) so launching `lumaglyph.exe` opens **only** the native GPU workstation with **zero attached console/terminal window**.
   - Headless CLI subcommands (`image`, `video`, `bench`, `look`, `build-info`, `check-update`) remain inside the same single binary: when invoked from an existing PowerShell / `cmd.exe` / Windows Terminal session without pipe redirection, LumaGlyph attaches cleanly via `AttachConsole(ATTACH_PARENT_PROCESS)` and never calls `AllocConsole`. Background `ffmpeg` / `ffprobe` workers always spawn with `CREATE_NO_WINDOW` (`0x0800_0000`).
 - **8-Layer Cryptographically Verified Remote Release Checker & Downloader:**
   - Opt-in release checks and binary downloads (`Settings -> About & Build -> Download Verified Binary...` or `lumaglyph check-update --download`) enforce 8 independent defense layers before writing a single byte to disk:
@@ -27,12 +35,12 @@ Unlike basic 10-character brightness ramps (`@%#*+=-:. `), **LumaGlyph** treats 
     6. **Mandatory Constant-Time SHA-256 Verification Before Decompression:** Fetches `SHA256SUMS.txt` from the identical release tag and verifies the raw archive bytes in constant time prior to opening `tar.gz` or `zip`.
     7. **Anti-Bomb & Anti-Traversal In-Memory Extraction:** Blocks `TarSlip`/`ZipSlip` (`..`, `/`, `\`, drive prefixes), symlinks, hardlinks, device nodes, unexpected `.dll`/`.so`/`.sh`/`.bat` sidecars, duplicate-entry shadowing, and decompression bombs.
     8. **Native CPU Executable Header + Atomic Write Verification:** Inspects magic/machine/subsystem headers (`ELF64 x86_64`, `Mach-O 64-bit arm64/x86_64`, `PE32+ AMD64 WINDOWS_GUI`) and commits via `.part` + `File::sync_all()` + atomic `fs::rename`.
-- **1,229 Automated Corner-to-Corner Tests (`cargo test --release`):**
-  - 7 integration and deterministic splitmix64 fuzz suites (`1,229` `#[test]` functions completing in `~3.2s`) covering URL/redirect/SHA-256/archive/PE-header fault injection against live loopback HTTP mock servers, all 95 ASCII shape vectors across 18 atlas heights, all 9 color modes, `lg2:` Look Code fuzzing (`NaN`/`inf`/UTF-8 boundaries), all 90 theme x accent x corner WCAG contrast combinations, exporters, and streaming `ffmpeg` E2E transcoding.
+- **1,232 Automated Corner-to-Corner Tests (`cargo test --release`):**
+  - 7 integration and deterministic splitmix64 fuzz suites (`1,232` `#[test]` functions completing in `~3.2s`) covering URL/redirect/SHA-256/archive/PE-header fault injection against live loopback HTTP mock servers, empty-canvas & zero-sample GUI invariants, all 95 ASCII shape vectors across 18 atlas heights, all 9 color modes, `lg2:` Look Code fuzzing (`NaN`/`inf`/UTF-8 boundaries), all 90 theme x accent x corner WCAG contrast combinations, exporters, and streaming `ffmpeg` E2E transcoding.
 
 ---
 
-## Pro Grading Suite Workstation (`v0.3.0+`)
+## Pro Grading Suite Workstation
 
 - **Calibrated Pro Grading Suite Chrome:**
   - Neutral matte `#141416` / `#1C1C1F` surfaces, tight `2px` precision geometry, `1px` low-contrast hairline rules, top menu + command strip, segmented `All | Color | Geometry | Output` inspector, and custom two-column scrub faders with double-click-to-reset.
@@ -49,8 +57,6 @@ Unlike basic 10-character brightness ramps (`@%#*+=-:. `), **LumaGlyph** treats 
 ![LumaGlyph Workstation Settings: Appearance & Themes](docs/screenshots/v030-settings-appearance.png)
 
 ![LumaGlyph Workstation Settings: About & Build Diagnostics (Carbon Tungsten)](docs/screenshots/v030-settings-about.png)
-
-![LumaGlyph Daylight Paper Light Editorial Theme](docs/screenshots/v030-studio-daylight.png)
 
 ---
 
@@ -71,11 +77,12 @@ Download prebuilt binaries for **Linux**, **macOS**, and **Windows** from [**Git
 
 ### Launch Native GPU Workstation
 ```bash
+# Opens clean empty default workstation:
 lumaglyph
-# Open media directly or select a workstation theme:
+
+# Or open an image or video directly on launch:
 lumaglyph photo.png
 lumaglyph studio clip.mp4 --theme tungsten
-lumaglyph studio --settings about
 ```
 
 ### Inspect Build Diagnostics & Verified Release Updates
@@ -109,7 +116,7 @@ lumaglyph video input.mp4 -o alpha_overlay.webm --cols 152 --transparent --wiref
 lumaglyph video input.mp4 -o alpha_overlay.mov  --cols 152 --transparent --wireframe
 ```
 
-### Run Benchmark & Full 1,229-Test Suite
+### Run Benchmark & Full 1,232-Test Suite
 ```bash
 lumaglyph bench --cols 180 --iters 200
 cargo test --release --locked

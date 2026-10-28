@@ -40,8 +40,6 @@ pub enum Commands {
     Studio {
         /// Optional image or video file to open on startup.
         file: Option<PathBuf>,
-        #[arg(long)]
-        preset: Option<String>,
         /// Apply a one-line shareable Look Code (`lg2:...`).
         #[arg(long)]
         look: Option<String>,
@@ -77,16 +75,14 @@ pub enum Commands {
         #[arg(long)]
         bloom: bool,
         #[arg(long)]
-        live_motion: bool,
-        #[arg(long)]
         show_updates: bool,
         #[arg(long, hide = true)]
         exit_after_frames: Option<u32>,
     },
     /// Convert an image (PNG/JPG/WebP/GIF/BMP) to 95-character ASCII (PNG/SVG/HTML/ANS/TXT or stdout).
     Image {
-        /// Input image path (or `sample:cyber`, `sample:synthwave`, `sample:orbs`).
-        input: String,
+        /// Input image file path (PNG, JPG, WebP, GIF, or BMP).
+        input: PathBuf,
         /// Output file (.png, .svg, .html, .ans, .txt). Prints TrueColor ANSI to stdout if omitted.
         #[arg(short, long)]
         output: Option<PathBuf>,
@@ -259,7 +255,6 @@ pub fn run_entry() -> Result<(), String> {
         }),
         Some(Commands::Studio {
             file,
-            preset,
             look,
             theme,
             settings,
@@ -275,7 +270,6 @@ pub fn run_entry() -> Result<(), String> {
             split,
             zoom,
             bloom,
-            live_motion,
             show_updates,
             exit_after_frames,
         }) => {
@@ -324,13 +318,6 @@ pub fn run_entry() -> Result<(), String> {
                 params.crt_bloom = true;
             }
 
-            let initial_preset = match preset.as_deref() {
-                Some("synthwave") => Some(SamplePreset::SynthwaveHorizon),
-                Some("orbs") => Some(SamplePreset::ChromaticSpheres),
-                Some("cyber") => Some(SamplePreset::CyberSculpture),
-                _ => None,
-            };
-
             let theme_override = theme.as_deref().and_then(StudioTheme::from_cli);
             let open_settings_tab = settings
                 .as_deref()
@@ -338,13 +325,11 @@ pub fn run_entry() -> Result<(), String> {
 
             launch_gui(GuiBootOptions {
                 initial_media: file,
-                initial_preset,
                 initial_params: Some(params),
                 theme_override,
                 open_settings_tab,
                 split_wipe: split,
                 initial_zoom: zoom,
-                live_motion,
                 show_update_modal: show_updates,
                 auto_exit_after_frames: exit_after_frames,
             })
@@ -368,20 +353,11 @@ pub fn run_entry() -> Result<(), String> {
             bloom,
             scanlines,
         }) => {
-            let (rgba, w, h) = if let Some(rest) = input.strip_prefix("sample:") {
-                let p = match rest {
-                    "synthwave" => SamplePreset::SynthwaveHorizon,
-                    "orbs" => SamplePreset::ChromaticSpheres,
-                    _ => SamplePreset::CyberSculpture,
-                };
-                (generate_sample_rgba(p, 1280, 800, 0.0), 1280, 800)
-            } else {
-                let img = image::open(&input)
-                    .map_err(|e| format!("Failed opening image '{input}': {e}"))?
-                    .to_rgba8();
-                let (w, h) = img.dimensions();
-                (img.into_raw(), w, h)
-            };
+            let img = image::open(&input)
+                .map_err(|e| format!("Failed opening image '{}': {e}", input.display()))?
+                .to_rgba8();
+            let (w, h) = img.dimensions();
+            let rgba = img.into_raw();
 
             let atlas = GlyphAtlas::default_embedded(20);
             let mut params = RenderParams::default();

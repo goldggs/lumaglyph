@@ -146,7 +146,7 @@ fn compiled_cli_binary_executes_headless_commands_cleanly() {
     let info_out = Command::new(bin).arg("build-info").output().unwrap();
     assert!(info_out.status.success());
     let info_str = String::from_utf8_lossy(&info_out.stdout);
-    assert!(info_str.contains("LumaGlyph v0.3.1"));
+    assert!(info_str.contains("LumaGlyph v0.3.2"));
 
     let look_out = Command::new(bin).arg("look").output().unwrap();
     assert!(look_out.status.success());
@@ -159,16 +159,25 @@ fn compiled_cli_binary_executes_headless_commands_cleanly() {
     assert!(bench_out.status.success());
 
     let dir = temp_vid_dir();
+    let in_png = dir.join("cli_in.png");
+    let mut img = image::RgbaImage::new(96, 64);
+    for (x, y, px) in img.enumerate_pixels_mut() {
+        *px = image::Rgba([(x * 2) as u8, (y * 3) as u8, ((x + y) * 2) as u8, 255]);
+    }
+    img.save(&in_png).unwrap();
+
+    // Built-in `sample:*` magic strings are no longer accepted; real files are required
+    let no_sample = Command::new(bin)
+        .args(["image", "sample:cyber"])
+        .output()
+        .unwrap();
+    assert!(!no_sample.status.success());
+
     let out_png = dir.join("cli_test.png");
     let img_out = Command::new(bin)
-        .args([
-            "image",
-            "sample:cyber",
-            "--cols",
-            "64",
-            "--oled-black",
-            "-o",
-        ])
+        .arg("image")
+        .arg(&in_png)
+        .args(["--cols", "64", "--oled-black", "-o"])
         .arg(&out_png)
         .output()
         .unwrap();

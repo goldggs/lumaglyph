@@ -5,7 +5,6 @@ use crate::export::{
     export_ansi, export_html, export_png, export_svg, export_txt, frame_to_ansi_string,
 };
 use crate::glyph_atlas::GlyphAtlas;
-use crate::samples::{generate_sample_rgba, SamplePreset};
 use crate::telemetry::format_rss_mb;
 use crate::theme::{
     apply_theme_to_context, install_studio_fonts, mono_font, plex_medium, resolve_palette,
@@ -96,21 +95,22 @@ impl InspectorTab {
 #[derive(Clone, Default)]
 pub struct GuiBootOptions {
     pub initial_media: Option<PathBuf>,
-    pub initial_preset: Option<SamplePreset>,
     pub initial_params: Option<RenderParams>,
     pub theme_override: Option<StudioTheme>,
     pub open_settings_tab: Option<SettingsTab>,
     pub split_wipe: Option<f32>,
     pub initial_zoom: Option<f32>,
-    pub live_motion: bool,
     pub show_update_modal: bool,
     pub auto_exit_after_frames: Option<u32>,
 }
 
+#[derive(Default)]
 enum SourceKind {
-    Sample(SamplePreset),
-    StaticImage { name: String },
-    LiveMotion(SamplePreset),
+    #[default]
+    Empty,
+    StaticImage {
+        name: String,
+    },
     VideoFile(LiveVideoStream),
 }
 
@@ -148,9 +148,7 @@ pub struct LumaGlyphApp {
     auto_fit: bool,
     pan_offset: Vec2,
 
-    // Motion, audio-reactive & video state
-    motion_paused: bool,
-    motion_start: Instant,
+    // Audio-reactive & video state
     live_audio_energy: f32,
     video_frames_seen: u64,
     ffmpeg_info: Option<String>,
@@ -217,11 +215,6 @@ impl LumaGlyphApp {
             ..RenderParams::default()
         });
         let look_code_buf = params.to_look_code();
-        let preset = boot.initial_preset.unwrap_or(SamplePreset::CyberSculpture);
-
-        let sample_w = 960;
-        let sample_h = 600;
-        let source_rgba = generate_sample_rgba(preset, sample_w, sample_h, 0.0);
 
         let update_rx = if prefs.check_updates_on_startup {
             Some(spawn_release_check(prefs.github_repo.clone()))
@@ -240,17 +233,13 @@ impl LumaGlyphApp {
             atlas,
             params,
             look_code_buf,
-            source_kind: if boot.live_motion {
-                SourceKind::LiveMotion(preset)
-            } else {
-                SourceKind::Sample(preset)
-            },
-            source_rgba,
+            source_kind: SourceKind::Empty,
+            source_rgba: Vec::new(),
             source_channels: 4,
-            source_w: sample_w,
-            source_h: sample_h,
-            source_dirty: true,
-            ascii_dirty: true,
+            source_w: 0,
+            source_h: 0,
+            source_dirty: false,
+            ascii_dirty: false,
             ascii_frame: AsciiFrame::new(),
             raster_rgba: Vec::new(),
             ascii_tex: None,
@@ -259,13 +248,11 @@ impl LumaGlyphApp {
             ascii_px_h: 0,
             inspector_tab: InspectorTab::All,
             zen_mode: false,
-            split_enabled: boot.split_wipe != Some(0.0),
-            split_ratio: boot.split_wipe.unwrap_or(0.34),
+            split_enabled: boot.split_wipe.is_some_and(|v| v > 0.0),
+            split_ratio: boot.split_wipe.unwrap_or(0.50),
             zoom: boot.initial_zoom.unwrap_or(1.0),
             auto_fit: boot.initial_zoom.is_none(),
             pan_offset: Vec2::ZERO,
-            motion_paused: false,
-            motion_start: Instant::now(),
             live_audio_energy: 0.0,
             video_frames_seen: 0,
             ffmpeg_info: detect_ffmpeg_version(),
@@ -292,6 +279,31 @@ impl LumaGlyphApp {
         }
 
         app
+    }
+
+    #[inline]
+    fn has_media(&self) -> bool {
+        !matches!(self.source_kind, SourceKind::Empty)
+    }
+
+    fn close_media(&mut self) {
+        self.source_kind = SourceKind::Empty;
+        self.source_rgba.clear();
+        self.source_rgba.shrink_to_fit();
+        self.raster_rgba.clear();
+        self.raster_rgba.shrink_to_fit();
+        self.source_w = 0;
+        self.source_h = 0;
+        self.ascii_px_w = 0;
+        self.ascii_px_h = 0;
+        self.ascii_frame = AsciiFrame::new();
+        self.ascii_tex = None;
+        self.orig_tex = None;
+        self.source_dirty = false;
+        self.ascii_dirty = false;
+        self.live_audio_energy = 0.0;
+        self.video_frames_seen = 0;
+        self.pan_offset = Vec2::ZERO;
     }
 
     fn set_toast(&mut self, msg: impl Into<String>) {
@@ -333,26 +345,35 @@ impl LumaGlyphApp {
             .add_filter("Font", &["ttf", "otf"])
             .pick_file()
         {
-            if let Ok(bytes) = std::fs::read(&p) {
-                let name = p
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("Custom Font")
-                    .to_string();
-                let ch = self.prefs.atlas_cell_height.clamp(12, 36);
-                match GlyphAtlas::from_font_bytes(name.clone(), bytes, ch) {
-                    Ok(new_atlas) => {
-                        self.atlas = new_atlas;
+            self.load_font_path(p);
+        }
+    }
+
+    fn load_font_path(&mut self, p: PathBuf) {
+        if let Ok(bytes) = std::fs::read(&p) {
+            let name = p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("Custom Font")
+                .to_string();
+            let ch = self.prefs.atlas_cell_height.clamp(12, 36);
+            match GlyphAtlas::from_font_bytes(name.clone(), bytes, ch) {
+                Ok(new_atlas) => {
+                    self.atlas = new_atlas;
+                    if self.has_media() {
                         self.ascii_dirty = true;
-                        self.set_toast(format!("Calibrated font: {name}"));
                     }
-                    Err(e) => self.set_toast(e),
+                    self.set_toast(format!("Calibrated font: {name}"));
                 }
+                Err(e) => self.set_toast(e),
             }
         }
     }
 
     fn save_png_dialog(&mut self) {
+        if !self.has_media() {
+            return;
+        }
         if let Some(p) = rfd::FileDialog::new()
             .set_file_name("lumaglyph.png")
             .add_filter("PNG", &["png"])
@@ -364,26 +385,6 @@ impl LumaGlyphApp {
                 Err(e) => self.set_toast(e),
             }
         }
-    }
-
-    fn load_sample(&mut self, preset: SamplePreset, animated: bool) {
-        let w = 960;
-        let h = 600;
-        self.source_rgba = generate_sample_rgba(preset, w, h, 0.0);
-        self.source_channels = 4;
-        self.source_w = w;
-        self.source_h = h;
-        self.live_audio_energy = 0.0;
-        self.source_kind = if animated {
-            self.motion_start = Instant::now();
-            self.motion_paused = false;
-            SourceKind::LiveMotion(preset)
-        } else {
-            SourceKind::Sample(preset)
-        };
-        self.ascii_frame.prev_glyphs.clear();
-        self.source_dirty = true;
-        self.ascii_dirty = true;
     }
 
     fn load_media_path(&mut self, path: PathBuf) {
@@ -450,6 +451,25 @@ impl LumaGlyphApp {
         }
     }
 
+    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        for f in dropped {
+            if let Some(path) = f.path {
+                let ext = path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if matches!(ext.as_str(), "ttf" | "otf") {
+                    self.load_font_path(path);
+                } else {
+                    self.load_media_path(path);
+                }
+                break;
+            }
+        }
+    }
+
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         if ctx.wants_keyboard_input() {
             return;
@@ -458,8 +478,14 @@ impl LumaGlyphApp {
             if i.modifiers.command && i.key_pressed(Key::Comma) {
                 self.show_settings_window = !self.show_settings_window;
             }
-            if i.modifiers.command && i.key_pressed(Key::O) {
+            if i.modifiers.command && !i.modifiers.shift && i.key_pressed(Key::O) {
                 self.open_image_dialog();
+            }
+            if i.modifiers.command && i.modifiers.shift && i.key_pressed(Key::O) {
+                self.open_video_dialog();
+            }
+            if i.modifiers.command && !i.modifiers.shift && i.key_pressed(Key::W) {
+                self.close_media();
             }
             if i.modifiers.command && !i.modifiers.shift && i.key_pressed(Key::S) {
                 self.save_png_dialog();
@@ -475,7 +501,7 @@ impl LumaGlyphApp {
                 }
                 if i.key_pressed(Key::W) {
                     self.split_enabled = !self.split_enabled;
-                    if self.split_enabled {
+                    if self.split_enabled && self.has_media() {
                         self.source_dirty = true;
                     }
                 }
@@ -491,13 +517,9 @@ impl LumaGlyphApp {
                     self.ascii_dirty = true;
                 }
                 if i.key_pressed(Key::Space) {
-                    match &mut self.source_kind {
-                        SourceKind::LiveMotion(_) => self.motion_paused = !self.motion_paused,
-                        SourceKind::VideoFile(stream) => {
-                            let p = stream.paused.load(Ordering::Relaxed);
-                            stream.paused.store(!p, Ordering::Relaxed);
-                        }
-                        _ => {}
+                    if let SourceKind::VideoFile(stream) = &mut self.source_kind {
+                        let p = stream.paused.load(Ordering::Relaxed);
+                        stream.paused.store(!p, Ordering::Relaxed);
                     }
                 }
                 if i.key_pressed(Key::Num0) {
@@ -605,107 +627,92 @@ impl LumaGlyphApp {
             self.style_dirty = false;
         }
 
-        match &mut self.source_kind {
-            SourceKind::LiveMotion(preset) => {
-                if !self.motion_paused {
-                    let t = self.motion_start.elapsed().as_secs_f32();
-                    self.source_rgba =
-                        generate_sample_rgba(*preset, self.source_w, self.source_h, t);
-                    self.source_channels = 4;
-                    if self.params.audio_reactive > 0.001 {
-                        let phase = (t * (124.0 / 60.0)).fract();
-                        self.live_audio_energy = (1.0 - phase).powi(4);
-                    } else {
-                        self.live_audio_energy = 0.0;
-                    }
-                    self.source_dirty = true;
-                    self.ascii_dirty = true;
-                    ctx.request_repaint();
-                }
+        if let SourceKind::VideoFile(stream) = &mut self.source_kind {
+            if let Some((rgb, audio_e)) = stream.poll_latest_frame() {
+                self.source_rgba = rgb;
+                self.source_channels = 3;
+                self.live_audio_energy = audio_e;
+                self.video_frames_seen += 1;
+                self.source_dirty = true;
+                self.ascii_dirty = true;
             }
-            SourceKind::VideoFile(stream) => {
-                if let Some((rgb, audio_e)) = stream.poll_latest_frame() {
-                    self.source_rgba = rgb;
-                    self.source_channels = 3;
-                    self.live_audio_energy = audio_e;
-                    self.video_frames_seen += 1;
-                    self.source_dirty = true;
-                    self.ascii_dirty = true;
-                }
-                if !stream.paused.load(Ordering::Relaxed) {
-                    ctx.request_repaint_after(std::time::Duration::from_millis(14));
-                }
+            if !stream.paused.load(Ordering::Relaxed) {
+                ctx.request_repaint_after(std::time::Duration::from_millis(14));
             }
-            _ => {
-                self.live_audio_energy = 0.0;
-            }
+        } else {
+            self.live_audio_energy = 0.0;
         }
 
-        if self.split_enabled && (self.source_dirty || self.orig_tex.is_none()) {
-            let color_img = if self.source_channels == 4 {
-                ColorImage::from_rgba_unmultiplied(
-                    [self.source_w as usize, self.source_h as usize],
-                    &self.source_rgba,
-                )
-            } else {
-                ColorImage::from_rgb(
-                    [self.source_w as usize, self.source_h as usize],
-                    &self.source_rgba,
-                )
-            };
-            match &mut self.orig_tex {
-                Some(tex) => tex.set(color_img, TextureOptions::LINEAR),
-                None => {
-                    self.orig_tex =
-                        Some(ctx.load_texture("orig_media", color_img, TextureOptions::LINEAR));
-                }
+        if !self.has_media() || self.source_w == 0 || self.source_h == 0 {
+            if self.ascii_dirty {
+                self.sync_look_code();
+                self.ascii_dirty = false;
             }
             self.source_dirty = false;
-        }
-
-        if self.ascii_dirty || self.ascii_tex.is_none() {
-            self.sync_look_code();
-            let use_temporal = matches!(
-                self.source_kind,
-                SourceKind::LiveMotion(_) | SourceKind::VideoFile(_)
-            );
-            convert_image_buffer_with_audio(
-                &self.source_rgba,
-                self.source_w,
-                self.source_h,
-                self.source_channels,
-                &self.atlas,
-                &self.params,
-                use_temporal,
-                self.live_audio_energy,
-                &mut self.ascii_frame,
-            );
-            let bloom_boost = self.live_audio_energy * self.params.audio_reactive * 0.65;
-            let (pw, ph) = rasterize_rgba(
-                &self.ascii_frame,
-                &self.atlas,
-                &self.params,
-                bloom_boost,
-                &mut self.raster_rgba,
-            );
-            self.ascii_px_w = pw;
-            self.ascii_px_h = ph;
-
-            if pw > 0 && ph > 0 {
-                let cimg = ColorImage::from_rgba_unmultiplied([pw, ph], &self.raster_rgba);
-                let opts = if self.zoom >= 1.8 {
-                    TextureOptions::NEAREST
+        } else {
+            if self.split_enabled && (self.source_dirty || self.orig_tex.is_none()) {
+                let color_img = if self.source_channels == 4 {
+                    ColorImage::from_rgba_unmultiplied(
+                        [self.source_w as usize, self.source_h as usize],
+                        &self.source_rgba,
+                    )
                 } else {
-                    TextureOptions::LINEAR
+                    ColorImage::from_rgb(
+                        [self.source_w as usize, self.source_h as usize],
+                        &self.source_rgba,
+                    )
                 };
-                match &mut self.ascii_tex {
-                    Some(tex) => tex.set(cimg, opts),
+                match &mut self.orig_tex {
+                    Some(tex) => tex.set(color_img, TextureOptions::LINEAR),
                     None => {
-                        self.ascii_tex = Some(ctx.load_texture("ascii_canvas", cimg, opts));
+                        self.orig_tex =
+                            Some(ctx.load_texture("orig_media", color_img, TextureOptions::LINEAR));
                     }
                 }
+                self.source_dirty = false;
             }
-            self.ascii_dirty = false;
+
+            if self.ascii_dirty || self.ascii_tex.is_none() {
+                self.sync_look_code();
+                let use_temporal = matches!(self.source_kind, SourceKind::VideoFile(_));
+                convert_image_buffer_with_audio(
+                    &self.source_rgba,
+                    self.source_w,
+                    self.source_h,
+                    self.source_channels,
+                    &self.atlas,
+                    &self.params,
+                    use_temporal,
+                    self.live_audio_energy,
+                    &mut self.ascii_frame,
+                );
+                let bloom_boost = self.live_audio_energy * self.params.audio_reactive * 0.65;
+                let (pw, ph) = rasterize_rgba(
+                    &self.ascii_frame,
+                    &self.atlas,
+                    &self.params,
+                    bloom_boost,
+                    &mut self.raster_rgba,
+                );
+                self.ascii_px_w = pw;
+                self.ascii_px_h = ph;
+
+                if pw > 0 && ph > 0 {
+                    let cimg = ColorImage::from_rgba_unmultiplied([pw, ph], &self.raster_rgba);
+                    let opts = if self.zoom >= 1.8 {
+                        TextureOptions::NEAREST
+                    } else {
+                        TextureOptions::LINEAR
+                    };
+                    match &mut self.ascii_tex {
+                        Some(tex) => tex.set(cimg, opts),
+                        None => {
+                            self.ascii_tex = Some(ctx.load_texture("ascii_canvas", cimg, opts));
+                        }
+                    }
+                }
+                self.ascii_dirty = false;
+            }
         }
 
         if let Some(job) = &self.transcode_job {
@@ -784,12 +791,13 @@ impl LumaGlyphApp {
             ui.separator();
 
             egui::menu::bar(ui, |ui| {
+                let has_media = self.has_media();
                 ui.menu_button("File", |ui| {
                     if ui.button("Open Image...          Ctrl+O").clicked() {
                         ui.close_menu();
                         self.open_image_dialog();
                     }
-                    if ui.button("Open Video...").clicked() {
+                    if ui.button("Open Video...    Ctrl+Shift+O").clicked() {
                         ui.close_menu();
                         self.open_video_dialog();
                     }
@@ -797,8 +805,24 @@ impl LumaGlyphApp {
                         ui.close_menu();
                         self.open_font_dialog();
                     }
+                    if ui
+                        .add_enabled(
+                            has_media,
+                            egui::Button::new("Close Media            Ctrl+W"),
+                        )
+                        .clicked()
+                    {
+                        ui.close_menu();
+                        self.close_media();
+                    }
                     ui.separator();
-                    if ui.button("Export PNG...          Ctrl+S").clicked() {
+                    if ui
+                        .add_enabled(
+                            has_media,
+                            egui::Button::new("Export PNG...          Ctrl+S"),
+                        )
+                        .clicked()
+                    {
                         ui.close_menu();
                         self.save_png_dialog();
                     }
@@ -824,6 +848,7 @@ impl LumaGlyphApp {
                         .checkbox(&mut self.split_enabled, "Split-Wipe Curtain       W")
                         .changed()
                         && self.split_enabled
+                        && self.has_media()
                     {
                         self.source_dirty = true;
                     }
@@ -870,32 +895,6 @@ impl LumaGlyphApp {
                             }
                         }
                     });
-                });
-
-                ui.menu_button("Scenes", |ui| {
-                    ui.label(
-                        RichText::new("Static Calibration Plates")
-                            .font(plex_medium(11.0))
-                            .color(pal.text_muted),
-                    );
-                    for p in SamplePreset::ALL {
-                        if ui.button(p.label()).clicked() {
-                            self.load_sample(p, false);
-                            ui.close_menu();
-                        }
-                    }
-                    ui.separator();
-                    ui.label(
-                        RichText::new("Real-Time 60fps Streams")
-                            .font(plex_medium(11.0))
-                            .color(pal.text_muted),
-                    );
-                    for p in SamplePreset::ALL {
-                        if ui.button(format!("{} (Live)", p.label())).clicked() {
-                            self.load_sample(p, true);
-                            ui.close_menu();
-                        }
-                    }
                 });
 
                 ui.menu_button("Presets", |ui| {
@@ -966,20 +965,24 @@ impl LumaGlyphApp {
 
                 ui.separator();
 
-                let fps_est = if self.ascii_frame.render_ms > 0.05 {
-                    (1000.0 / self.ascii_frame.render_ms).min(9999.0)
+                let metrics = if self.has_media() {
+                    let fps_est = if self.ascii_frame.render_ms > 0.05 {
+                        (1000.0 / self.ascii_frame.render_ms).min(9999.0)
+                    } else {
+                        9999.0
+                    };
+                    format!(
+                        "{}x{}   |   {:02}/95 CHARS   |   {:.2} ms ({:.0} FPS)   |   RSS {}",
+                        self.ascii_frame.cols,
+                        self.ascii_frame.rows,
+                        self.ascii_frame.unique_glyphs,
+                        self.ascii_frame.render_ms,
+                        fps_est,
+                        self.rss_label
+                    )
                 } else {
-                    9999.0
+                    format!("RSS {}", self.rss_label)
                 };
-                let metrics = format!(
-                    "{}x{}   |   {:02}/95 CHARS   |   {:.2} ms ({:.0} FPS)   |   RSS {}",
-                    self.ascii_frame.cols,
-                    self.ascii_frame.rows,
-                    self.ascii_frame.unique_glyphs,
-                    self.ascii_frame.render_ms,
-                    fps_est,
-                    self.rss_label
-                );
                 ui.label(
                     RichText::new(metrics)
                         .font(mono_font(11.0))
@@ -1000,14 +1003,22 @@ impl LumaGlyphApp {
             if ui.button("Open Video").clicked() {
                 self.open_video_dialog();
             }
-
-            let is_live = matches!(self.source_kind, SourceKind::LiveMotion(_));
-            if workstation_toggle(ui, &pal, is_live, "Live 60fps").clicked() {
-                let cur = match self.source_kind {
-                    SourceKind::Sample(p) | SourceKind::LiveMotion(p) => p,
-                    _ => SamplePreset::CyberSculpture,
-                };
-                self.load_sample(cur, !is_live);
+            if let SourceKind::VideoFile(stream) = &mut self.source_kind {
+                let is_paused = stream.paused.load(Ordering::Relaxed);
+                if ui
+                    .button(if is_paused { "Play" } else { "Pause" })
+                    .clicked()
+                {
+                    stream.paused.store(!is_paused, Ordering::Relaxed);
+                }
+            }
+            if self.has_media()
+                && ui
+                    .button("Close")
+                    .on_hover_text("Close Media (Ctrl+W)")
+                    .clicked()
+            {
+                self.close_media();
             }
 
             ui.separator();
@@ -1541,73 +1552,76 @@ impl LumaGlyphApp {
                 }
 
                 if show_output {
+                    let has_media = self.has_media();
                     inspector_section(ui, &pal, "EXPORT & TRANSCODE", |ui| {
-                        ui.horizontal(|ui| {
-                            if ui.button("Copy Text").clicked() {
-                                ui.ctx().copy_text(self.ascii_frame.to_plain_text());
-                                self.set_toast("Copied plain ASCII text");
-                            }
-                            if ui.button("Copy 24-bit ANSI").clicked() {
-                                ui.ctx().copy_text(frame_to_ansi_string(
-                                    &self.ascii_frame,
-                                    &self.params,
-                                ));
-                                self.set_toast("Copied TrueColor ANSI escape sequence");
-                            }
-                        });
+                        ui.add_enabled_ui(has_media, |ui| {
+                            ui.horizontal(|ui| {
+                                if ui.button("Copy Text").clicked() {
+                                    ui.ctx().copy_text(self.ascii_frame.to_plain_text());
+                                    self.set_toast("Copied plain ASCII text");
+                                }
+                                if ui.button("Copy 24-bit ANSI").clicked() {
+                                    ui.ctx().copy_text(frame_to_ansi_string(
+                                        &self.ascii_frame,
+                                        &self.params,
+                                    ));
+                                    self.set_toast("Copied TrueColor ANSI escape sequence");
+                                }
+                            });
 
-                        ui.horizontal_wrapped(|ui| {
-                            if ui.button("PNG").clicked() {
-                                self.save_png_dialog();
-                            }
-                            if ui.button("SVG").clicked() {
-                                if let Some(p) = rfd::FileDialog::new()
-                                    .set_file_name("lumaglyph.svg")
-                                    .add_filter("SVG", &["svg"])
-                                    .save_file()
-                                {
-                                    match export_svg(&self.ascii_frame, &self.params, &p) {
-                                        Ok(()) => self.set_toast("Exported vector SVG"),
-                                        Err(e) => self.set_toast(e),
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button("PNG").clicked() {
+                                    self.save_png_dialog();
+                                }
+                                if ui.button("SVG").clicked() {
+                                    if let Some(p) = rfd::FileDialog::new()
+                                        .set_file_name("lumaglyph.svg")
+                                        .add_filter("SVG", &["svg"])
+                                        .save_file()
+                                    {
+                                        match export_svg(&self.ascii_frame, &self.params, &p) {
+                                            Ok(()) => self.set_toast("Exported vector SVG"),
+                                            Err(e) => self.set_toast(e),
+                                        }
                                     }
                                 }
-                            }
-                            if ui.button("HTML").clicked() {
-                                if let Some(p) = rfd::FileDialog::new()
-                                    .set_file_name("lumaglyph.html")
-                                    .add_filter("HTML", &["html"])
-                                    .save_file()
-                                {
-                                    match export_html(&self.ascii_frame, &self.params, &p) {
-                                        Ok(()) => self.set_toast("Exported standalone HTML"),
-                                        Err(e) => self.set_toast(e),
+                                if ui.button("HTML").clicked() {
+                                    if let Some(p) = rfd::FileDialog::new()
+                                        .set_file_name("lumaglyph.html")
+                                        .add_filter("HTML", &["html"])
+                                        .save_file()
+                                    {
+                                        match export_html(&self.ascii_frame, &self.params, &p) {
+                                            Ok(()) => self.set_toast("Exported standalone HTML"),
+                                            Err(e) => self.set_toast(e),
+                                        }
                                     }
                                 }
-                            }
-                            if ui.button(".ANS").clicked() {
-                                if let Some(p) = rfd::FileDialog::new()
-                                    .set_file_name("lumaglyph.ans")
-                                    .add_filter("ANSI Art", &["ans"])
-                                    .save_file()
-                                {
-                                    match export_ansi(&self.ascii_frame, &self.params, &p) {
-                                        Ok(()) => self.set_toast("Exported 24-bit .ans"),
-                                        Err(e) => self.set_toast(e),
+                                if ui.button(".ANS").clicked() {
+                                    if let Some(p) = rfd::FileDialog::new()
+                                        .set_file_name("lumaglyph.ans")
+                                        .add_filter("ANSI Art", &["ans"])
+                                        .save_file()
+                                    {
+                                        match export_ansi(&self.ascii_frame, &self.params, &p) {
+                                            Ok(()) => self.set_toast("Exported 24-bit .ans"),
+                                            Err(e) => self.set_toast(e),
+                                        }
                                     }
                                 }
-                            }
-                            if ui.button(".TXT").clicked() {
-                                if let Some(p) = rfd::FileDialog::new()
-                                    .set_file_name("lumaglyph.txt")
-                                    .add_filter("Text", &["txt"])
-                                    .save_file()
-                                {
-                                    match export_txt(&self.ascii_frame, &p) {
-                                        Ok(()) => self.set_toast("Exported plain .txt"),
-                                        Err(e) => self.set_toast(e),
+                                if ui.button(".TXT").clicked() {
+                                    if let Some(p) = rfd::FileDialog::new()
+                                        .set_file_name("lumaglyph.txt")
+                                        .add_filter("Text", &["txt"])
+                                        .save_file()
+                                    {
+                                        match export_txt(&self.ascii_frame, &p) {
+                                            Ok(()) => self.set_toast("Exported plain .txt"),
+                                            Err(e) => self.set_toast(e),
+                                        }
                                     }
                                 }
-                            }
+                            });
                         });
 
                         if let SourceKind::VideoFile(stream) = &self.source_kind {
@@ -1689,7 +1703,28 @@ impl LumaGlyphApp {
         };
         painter.rect_filled(avail, 0.0, surround);
 
-        if self.ascii_px_w == 0 || self.ascii_px_h == 0 {
+        let dragging_file = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
+        if dragging_file {
+            painter.rect_stroke(
+                avail.shrink(6.0),
+                CornerRadius::same(2),
+                Stroke::new(1.0_f32, pal.accent),
+                StrokeKind::Inside,
+            );
+        }
+
+        if !self.has_media() || self.ascii_px_w == 0 || self.ascii_px_h == 0 {
+            if let Some((msg, when)) = &self.status_toast {
+                if when.elapsed().as_secs_f32() < 4.5 {
+                    draw_viewport_tag(
+                        &painter,
+                        Pos2::new(avail.left() + 10.0, avail.top() + 10.0),
+                        msg,
+                    );
+                } else {
+                    self.status_toast = None;
+                }
+            }
             return;
         }
 
@@ -1891,18 +1926,11 @@ impl LumaGlyphApp {
         let pal = self.palette;
         ui.horizontal(|ui| {
             match &mut self.source_kind {
-                SourceKind::LiveMotion(preset) => {
-                    let p_label = preset.label();
-                    if ui
-                        .small_button(if self.motion_paused { "Play" } else { "Pause" })
-                        .clicked()
-                    {
-                        self.motion_paused = !self.motion_paused;
-                    }
+                SourceKind::Empty => {
                     ui.label(
-                        RichText::new(format!("LIVE 60FPS  |  {p_label}"))
+                        RichText::new("IDLE")
                             .font(mono_font(10.8))
-                            .color(pal.text_secondary),
+                            .color(pal.text_muted),
                     );
                 }
                 SourceKind::VideoFile(stream) => {
@@ -1930,19 +1958,6 @@ impl LumaGlyphApp {
                     ui.label(
                         RichText::new(format!(
                             "IMAGE  |  {name} ({}x{})  |  ZOOM {:.0}%",
-                            self.source_w,
-                            self.source_h,
-                            self.zoom * 100.0
-                        ))
-                        .font(mono_font(10.8))
-                        .color(pal.text_muted),
-                    );
-                }
-                SourceKind::Sample(p) => {
-                    ui.label(
-                        RichText::new(format!(
-                            "PLATE  |  {} ({}x{})  |  ZOOM {:.0}%",
-                            p.label(),
                             self.source_w,
                             self.source_h,
                             self.zoom * 100.0
@@ -2494,6 +2509,8 @@ impl LumaGlyphApp {
 
         let bindings = [
             ("Ctrl + O", "Open image or animated GIF"),
+            ("Ctrl + Shift + O", "Open video file"),
+            ("Ctrl + W", "Close current media"),
             ("Ctrl + S", "Quick export PNG at configured DPI scale"),
             (
                 "Ctrl + Shift + C",
@@ -2504,7 +2521,7 @@ impl LumaGlyphApp {
                 "Tab",
                 "Toggle Zen Canvas Mode (hide side dock & status bar)",
             ),
-            ("Space", "Play / pause live 60fps stream or video file"),
+            ("Space", "Play / pause loaded video file"),
             ("W", "Toggle Source / ASCII Split-Wipe curtain"),
             ("B", "Toggle True OLED #000000 pitch-black canvas"),
             ("N", "Toggle Neon Wireframe contour-only mode"),
@@ -2769,6 +2786,7 @@ impl LumaGlyphApp {
 
 impl eframe::App for LumaGlyphApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_dropped_files(ctx);
         self.handle_shortcuts(ctx);
         self.refresh_pipelines(ctx);
         let pal = self.palette;
@@ -3183,7 +3201,8 @@ pub fn launch_gui(boot: GuiBootOptions) -> Result<(), String> {
         viewport: egui::ViewportBuilder::default()
             .with_title("LumaGlyph")
             .with_inner_size([1520.0, 900.0])
-            .with_min_inner_size([1024.0, 640.0]),
+            .with_min_inner_size([1024.0, 640.0])
+            .with_drag_and_drop(true),
         ..Default::default()
     };
 

@@ -222,6 +222,29 @@ fn main_rs_enforces_windows_gui_subsystem_with_zero_alloc_console() {
 }
 
 #[test]
+fn gui_defaults_to_empty_canvas_with_zero_sample_scenes() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let gui_src = std::fs::read_to_string(manifest_dir.join("src/gui.rs")).unwrap();
+    assert!(
+        gui_src.contains("source_kind: SourceKind::Empty"),
+        "LumaGlyphApp::new must boot into SourceKind::Empty by default"
+    );
+    for forbidden in [
+        "SamplePreset",
+        "generate_sample_rgba",
+        "SourceKind::Sample",
+        "SourceKind::LiveMotion",
+        "menu_button(\"Scenes\"",
+        "\"Live 60fps\"",
+    ] {
+        assert!(
+            !gui_src.contains(forbidden),
+            "src/gui.rs must not reference sample scenes ('{forbidden}')"
+        );
+    }
+}
+
+#[test]
 fn entire_source_tree_and_readme_contain_zero_emojis() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut files = vec![
