@@ -11,28 +11,24 @@ permissions:
 
 jobs:
   build-release:
-    name: Release (${{ matrix.artifact }})
+    name: Release (${{ matrix.label }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            artifact: lumaglyph-linux-x86_64
-            archive: tar.gz
-          - os: macos-14
-            target: aarch64-apple-darwin
-            artifact: lumaglyph-macos-arm64
-            archive: tar.gz
-          - os: macos-14
-            target: x86_64-apple-darwin
-            artifact: lumaglyph-macos-x86_64
-            archive: tar.gz
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact: lumaglyph-windows-x86_64
-            archive: zip
+          - label: linux-x86_64
+            os: ubuntu-22.04
+            rust_targets: x86_64-unknown-linux-gnu
+            spec: "x86_64-unknown-linux-gnu:lumaglyph-linux-x86_64:tar.gz"
+          - label: macos-universal-targets
+            os: macos-latest
+            rust_targets: aarch64-apple-darwin, x86_64-apple-darwin
+            spec: "aarch64-apple-darwin:lumaglyph-macos-arm64:tar.gz;x86_64-apple-darwin:lumaglyph-macos-x86_64:tar.gz"
+          - label: windows-x86_64
+            os: windows-latest
+            rust_targets: x86_64-pc-windows-msvc
+            spec: "x86_64-pc-windows-msvc:lumaglyph-windows-x86_64:zip"
 
     steps:
       - name: Checkout repository
@@ -51,21 +47,15 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.rust_targets }}
 
-      - name: Build hardened binary, audit zero path leaks & package archive
+      - name: Build hardened binaries, audit zero path leaks & package archives
         shell: python
         env:
           LUMAGLYPH_GITHUB_REPO: ${{ github.repository }}
-          TARGET_TRIPLE: ${{ matrix.target }}
-          ARTIFACT_NAME: ${{ matrix.artifact }}
-          ARCHIVE_KIND: ${{ matrix.archive }}
+          BUILD_SPEC: ${{ matrix.spec }}
         run: |
           import hashlib, os, pathlib, stat, subprocess, sys, tarfile, zipfile
-
-          target = os.environ["TARGET_TRIPLE"]
-          artifact = os.environ["ARTIFACT_NAME"]
-          archive_kind = os.environ["ARCHIVE_KIND"]
 
           home = pathlib.Path.home()
           workspace = os.environ.get("GITHUB_WORKSPACE", str(pathlib.Path.cwd()))
@@ -85,58 +75,62 @@ jobs:
           env = os.environ.copy()
           env["RUSTFLAGS"] = " ".join(flags)
 
-          subprocess.run(
-              ["cargo", "build", "--release", "--locked", "--target", target],
-              env=env,
-              check=True,
-          )
+          out_dir = pathlib.Path("dist_pkg")
+          out_dir.mkdir(exist_ok=True)
 
-          bin_name = "lumaglyph.exe" if os.name == "nt" else "lumaglyph"
-          exe = pathlib.Path("target") / target / "release" / bin_name
-          data = exe.read_bytes()
+          for entry in os.environ["BUILD_SPEC"].split(";"):
+              target, artifact, archive_kind = entry.strip().split(":")
+              subprocess.run(
+                  ["cargo", "build", "--release", "--locked", "--target", target],
+                  env=env,
+                  check=True,
+              )
 
-          forbidden = [
-              b"/home/runner",
-              b"/Users/runner",
-              b"runneradmin",
-              b"C:\\Users\\",
-              b"D:\\a\\",
-              workspace.encode("utf-8"),
-          ]
-          leaks = [pat.decode("utf-8", "ignore") for pat in forbidden if pat and pat in data]
-          if leaks:
-              print(f"FATAL: Leaked build paths detected: {leaks}", file=sys.stderr)
-              sys.exit(1)
-          print(f"Verified clean binary: {exe} ({len(data)/(1024*1024):.2f} MB)")
+              bin_name = "lumaglyph.exe" if os.name == "nt" else "lumaglyph"
+              exe = pathlib.Path("target") / target / "release" / bin_name
+              data = exe.read_bytes()
 
-          if os.name != "nt":
-              exe.chmod(exe.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+              forbidden = [
+                  b"/home/runner",
+                  b"/Users/runner",
+                  b"runneradmin",
+                  b"C:\\Users\\",
+                  b"D:\\a\\",
+                  workspace.encode("utf-8"),
+              ]
+              leaks = [pat.decode("utf-8", "ignore") for pat in forbidden if pat and pat in data]
+              if leaks:
+                  print(f"FATAL: Leaked build paths detected in {target}: {leaks}", file=sys.stderr)
+                  sys.exit(1)
+              print(f"Verified clean binary: {exe} ({len(data)/(1024*1024):.2f} MB)")
 
-          if archive_kind == "zip":
-              out_archive = pathlib.Path(f"{artifact}.zip")
-              with zipfile.ZipFile(out_archive, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                  zf.write(exe, arcname=bin_name)
-                  zf.write("LICENSE", arcname="LICENSE")
-                  zf.write("README.md", arcname="README.md")
-          else:
-              out_archive = pathlib.Path(f"{artifact}.tar.gz")
-              with tarfile.open(out_archive, "w:gz") as tf:
-                  tf.add(exe, arcname=bin_name)
-                  tf.add("LICENSE", arcname="LICENSE")
-                  tf.add("README.md", arcname="README.md")
+              if os.name != "nt":
+                  exe.chmod(exe.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
-          digest = hashlib.sha256(out_archive.read_bytes()).hexdigest()
-          pathlib.Path(f"{out_archive.name}.sha256").write_text(
-              f"{digest}  {out_archive.name}\n", encoding="utf-8"
-          )
-          print(f"Packaged {out_archive} (sha256={digest})")
+              if archive_kind == "zip":
+                  out_archive = out_dir / f"{artifact}.zip"
+                  with zipfile.ZipFile(out_archive, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                      zf.write(exe, arcname=bin_name)
+                      zf.write("LICENSE", arcname="LICENSE")
+                      zf.write("README.md", arcname="README.md")
+              else:
+                  out_archive = out_dir / f"{artifact}.tar.gz"
+                  with tarfile.open(out_archive, "w:gz") as tf:
+                      tf.add(exe, arcname=bin_name)
+                      tf.add("LICENSE", arcname="LICENSE")
+                      tf.add("README.md", arcname="README.md")
 
-      - name: Upload build artifact
+              digest = hashlib.sha256(out_archive.read_bytes()).hexdigest()
+              (out_dir / f"{out_archive.name}.sha256").write_text(
+                  f"{digest}  {out_archive.name}\n", encoding="utf-8"
+              )
+              print(f"Packaged {out_archive} (sha256={digest})")
+
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: |
-            ${{ matrix.artifact }}.*
+          name: pkg-${{ matrix.label }}
+          path: dist_pkg/*
 
   publish-github-release:
     name: Publish GitHub Release
