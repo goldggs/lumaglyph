@@ -5,11 +5,14 @@ use crate::export::{
     export_ansi, export_html, export_png, export_svg, export_txt, frame_to_ansi_string,
 };
 use crate::glyph_atlas::GlyphAtlas;
-use crate::gui::{launch_gui, GuiBootOptions};
+use crate::gui::{launch_gui, GuiBootOptions, SettingsTab};
 use crate::samples::{generate_sample_rgba, SamplePreset};
 use crate::telemetry::format_rss_mb;
-use crate::updater::{check_latest_release_blocking, AppPreferences, APP_VERSION};
-use crate::video::{transcode_video_streaming, TranscodeProgress};
+use crate::theme::StudioTheme;
+use crate::updater::{
+    check_latest_release_blocking, format_build_report, AppPreferences, APP_VERSION,
+};
+use crate::video::{detect_ffmpeg_version, transcode_video_streaming, TranscodeProgress};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -20,10 +23,10 @@ use std::time::Instant;
 #[command(
     name = "lumaglyph",
     version,
-    about = "Blazing-fast, low-memory genuine 95-character color ASCII art & video studio"
+    about = "High-throughput 95-character color ASCII art and streaming video workstation"
 )]
 pub struct Cli {
-    /// Optional media file to open directly in the native GUI studio when no subcommand is given.
+    /// Optional media file to open directly in the native workstation when no subcommand is given.
     pub file: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -32,7 +35,7 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Launch the interactive Native GPU Studio (default when run with no subcommand).
+    /// Launch the interactive GPU Workstation (default when run with no subcommand).
     Studio {
         /// Optional image or video file to open on startup.
         file: Option<PathBuf>,
@@ -41,9 +44,15 @@ pub enum Commands {
         /// Apply a one-line shareable Look Code (`lg2:...`).
         #[arg(long)]
         look: Option<String>,
+        /// Workstation UI theme (`graphite`, `oled`, `tungsten`, `nordic`, `daylight`).
+        #[arg(long)]
+        theme: Option<String>,
+        /// Open Settings dialog to a specific tab (`appearance`, `engine`, `export`, `shortcuts`, `about`).
+        #[arg(long)]
+        settings: Option<String>,
         #[arg(long)]
         color: Option<String>,
-        /// Tri-Tone palette (`cyber`, `inferno`, `ice`, `gold`, or `HEX1,HEX2,HEX3`).
+        /// Tri-Tone palette (`solar`, `tokyo`, `blade`, `emerald`, or `RRGGBB-RRGGBB-RRGGBB`).
         #[arg(long)]
         tritone: Option<String>,
         #[arg(long)]
@@ -73,7 +82,7 @@ pub enum Commands {
         #[arg(long, hide = true)]
         exit_after_frames: Option<u32>,
     },
-    /// Convert an image (PNG/JPG/WebP/GIF/BMP) to genuine 95-char ASCII (PNG/SVG/HTML/ANS/TXT or stdout).
+    /// Convert an image (PNG/JPG/WebP/GIF/BMP) to 95-character ASCII (PNG/SVG/HTML/ANS/TXT or stdout).
     Image {
         /// Input image path (or `sample:cyber`, `sample:synthwave`, `sample:orbs`).
         input: String,
@@ -89,7 +98,7 @@ pub enum Commands {
         charset: Option<String>,
         #[arg(long)]
         color: Option<String>,
-        /// Tri-Tone palette (`cyber`, `inferno`, `ice`, `gold`, or `HEX1,HEX2,HEX3`).
+        /// Tri-Tone palette (`solar`, `tokyo`, `blade`, `emerald`, or `RRGGBB-RRGGBB-RRGGBB`).
         #[arg(long)]
         tritone: Option<String>,
         /// True `#000000` pitch-black background for OLED displays.
@@ -101,7 +110,7 @@ pub enum Commands {
         /// Render background with true `RGBA [0,0,0,0]` alpha cutout.
         #[arg(long)]
         transparent: bool,
-        /// Contour / Neon Wireframe mode (edges only, flat fills dropped).
+        /// Contour / Wireframe mode (edges only, flat fills dropped).
         #[arg(long)]
         wireframe: bool,
         #[arg(long)]
@@ -135,7 +144,7 @@ pub enum Commands {
         charset: Option<String>,
         #[arg(long)]
         color: Option<String>,
-        /// Tri-Tone palette (`cyber`, `inferno`, `ice`, `gold`, or `HEX1,HEX2,HEX3`).
+        /// Tri-Tone palette (`solar`, `tokyo`, `blade`, `emerald`, or `RRGGBB-RRGGBB-RRGGBB`).
         #[arg(long)]
         tritone: Option<String>,
         /// True `#000000` pitch-black background for OLED displays.
@@ -147,7 +156,7 @@ pub enum Commands {
         /// Transparent alpha video overlay (`.webm` VP9 yuva420p, `.mov` RGBA, or `.gif`).
         #[arg(long)]
         transparent: bool,
-        /// Contour / Neon Wireframe mode.
+        /// Contour / Wireframe mode.
         #[arg(long)]
         wireframe: bool,
         #[arg(long)]
@@ -169,7 +178,10 @@ pub enum Commands {
         /// Optional `lg2:...` code to inspect; prints default Look Code if omitted.
         code: Option<String>,
     },
-    /// Run a multi-core throughput & memory footprint benchmark.
+    /// Print detailed version, commit revision, target triple, toolchain, and runtime info.
+    #[command(alias = "info")]
+    BuildInfo,
+    /// Run a multi-core throughput and memory footprint benchmark.
     Bench {
         #[arg(long, default_value_t = 180)]
         cols: u32,
@@ -209,6 +221,8 @@ pub fn run_entry() -> Result<(), String> {
             file,
             preset,
             look,
+            theme,
+            settings,
             color,
             tritone,
             charset,
@@ -225,7 +239,14 @@ pub fn run_entry() -> Result<(), String> {
             show_updates,
             exit_after_frames,
         }) => {
-            let mut params = RenderParams::default();
+            let prefs = AppPreferences::load();
+            let mut params = RenderParams {
+                cols: prefs.default_cols.clamp(40, 320),
+                charset: prefs.default_charset,
+                color_mode: prefs.default_color_mode,
+                oled_black: prefs.default_oled_black,
+                ..RenderParams::default()
+            };
             if let Some(code) = look.as_deref() {
                 params.apply_look_code(code)?;
             }
@@ -270,10 +291,17 @@ pub fn run_entry() -> Result<(), String> {
                 _ => None,
             };
 
+            let theme_override = theme.as_deref().and_then(StudioTheme::from_cli);
+            let open_settings_tab = settings
+                .as_deref()
+                .and_then(|s| SettingsTab::from_cli(s).or(Some(SettingsTab::Appearance)));
+
             launch_gui(GuiBootOptions {
                 initial_media: file,
                 initial_preset,
                 initial_params: Some(params),
+                theme_override,
+                open_settings_tab,
                 split_wipe: split,
                 initial_zoom: zoom,
                 live_motion,
@@ -379,7 +407,7 @@ pub fn run_entry() -> Result<(), String> {
                     "png" => {
                         let (pw, ph) = export_png(&frame, &atlas, 28, &params, &out_path)?;
                         eprintln!(
-                            "Saved PNG {} ({pw}x{ph}px, {}x{} cells, {}/95 unique glyphs, {:.2} ms, RSS {})\nLook Code: {}",
+                            "Saved PNG {} ({pw}x{ph} px, {}x{} cells, {}/95 glyphs, {:.2} ms, RSS {})\nLook Code: {}",
                             out_path.display(),
                             frame.cols,
                             frame.rows,
@@ -478,7 +506,7 @@ pub fn run_entry() -> Result<(), String> {
                     let done = monitor.frames_done.load(Ordering::Relaxed);
                     if done > 0 && !monitor.finished.load(Ordering::Relaxed) {
                         eprint!(
-                            "\rStreaming ASCII encode: {done} frames · RSS {}   ",
+                            "\rStreaming ASCII encode: {done} frames | RSS {}   ",
                             format_rss_mb()
                         );
                     }
@@ -489,7 +517,7 @@ pub fn run_entry() -> Result<(), String> {
                 transcode_video_streaming(&input, &output, &atlas, &params, fps, progress)?;
             let _ = reporter.join();
             eprintln!(
-                "\rDone! Rendered {} frames ({}x{}px) in {:.2}s ({:.1} FPS) · Peak/Final RSS {}\nLook Code: {}",
+                "\rCompleted: {} frames ({}x{} px) in {:.2}s ({:.1} FPS) | RSS {}\nLook Code: {}",
                 summary.frames_rendered,
                 summary.out_width,
                 summary.out_height,
@@ -506,6 +534,12 @@ pub fn run_entry() -> Result<(), String> {
                 params.apply_look_code(&c)?;
             }
             println!("{}", params.to_look_code());
+            Ok(())
+        }
+        Some(Commands::BuildInfo) => {
+            let ff = detect_ffmpeg_version();
+            let rss = format_rss_mb();
+            println!("{}", format_build_report(None, ff.as_deref(), &rss));
             Ok(())
         }
         Some(Commands::Bench { cols, iters }) => {
@@ -554,7 +588,7 @@ pub fn run_entry() -> Result<(), String> {
                     out.latest_tag, out.html_url
                 );
             } else {
-                println!("Up to date! Latest GitHub release is {}.", out.latest_tag);
+                println!("Up to date. Latest GitHub release is {}.", out.latest_tag);
             }
             Ok(())
         }

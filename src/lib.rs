@@ -8,6 +8,7 @@ pub mod gui;
 pub mod look;
 pub mod samples;
 pub mod telemetry;
+pub mod theme;
 pub mod updater;
 pub mod video;
 
@@ -21,7 +22,14 @@ mod tests {
     };
     use crate::glyph_atlas::GlyphAtlas;
     use crate::samples::{generate_sample_rgba, SamplePreset};
-    use crate::updater::is_newer_semver;
+    use crate::theme::{
+        resolve_palette, AccentPreset, CornerStyle, StudioTheme, JETBRAINS_MONO_REGULAR,
+        PLEX_SANS_MEDIUM, PLEX_SANS_REGULAR,
+    };
+    use crate::updater::{
+        format_build_report, is_newer_semver, AppPreferences, APP_VERSION, BUILD_GIT_SHA,
+        BUILD_TARGET_TRIPLE,
+    };
 
     #[test]
     fn embedded_font_calibrates_all_95_printable_ascii_glyphs() {
@@ -34,6 +42,52 @@ mod tests {
         assert!(atlas.coverage[at_idx] > 0.45);
         assert!(atlas.vectors[slash_idx].v[7] * atlas.vectors[bslash_idx].v[7] < 0.0);
         assert_eq!(atlas.vectors.len(), ASCII_COUNT);
+    }
+
+    #[test]
+    fn embedded_ibm_plex_sans_and_jetbrains_mono_are_valid_fonts() {
+        assert!(
+            fontdue::Font::from_bytes(PLEX_SANS_REGULAR, fontdue::FontSettings::default()).is_ok()
+        );
+        assert!(
+            fontdue::Font::from_bytes(PLEX_SANS_MEDIUM, fontdue::FontSettings::default()).is_ok()
+        );
+        assert!(fontdue::Font::from_bytes(
+            JETBRAINS_MONO_REGULAR,
+            fontdue::FontSettings::default()
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn workstation_themes_and_preferences_backward_compat() {
+        for t in StudioTheme::ALL {
+            assert_eq!(StudioTheme::from_cli(t.cli_name()), Some(t));
+            for a in AccentPreset::ALL {
+                let pal = resolve_palette(t, a, CornerStyle::Precision2px);
+                assert_eq!(pal.is_light, t.is_light());
+            }
+        }
+
+        // Legacy v0.1 / v0.2 JSON must deserialize cleanly into v0.3 AppPreferences
+        let legacy_json = r#"{"check_updates_on_startup":false,"github_repo":"goldggs/lumaglyph"}"#;
+        let prefs: AppPreferences = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(prefs.theme, StudioTheme::GraphitePro);
+        assert_eq!(prefs.default_cols, 156);
+        assert_eq!(prefs.video_crf, 18);
+        assert!(!prefs.check_updates_on_startup);
+    }
+
+    #[test]
+    fn build_metadata_is_populated_and_path_free() {
+        assert_eq!(APP_VERSION, "0.3.0");
+        assert!(!BUILD_GIT_SHA.is_empty());
+        assert!(!BUILD_TARGET_TRIPLE.is_empty());
+        let report = format_build_report(Some("Test GPU"), Some("ffmpeg 7.1"), "8.0 MB");
+        assert!(report.contains("LumaGlyph v0.3.0"));
+        assert!(!report.contains("/home/"));
+        assert!(!report.contains("/Users/"));
+        assert!(!report.contains("C:\\Users\\"));
     }
 
     #[test]
@@ -66,7 +120,6 @@ mod tests {
     #[test]
     fn oled_black_and_shadow_noise_gate_produce_exact_pitch_black() {
         let atlas = GlyphAtlas::default_embedded(20);
-        // Simulate noisy dark video frame (`RGB = [5, 6, 7]`) with a bright neon center bar
         let w = 160u32;
         let h = 100u32;
         let mut rgb = vec![6u8; (w * h * 3) as usize];
@@ -87,7 +140,6 @@ mod tests {
         let mut frame = AsciiFrame::new();
         convert_image_buffer(&rgb, w, h, 3, &atlas, &params, false, &mut frame);
 
-        // Top-left cell must be gated cleanly to `' '` + `[0, 0, 0]`
         assert_eq!(frame.cells[0].ch, b' ');
         assert_eq!(frame.cells[0].bg, OLED_BG);
 
@@ -103,7 +155,6 @@ mod tests {
     #[test]
     fn transparent_alpha_and_neon_wireframe_cut_out_interiors() {
         let atlas = GlyphAtlas::default_embedded(20);
-        // Large bright white square on dark background: interior is flat, border is sharp contour
         let w = 240u32;
         let h = 160u32;
         let mut rgb = vec![0u8; (w * h * 3) as usize];
@@ -125,7 +176,6 @@ mod tests {
         let mut frame = AsciiFrame::new();
         convert_image_buffer(&rgb, w, h, 3, &atlas, &params, false, &mut frame);
 
-        // Center of the solid white square must be dropped to `' '` by wireframe mode!
         let mid_c = (frame.cols / 2) as usize;
         let mid_r = (frame.rows / 2) as usize;
         assert_eq!(
@@ -133,13 +183,11 @@ mod tests {
             b' ',
             "flat interior must be empty in wireframe mode"
         );
-        // Meanwhile contour edges must have active non-space strokes
         let non_space = frame.cells.iter().filter(|c| c.ch != b' ').count();
         assert!(non_space > 20, "expected active wireframe contour cells");
 
         let mut rgba = Vec::new();
         rasterize_rgba(&frame, &atlas, &params, 0.0, &mut rgba);
-        // Top-left corner pixel must be 100% transparent `[0, 0, 0, 0]`
         assert_eq!(&rgba[0..4], &[0, 0, 0, 0]);
         assert!(
             rgba.chunks_exact(4).any(|px| px[3] > 180),
@@ -215,10 +263,10 @@ mod tests {
 
     #[test]
     fn semver_release_comparison_is_accurate() {
-        assert!(is_newer_semver("v0.2.0", "0.1.0"));
-        assert!(is_newer_semver("0.3.0", "0.2.0"));
+        assert!(is_newer_semver("v0.3.0", "0.2.0"));
+        assert!(is_newer_semver("0.4.0", "0.3.0"));
         assert!(is_newer_semver("1.0.0", "0.9.9"));
-        assert!(!is_newer_semver("v0.2.0", "0.2.0"));
-        assert!(!is_newer_semver("v0.1.0", "0.2.0"));
+        assert!(!is_newer_semver("v0.3.0", "0.3.0"));
+        assert!(!is_newer_semver("v0.2.0", "0.3.0"));
     }
 }

@@ -7,10 +7,21 @@ use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+static VIDEO_CRF: AtomicU8 = AtomicU8::new(18);
+static FFMPEG_CUSTOM_DIR: OnceLock<Mutex<String>> = OnceLock::new();
+
+pub fn set_video_pipeline_prefs(custom_dir: &str, crf: u8) {
+    VIDEO_CRF.store(crf.clamp(12, 34), Ordering::Relaxed);
+    let cell = FFMPEG_CUSTOM_DIR.get_or_init(|| Mutex::new(String::new()));
+    if let Ok(mut guard) = cell.lock() {
+        *guard = custom_dir.trim().to_string();
+    }
+}
 
 /// Apply `CREATE_NO_WINDOW` on Windows so background `ffmpeg` pipes never flash a console window.
 fn configure_no_window(cmd: &mut Command) {
@@ -23,13 +34,28 @@ fn configure_no_window(cmd: &mut Command) {
     let _ = cmd;
 }
 
-/// Resolve `ffmpeg` or `ffprobe` binary: checks alongside the executable first, then `PATH`.
+/// Resolve `ffmpeg` or `ffprobe` binary: checks custom Settings directory, alongside executable, then `PATH`.
 pub fn resolve_tool_binary(tool: &str) -> PathBuf {
     let exe_name = if cfg!(windows) {
         format!("{tool}.exe")
     } else {
         tool.to_string()
     };
+    if let Some(cell) = FFMPEG_CUSTOM_DIR.get() {
+        if let Ok(guard) = cell.lock() {
+            if !guard.is_empty() {
+                let custom = Path::new(guard.as_str());
+                let candidate = if custom.is_file() {
+                    custom.with_file_name(&exe_name)
+                } else {
+                    custom.join(&exe_name)
+                };
+                if candidate.is_file() {
+                    return candidate;
+                }
+            }
+        }
+    }
     if let Ok(current_exe) = std::env::current_exe() {
         if let Some(dir) = current_exe.parent() {
             let candidate = dir.join(&exe_name);
@@ -55,7 +81,8 @@ pub fn detect_ffmpeg_version() -> Option<String> {
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let first = text.lines().next()?.trim();
-    Some(first.chars().take(48).collect())
+    let clean = first.split(" Copyright").next().unwrap_or(first).trim();
+    Some(clean.chars().take(48).collect())
 }
 
 #[derive(Debug, Clone)]
@@ -535,13 +562,14 @@ pub fn transcode_video_streaming(
                         "-shortest",
                     ]);
                 } else {
+                    let crf_s = VIDEO_CRF.load(Ordering::Relaxed).to_string();
                     ecmd.args([
                         "-c:v",
                         "libx264",
                         "-preset",
                         "fast",
                         "-crf",
-                        "18",
+                        &crf_s,
                         "-pix_fmt",
                         "yuv420p",
                         "-c:a",
