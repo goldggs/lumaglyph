@@ -104,6 +104,9 @@ impl TriTonePalette {
         let sh = parse_hex_rgb(parts.next()?)?;
         let mid = parse_hex_rgb(parts.next()?)?;
         let hi = parse_hex_rgb(parts.next()?)?;
+        if parts.next().is_some() {
+            return None;
+        }
         Some(Self {
             shadow: sh,
             midtone: mid,
@@ -114,7 +117,7 @@ impl TriTonePalette {
 
 pub fn parse_hex_rgb(hex: &str) -> Option<[u8; 3]> {
     let h = hex.trim().trim_start_matches('#');
-    if h.len() != 6 {
+    if h.len() != 6 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let r = u8::from_str_radix(&h[0..2], 16).ok()?;

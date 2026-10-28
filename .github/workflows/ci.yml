@@ -79,6 +79,16 @@ jobs:
 
           exe = pathlib.Path("target/release/lumaglyph.exe" if os.name == "nt" else "target/release/lumaglyph")
           data = exe.read_bytes()
+          if os.name == "nt":
+              import struct
+              assert data[:2] == b"MZ", "Missing MZ header"
+              pe_off = struct.unpack_from("<I", data, 0x3C)[0]
+              assert data[pe_off:pe_off+4] == b"PE\x00\x00", "Missing PE signature"
+              subsystem = struct.unpack_from("<H", data, pe_off + 24 + 68)[0]
+              if subsystem != 2:
+                  print(f"ERROR: Expected IMAGE_SUBSYSTEM_WINDOWS_GUI (2), got {subsystem}", file=sys.stderr)
+                  sys.exit(1)
+              print("Verified Windows PE subsystem = IMAGE_SUBSYSTEM_WINDOWS_GUI (2) — no console attached.")
           forbidden = [
               b"/home/runner",
               b"/Users/runner",

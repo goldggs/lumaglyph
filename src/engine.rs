@@ -195,8 +195,16 @@ pub fn convert_image_buffer_with_audio(
     audio_energy: f32,
     frame: &mut AsciiFrame,
 ) {
-    assert!(channels == 3 || channels == 4, "channels must be 3 or 4");
-    if img_w == 0 || img_h == 0 || pixels.len() < (img_w as usize) * (img_h as usize) * channels {
+    if channels != 3 && channels != 4 {
+        return;
+    }
+    let Some(min_bytes) = (img_w as usize)
+        .checked_mul(img_h as usize)
+        .and_then(|px| px.checked_mul(channels))
+    else {
+        return;
+    };
+    if img_w == 0 || img_h == 0 || pixels.len() < min_bytes {
         return;
     }
 
@@ -204,7 +212,7 @@ pub fn convert_image_buffer_with_audio(
     let cols = params.cols.clamp(16, 420);
     let rows = ((cols as f32) * (img_h as f32 / img_w as f32) * atlas.aspect)
         .round()
-        .max(1.0) as u32;
+        .clamp(1.0, 2000.0) as u32;
     let total_cells = (cols as usize) * (rows as usize);
 
     let has_valid_history = use_temporal
@@ -219,8 +227,18 @@ pub fn convert_image_buffer_with_audio(
         frame.cells.resize(total_cells, AsciiCell::default());
     }
 
-    // Audio-reactive modulation pulse (`0.0` when disabled or silent)
-    let beat = (audio_energy.clamp(0.0, 1.5) * params.audio_reactive).clamp(0.0, 2.0);
+    // Audio-reactive modulation pulse (`0.0` when disabled, silent, or non-finite)
+    let safe_audio = if audio_energy.is_finite() {
+        audio_energy.clamp(0.0, 1.5)
+    } else {
+        0.0
+    };
+    let safe_ar = if params.audio_reactive.is_finite() {
+        params.audio_reactive.clamp(0.0, 2.5)
+    } else {
+        0.0
+    };
+    let beat = (safe_audio * safe_ar).clamp(0.0, 2.0);
     let eff_brightness = (params.brightness + beat * 0.065).clamp(-0.5, 0.5);
     let eff_contrast = (params.contrast * (1.0 + beat * 0.14)).clamp(0.3, 3.2);
     let eff_sat = (params.saturation * (1.0 + beat * 0.25)).clamp(0.0, 3.0);

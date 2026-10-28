@@ -2,6 +2,10 @@ use crate::charset::CharsetPreset;
 use crate::color::{ColorMode, TriTonePalette};
 use crate::engine::RenderParams;
 
+fn parse_finite_f32(v: &str) -> Option<f32> {
+    v.trim().parse::<f32>().ok().filter(|x| x.is_finite())
+}
+
 impl RenderParams {
     /// Encode all visual & physics settings into a shareable one-line `lg2:...` Look Code.
     pub fn to_look_code(&self) -> String {
@@ -35,15 +39,21 @@ impl RenderParams {
         );
         if self.charset == CharsetPreset::Custom && !self.custom_chars.is_empty() {
             s.push_str(",cc=");
-            for &byte in self.custom_chars.as_bytes() {
-                s.push_str(&format!("{byte:02X}"));
+            for &byte in self.custom_chars.as_bytes().iter().take(256) {
+                if (0x20..=0x7E).contains(&byte) {
+                    s.push_str(&format!("{byte:02X}"));
+                }
             }
         }
         s
     }
 
     /// Parse and apply a shareable `lg2:...` Look Code string onto `self`.
+    /// Rejects non-finite floats (`NaN`, `inf`, `-inf`), oversized inputs, and control bytes.
     pub fn apply_look_code(&mut self, raw: &str) -> Result<(), String> {
+        if raw.len() > 2048 {
+            return Err("Look code exceeds maximum allowed length (2048 bytes)".to_string());
+        }
         let trimmed = raw.trim().trim_matches(['`', '"', '\'']).trim();
         let body = trimmed
             .strip_prefix("lg2:")
@@ -69,7 +79,7 @@ impl RenderParams {
             };
             match k.trim() {
                 "cols" => {
-                    if let Ok(n) = v.parse::<u32>() {
+                    if let Ok(n) = v.trim().parse::<u32>() {
                         self.cols = n.clamp(16, 420);
                         applied += 1;
                     }
@@ -89,11 +99,14 @@ impl RenderParams {
                 "oled" => {
                     if let Some(f) = parse_bool(v) {
                         self.oled_black = f;
+                        if f {
+                            self.transparent_bg = false;
+                        }
                         applied += 1;
                     }
                 }
                 "gate" => {
-                    if let Ok(x) = v.parse::<f32>() {
+                    if let Some(x) = parse_finite_f32(v) {
                         self.black_gate = x.clamp(0.0, 0.35);
                         applied += 1;
                     }
@@ -101,6 +114,9 @@ impl RenderParams {
                 "alpha" => {
                     if let Some(f) = parse_bool(v) {
                         self.transparent_bg = f;
+                        if f {
+                            self.oled_black = false;
+                        }
                         applied += 1;
                     }
                 }
@@ -111,79 +127,79 @@ impl RenderParams {
                     }
                 }
                 "wfs" => {
-                    if let Ok(x) = v.parse::<f32>() {
+                    if let Some(x) = parse_finite_f32(v) {
                         self.wireframe_sensitivity = x.clamp(0.2, 3.0);
                         applied += 1;
                     }
                 }
                 "ar" => {
-                    if let Ok(x) = v.parse::<f32>() {
+                    if let Some(x) = parse_finite_f32(v) {
                         self.audio_reactive = x.clamp(0.0, 2.5);
                         applied += 1;
                     }
                 }
                 "cr" => {
-                    if let Ok(x) = v.parse::<f32>() {
+                    if let Some(x) = parse_finite_f32(v) {
                         self.directional_crunch = x.clamp(0.0, 3.5);
                         applied += 1;
                     }
                 }
                 "ew" => {
-                    if let Ok(x) = v.parse::<f32>() {
+                    if let Some(x) = parse_finite_f32(v) {
                         self.edge_weight = x.clamp(0.0, 2.5);
                         applied += 1;
                     }
                 }
                 "lum" => {
-                    if let Ok(x) = v.parse::<f32>() {
+                    if let Some(x) = parse_finite_f32(v) {
                         self.luminance_comp = x.clamp(0.0, 1.5);
                         applied += 1;
                     }
                 }
                 "bg" => {
-                    if let Ok(x) = v.parse::<f32>() {
+                    if let Some(x) = parse_finite_f32(v) {
                         self.bg_intensity = x.clamp(0.0, 0.65);
                         applied += 1;
                     }
                 }
                 "dt" => {
-                    if let Ok(x) = v.parse::<f32>() {
+                    if let Some(x) = parse_finite_f32(v) {
                         self.dither = x.clamp(0.0, 1.0);
                         applied += 1;
                     }
                 }
                 "vig" => {
-                    if let Ok(x) = v.parse::<f32>() {
+                    if let Some(x) = parse_finite_f32(v) {
                         self.vignette_focus = x.clamp(0.0, 1.0);
                         applied += 1;
                     }
                 }
                 "st" => {
-                    if let Ok(x) = v.parse::<f32>() {
+                    if let Some(x) = parse_finite_f32(v) {
                         self.temporal_stability = x.clamp(0.0, 0.5);
                         applied += 1;
                     }
                 }
                 "br" => {
-                    if let Ok(x) = v.parse::<f32>() {
+                    if let Some(x) = parse_finite_f32(v) {
                         self.brightness = x.clamp(-0.5, 0.5);
                         applied += 1;
                     }
                 }
                 "ct" => {
-                    if let Ok(x) = v.parse::<f32>() {
+                    if let Some(x) = parse_finite_f32(v) {
                         self.contrast = x.clamp(0.3, 3.0);
                         applied += 1;
                     }
                 }
                 "sat" => {
-                    if let Ok(x) = v.parse::<f32>() {
+                    if let Some(x) = parse_finite_f32(v) {
                         self.saturation = x.clamp(0.0, 3.0);
                         applied += 1;
                     }
                 }
                 "gam" => {
-                    if let Ok(x) = v.parse::<f32>() {
+                    if let Some(x) = parse_finite_f32(v) {
                         self.gamma = x.clamp(0.25, 3.0);
                         applied += 1;
                     }
@@ -214,22 +230,26 @@ impl RenderParams {
                 }
                 "cc" => {
                     let h = v.trim();
-                    if h.len() % 2 == 0 && !h.is_empty() {
-                        let mut bytes = Vec::with_capacity(h.len() / 2);
+                    if !h.is_empty()
+                        && h.len() <= 512
+                        && h.len() % 2 == 0
+                        && h.bytes().all(|b| b.is_ascii_hexdigit())
+                    {
+                        let mut chars = String::with_capacity(h.len() / 2);
                         let mut ok = true;
                         for i in (0..h.len()).step_by(2) {
                             if let Ok(b) = u8::from_str_radix(&h[i..i + 2], 16) {
-                                bytes.push(b);
+                                if (0x20..=0x7E).contains(&b) {
+                                    chars.push(b as char);
+                                }
                             } else {
                                 ok = false;
                                 break;
                             }
                         }
-                        if ok {
-                            if let Ok(decoded) = String::from_utf8(bytes) {
-                                self.custom_chars = decoded;
-                                applied += 1;
-                            }
+                        if ok && !chars.is_empty() {
+                            self.custom_chars = chars;
+                            applied += 1;
                         }
                     }
                 }

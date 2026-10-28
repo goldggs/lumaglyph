@@ -12,8 +12,9 @@ use crate::theme::{
     AccentPreset, CheckerContrast, CornerStyle, StudioTheme, ThemePalette, UiDensity,
 };
 use crate::updater::{
-    format_build_report, spawn_release_check, AppPreferences, ReleaseCheckOutcome, APP_VERSION,
-    BUILD_GIT_SHA, BUILD_PROFILE, BUILD_RUSTC_VERSION, BUILD_TARGET_TRIPLE,
+    format_build_report, spawn_release_check, spawn_verified_release_download, AppPreferences,
+    ReleaseCheckOutcome, VerifiedDownloadOutcome, APP_VERSION, BUILD_GIT_SHA, BUILD_PROFILE,
+    BUILD_RUSTC_VERSION, BUILD_TARGET_TRIPLE, DEFAULT_GITHUB_REPO,
 };
 use crate::video::{
     detect_ffmpeg_version, set_video_pipeline_prefs, transcode_video_streaming, LiveVideoStream,
@@ -169,6 +170,8 @@ pub struct LumaGlyphApp {
     settings_tab: SettingsTab,
     update_rx: Option<Receiver<Result<ReleaseCheckOutcome, String>>>,
     update_status: Option<Result<ReleaseCheckOutcome, String>>,
+    download_rx: Option<Receiver<Result<VerifiedDownloadOutcome, String>>>,
+    download_status: Option<Result<VerifiedDownloadOutcome, String>>,
 
     // Automated frame capture exit
     frames_drawn: u32,
@@ -278,6 +281,8 @@ impl LumaGlyphApp {
             settings_tab: initial_tab,
             update_rx,
             update_status: None,
+            download_rx: None,
+            download_status: None,
             frames_drawn: 0,
             auto_exit_after_frames: boot.auto_exit_after_frames,
         };
@@ -724,6 +729,7 @@ impl LumaGlyphApp {
         }
 
         if let Some(rx) = &self.update_rx {
+            ctx.request_repaint_after(std::time::Duration::from_millis(80));
             if let Ok(res) = rx.try_recv() {
                 if let Ok(ref ok) = res {
                     if ok.update_available {
@@ -735,6 +741,21 @@ impl LumaGlyphApp {
                 }
                 self.update_status = Some(res);
                 self.update_rx = None;
+            }
+        }
+
+        if let Some(rx) = &self.download_rx {
+            ctx.request_repaint_after(std::time::Duration::from_millis(80));
+            if let Ok(res) = rx.try_recv() {
+                match &res {
+                    Ok(done) => self.set_toast(format!(
+                        "Verified SHA-256 & saved {}",
+                        done.saved_path.display()
+                    )),
+                    Err(err) => self.set_toast(format!("Update verification blocked: {err}")),
+                }
+                self.download_status = Some(res);
+                self.download_rx = None;
             }
         }
 
@@ -2634,6 +2655,27 @@ impl LumaGlyphApp {
             }
         });
 
+        if !self
+            .prefs
+            .github_repo
+            .trim()
+            .eq_ignore_ascii_case(DEFAULT_GITHUB_REPO)
+        {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "Custom repository configured (official: {DEFAULT_GITHUB_REPO})"
+                    ))
+                    .size(11.0)
+                    .color(pal.warn),
+                );
+                if ui.small_button("Reset to Official").clicked() {
+                    self.prefs.github_repo = DEFAULT_GITHUB_REPO.to_string();
+                    let _ = self.prefs.save();
+                }
+            });
+        }
+
         if ui
             .checkbox(
                 &mut self.prefs.check_updates_on_startup,
@@ -2656,7 +2698,36 @@ impl LumaGlyphApp {
                             .font(plex_medium(11.6))
                             .color(pal.warn),
                         );
-                        ui.hyperlink_to("Open GitHub Release Page", &info.html_url);
+                        ui.horizontal(|ui| {
+                            let dl_busy = self.download_rx.is_some();
+                            let dl_label = if dl_busy {
+                                "Verifying SHA-256 & Downloading..."
+                            } else {
+                                "Download Verified Binary..."
+                            };
+                            if ui
+                                .add_enabled(!dl_busy, egui::Button::new(dl_label))
+                                .on_hover_text(
+                                    "Downloads archive over HTTPS, verifies SHA256SUMS.txt in constant time, and inspects native OS/CPU binary header",
+                                )
+                                .clicked()
+                            {
+                                let default_dir = dirs::download_dir()
+                                    .or_else(dirs::home_dir)
+                                    .unwrap_or_else(|| PathBuf::from("."));
+                                if let Some(chosen) = rfd::FileDialog::new()
+                                    .set_directory(&default_dir)
+                                    .pick_folder()
+                                {
+                                    self.download_status = None;
+                                    self.download_rx = Some(spawn_verified_release_download(
+                                        self.prefs.github_repo.clone(),
+                                        chosen,
+                                    ));
+                                }
+                            }
+                            ui.hyperlink_to("Open GitHub Release Page", &info.html_url);
+                        });
                     } else {
                         ui.label(
                             RichText::new(format!(
@@ -2670,6 +2741,26 @@ impl LumaGlyphApp {
                 }
                 Err(err) => {
                     ui.label(RichText::new(err).size(11.2).color(pal.warn));
+                }
+            }
+        }
+
+        if let Some(dl) = &self.download_status {
+            match dl {
+                Ok(done) => {
+                    ui.label(
+                        RichText::new(format!(
+                            "Verified {} (SHA-256 {}...) -> {}",
+                            done.tag,
+                            &done.sha256_hex[..16],
+                            done.saved_path.display()
+                        ))
+                        .font(mono_font(10.8))
+                        .color(pal.accent),
+                    );
+                }
+                Err(err) => {
+                    ui.label(RichText::new(err).size(11.1).color(pal.warn));
                 }
             }
         }

@@ -10,7 +10,8 @@ use crate::samples::{generate_sample_rgba, SamplePreset};
 use crate::telemetry::format_rss_mb;
 use crate::theme::StudioTheme;
 use crate::updater::{
-    check_latest_release_blocking, format_build_report, AppPreferences, APP_VERSION,
+    check_latest_release_blocking, download_and_verify_release_blocking, format_build_report,
+    AppPreferences, APP_VERSION, DEFAULT_GITHUB_REPO,
 };
 use crate::video::{detect_ffmpeg_version, transcode_video_streaming, TranscodeProgress};
 use clap::{Parser, Subcommand};
@@ -188,14 +189,53 @@ pub enum Commands {
         #[arg(long, default_value_t = 120)]
         iters: u32,
     },
-    /// Manually check GitHub Releases for a newer version (no background telemetry).
+    /// Manually check GitHub Releases or download a SHA-256 verified binary update (no background telemetry).
     CheckUpdate {
         #[arg(long)]
         repo: Option<String>,
+        /// Download, SHA-256 verify, inspect native binary header, and extract the latest release binary.
+        #[arg(long)]
+        download: bool,
+        /// Destination directory when `--download` is set (defaults to current working directory).
+        #[arg(long)]
+        dest: Option<PathBuf>,
+        /// Permit `--download` from a custom `--repo` other than the canonical repository.
+        #[arg(long)]
+        allow_custom_repo: bool,
     },
 }
 
-fn parse_tritone_arg(spec: &str) -> Result<TriTonePalette, String> {
+/// Determines whether `args` represent a headless CLI / help / version invocation (which should
+/// attach to an existing parent shell on Windows) versus a native GUI workstation launch (which
+/// runs completely detached with zero console window).
+pub fn should_attach_parent_console<S: AsRef<str>>(args: &[S]) -> bool {
+    if args.len() <= 1 {
+        return false;
+    }
+    for a in &args[1..] {
+        let s = a.as_ref();
+        if matches!(s, "-h" | "--help" | "-V" | "--version" | "help") {
+            return true;
+        }
+    }
+    let first = args[1].as_ref();
+    if first == "studio" {
+        return false;
+    }
+    if matches!(
+        first,
+        "image" | "video" | "look" | "build-info" | "info" | "bench" | "check-update"
+    ) {
+        return true;
+    }
+    if first.starts_with('-') {
+        return true;
+    }
+    // Single positional file path (`lumaglyph.exe C:\media\clip.mp4`) opens GUI directly
+    args.len() > 2
+}
+
+pub fn parse_tritone_arg(spec: &str) -> Result<TriTonePalette, String> {
     match spec.trim().to_ascii_lowercase().as_str() {
         "solar" | "flare" | "inferno" | "fire" => Ok(TriTonePalette::SOLAR_FLARE),
         "tokyo" | "cyber" | "neon" => Ok(TriTonePalette::TOKYO_MIDNIGHT),
@@ -578,17 +618,43 @@ pub fn run_entry() -> Result<(), String> {
             println!("  Memory (RSS)    : {}", format_rss_mb());
             Ok(())
         }
-        Some(Commands::CheckUpdate { repo }) => {
+        Some(Commands::CheckUpdate {
+            repo,
+            download,
+            dest,
+            allow_custom_repo,
+        }) => {
             let prefs = AppPreferences::load();
-            let slug = repo.unwrap_or(prefs.github_repo);
-            let out = check_latest_release_blocking(&slug)?;
-            if out.update_available {
+            let slug = repo.unwrap_or_else(|| {
+                if download && !allow_custom_repo {
+                    DEFAULT_GITHUB_REPO.to_string()
+                } else {
+                    prefs.github_repo
+                }
+            });
+
+            if download {
+                let target_dir = dest.unwrap_or_else(|| PathBuf::from("."));
+                let out =
+                    download_and_verify_release_blocking(&slug, &target_dir, !allow_custom_repo)?;
+                println!("Verified release : {}", out.tag);
+                println!("Archive          : {}", out.archive_name);
+                println!("SHA-256 (matched): {}", out.sha256_hex);
                 println!(
-                    "New release available: {} (current v{APP_VERSION})\n{}",
-                    out.latest_tag, out.html_url
+                    "Saved executable : {} ({:.2} MB)",
+                    out.saved_path.display(),
+                    (out.binary_size_bytes as f64) / (1024.0 * 1024.0)
                 );
             } else {
-                println!("Up to date. Latest GitHub release is {}.", out.latest_tag);
+                let out = check_latest_release_blocking(&slug)?;
+                if out.update_available {
+                    println!(
+                        "New release available: {} (current v{APP_VERSION})\n{}",
+                        out.latest_tag, out.html_url
+                    );
+                } else {
+                    println!("Up to date. Latest GitHub release is {}.", out.latest_tag);
+                }
             }
             Ok(())
         }

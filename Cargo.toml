@@ -1,6 +1,6 @@
 [package]
 name = "lumaglyph"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 rust-version = "1.75"
 description = "High-throughput 95-character color ASCII art and streaming video workstation"
@@ -19,6 +19,7 @@ eframe = { version = "0.31", default-features = false, features = [
     "wayland",
 ] }
 egui = "0.31"
+flate2 = "1.0"
 fontdue = "0.9"
 gif = "0.13"
 image = { version = "0.25", default-features = false, features = [
@@ -32,7 +33,10 @@ rayon = "1.10"
 rfd = "0.15"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
+tar = "0.4"
 ureq = { version = "2.12", default-features = false, features = ["tls", "json"] }
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
 
 [profile.release]
 opt-level = 3
