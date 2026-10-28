@@ -1,5 +1,5 @@
 use crate::charset::CharsetPreset;
-use crate::color::ColorMode;
+use crate::color::{ColorMode, TriTonePalette};
 use crate::engine::{convert_image_buffer, AsciiFrame, RenderParams};
 use crate::export::{
     export_ansi, export_html, export_png, export_svg, export_txt, frame_to_ansi_string,
@@ -38,12 +38,28 @@ pub enum Commands {
         file: Option<PathBuf>,
         #[arg(long)]
         preset: Option<String>,
+        /// Apply a one-line shareable Look Code (`lg2:...`).
+        #[arg(long)]
+        look: Option<String>,
         #[arg(long)]
         color: Option<String>,
+        /// Tri-Tone palette (`cyber`, `inferno`, `ice`, `gold`, or `HEX1,HEX2,HEX3`).
+        #[arg(long)]
+        tritone: Option<String>,
         #[arg(long)]
         charset: Option<String>,
         #[arg(long)]
         cols: Option<u32>,
+        #[arg(long)]
+        oled_black: bool,
+        #[arg(long)]
+        black_gate: Option<f32>,
+        #[arg(long)]
+        transparent: bool,
+        #[arg(long)]
+        wireframe: bool,
+        #[arg(long)]
+        audio_reactive: Option<f32>,
         #[arg(long)]
         split: Option<f32>,
         #[arg(long)]
@@ -64,46 +80,94 @@ pub enum Commands {
         /// Output file (.png, .svg, .html, .ans, .txt). Prints TrueColor ANSI to stdout if omitted.
         #[arg(short, long)]
         output: Option<PathBuf>,
-        #[arg(long, default_value_t = 156)]
-        cols: u32,
-        #[arg(long, default_value = "genuine95")]
-        charset: String,
-        #[arg(long, default_value = "truecolor")]
-        color: String,
-        #[arg(long, default_value_t = 1.40)]
-        crunch: f32,
-        #[arg(long, default_value_t = 0.92)]
-        edge: f32,
-        #[arg(long, default_value_t = 0.08)]
-        dither: f32,
+        /// Apply a shareable `lg2:...` Look Code before CLI overrides.
+        #[arg(long)]
+        look: Option<String>,
+        #[arg(long)]
+        cols: Option<u32>,
+        #[arg(long)]
+        charset: Option<String>,
+        #[arg(long)]
+        color: Option<String>,
+        /// Tri-Tone palette (`cyber`, `inferno`, `ice`, `gold`, or `HEX1,HEX2,HEX3`).
+        #[arg(long)]
+        tritone: Option<String>,
+        /// True `#000000` pitch-black background for OLED displays.
+        #[arg(long)]
+        oled_black: bool,
+        /// Shadow noise gate (`0.00..=0.35`, default `0.03`).
+        #[arg(long)]
+        black_gate: Option<f32>,
+        /// Render background with true `RGBA [0,0,0,0]` alpha cutout.
+        #[arg(long)]
+        transparent: bool,
+        /// Contour / Neon Wireframe mode (edges only, flat fills dropped).
+        #[arg(long)]
+        wireframe: bool,
+        #[arg(long)]
+        wireframe_sens: Option<f32>,
+        #[arg(long)]
+        crunch: Option<f32>,
+        #[arg(long)]
+        edge: Option<f32>,
+        #[arg(long)]
+        dither: Option<f32>,
         #[arg(long)]
         bloom: bool,
         #[arg(long)]
         scanlines: bool,
     },
-    /// Stream-transcode a video file to ASCII video (.mp4 / .gif / .ans) with flat memory usage.
+    /// Stream-transcode a video file to ASCII video (.mp4 / .webm / .mov / .gif / .ans) with flat memory.
     Video {
         /// Input video path (.mp4, .mkv, .mov, .webm).
         input: PathBuf,
-        /// Output video/animation path (.mp4, .gif, .ans).
+        /// Output video/animation path (.mp4, .webm, .mov, .gif, .ans).
         #[arg(short, long)]
         output: PathBuf,
-        #[arg(long, default_value_t = 156)]
-        cols: u32,
+        /// Apply a shareable `lg2:...` Look Code before CLI overrides.
+        #[arg(long)]
+        look: Option<String>,
+        #[arg(long)]
+        cols: Option<u32>,
         #[arg(long)]
         fps: Option<f64>,
-        #[arg(long, default_value = "genuine95")]
-        charset: String,
-        #[arg(long, default_value = "truecolor")]
-        color: String,
-        #[arg(long, default_value_t = 0.16)]
-        stability: f32,
-        #[arg(long, default_value_t = 1.40)]
-        crunch: f32,
-        #[arg(long, default_value_t = 0.92)]
-        edge: f32,
+        #[arg(long)]
+        charset: Option<String>,
+        #[arg(long)]
+        color: Option<String>,
+        /// Tri-Tone palette (`cyber`, `inferno`, `ice`, `gold`, or `HEX1,HEX2,HEX3`).
+        #[arg(long)]
+        tritone: Option<String>,
+        /// True `#000000` pitch-black background for OLED displays.
+        #[arg(long)]
+        oled_black: bool,
+        /// Shadow noise gate (`0.00..=0.35`, default `0.03`).
+        #[arg(long)]
+        black_gate: Option<f32>,
+        /// Transparent alpha video overlay (`.webm` VP9 yuva420p, `.mov` RGBA, or `.gif`).
+        #[arg(long)]
+        transparent: bool,
+        /// Contour / Neon Wireframe mode.
+        #[arg(long)]
+        wireframe: bool,
+        #[arg(long)]
+        wireframe_sens: Option<f32>,
+        /// Audio-reactive beat modulation strength (`0.0..=2.0`).
+        #[arg(long)]
+        audio_reactive: Option<f32>,
+        #[arg(long)]
+        stability: Option<f32>,
+        #[arg(long)]
+        crunch: Option<f32>,
+        #[arg(long)]
+        edge: Option<f32>,
         #[arg(long)]
         bloom: bool,
+    },
+    /// Print or inspect a `lg2:...` shareable Look Code.
+    Look {
+        /// Optional `lg2:...` code to inspect; prints default Look Code if omitted.
+        code: Option<String>,
     },
     /// Run a multi-core throughput & memory footprint benchmark.
     Bench {
@@ -119,8 +183,21 @@ pub enum Commands {
     },
 }
 
+fn parse_tritone_arg(spec: &str) -> Result<TriTonePalette, String> {
+    match spec.trim().to_ascii_lowercase().as_str() {
+        "solar" | "flare" | "inferno" | "fire" => Ok(TriTonePalette::SOLAR_FLARE),
+        "tokyo" | "cyber" | "neon" => Ok(TriTonePalette::TOKYO_MIDNIGHT),
+        "blade" | "amber" | "gold" => Ok(TriTonePalette::BLADE_TEAL_AMBER),
+        "emerald" | "ice" | "arctic" => Ok(TriTonePalette::EMERALD_ICE),
+        _ => TriTonePalette::from_hex_triplet(spec).ok_or_else(|| {
+            format!(
+                "Invalid --tritone '{spec}': use solar|tokyo|blade|emerald or RRGGBB-RRGGBB-RRGGBB"
+            )
+        }),
+    }
+}
+
 pub fn run_entry() -> Result<(), String> {
-    // Windows GUI subsystem note: when double-clicked with zero CLI arguments, launch straight into GUI
     let cli = Cli::parse();
 
     match cli.command {
@@ -131,9 +208,16 @@ pub fn run_entry() -> Result<(), String> {
         Some(Commands::Studio {
             file,
             preset,
+            look,
             color,
+            tritone,
             charset,
             cols,
+            oled_black,
+            black_gate,
+            transparent,
+            wireframe,
+            audio_reactive,
             split,
             zoom,
             bloom,
@@ -142,6 +226,9 @@ pub fn run_entry() -> Result<(), String> {
             exit_after_frames,
         }) => {
             let mut params = RenderParams::default();
+            if let Some(code) = look.as_deref() {
+                params.apply_look_code(code)?;
+            }
             if let Some(c) = cols {
                 params.cols = c;
             }
@@ -151,7 +238,30 @@ pub fn run_entry() -> Result<(), String> {
             if let Some(cm) = color.as_deref().and_then(ColorMode::from_cli) {
                 params.color_mode = cm;
             }
-            params.crt_bloom = bloom;
+            if let Some(tt) = tritone.as_deref() {
+                params.tritone = parse_tritone_arg(tt)?;
+                params.color_mode = ColorMode::TriTone;
+            }
+            if oled_black {
+                params.oled_black = true;
+                params.transparent_bg = false;
+            }
+            if let Some(bg) = black_gate {
+                params.black_gate = bg.clamp(0.0, 0.35);
+            }
+            if transparent {
+                params.transparent_bg = true;
+                params.oled_black = false;
+            }
+            if wireframe {
+                params.wireframe_only = true;
+            }
+            if let Some(ar) = audio_reactive {
+                params.audio_reactive = ar.clamp(0.0, 2.0);
+            }
+            if bloom {
+                params.crt_bloom = true;
+            }
 
             let initial_preset = match preset.as_deref() {
                 Some("synthwave") => Some(SamplePreset::SynthwaveHorizon),
@@ -174,9 +284,16 @@ pub fn run_entry() -> Result<(), String> {
         Some(Commands::Image {
             input,
             output,
+            look,
             cols,
             charset,
             color,
+            tritone,
+            oled_black,
+            black_gate,
+            transparent,
+            wireframe,
+            wireframe_sens,
             crunch,
             edge,
             dither,
@@ -199,20 +316,54 @@ pub fn run_entry() -> Result<(), String> {
             };
 
             let atlas = GlyphAtlas::default_embedded(20);
-            let mut params = RenderParams {
-                cols,
-                directional_crunch: crunch,
-                edge_weight: edge,
-                dither,
-                crt_bloom: bloom,
-                scanlines,
-                ..RenderParams::default()
-            };
-            if let Some(cs) = CharsetPreset::from_cli(&charset) {
+            let mut params = RenderParams::default();
+            if let Some(code) = look.as_deref() {
+                params.apply_look_code(code)?;
+            }
+            if let Some(c) = cols {
+                params.cols = c;
+            }
+            if let Some(cs) = charset.as_deref().and_then(CharsetPreset::from_cli) {
                 params.charset = cs;
             }
-            if let Some(cm) = ColorMode::from_cli(&color) {
+            if let Some(cm) = color.as_deref().and_then(ColorMode::from_cli) {
                 params.color_mode = cm;
+            }
+            if let Some(tt) = tritone.as_deref() {
+                params.tritone = parse_tritone_arg(tt)?;
+                params.color_mode = ColorMode::TriTone;
+            }
+            if oled_black {
+                params.oled_black = true;
+                params.transparent_bg = false;
+            }
+            if let Some(bg) = black_gate {
+                params.black_gate = bg.clamp(0.0, 0.35);
+            }
+            if transparent {
+                params.transparent_bg = true;
+                params.oled_black = false;
+            }
+            if wireframe {
+                params.wireframe_only = true;
+            }
+            if let Some(ws) = wireframe_sens {
+                params.wireframe_sensitivity = ws.clamp(0.2, 3.0);
+            }
+            if let Some(cr) = crunch {
+                params.directional_crunch = cr;
+            }
+            if let Some(ew) = edge {
+                params.edge_weight = ew;
+            }
+            if let Some(d) = dither {
+                params.dither = d;
+            }
+            if bloom {
+                params.crt_bloom = true;
+            }
+            if scanlines {
+                params.scanlines = true;
             }
 
             let mut frame = AsciiFrame::new();
@@ -224,64 +375,99 @@ pub fn run_entry() -> Result<(), String> {
                     .and_then(|s| s.to_str())
                     .unwrap_or("png")
                     .to_ascii_lowercase();
-                let inc_bg = params.color_mode == ColorMode::DualColor;
                 match ext.as_str() {
                     "png" => {
-                        let (pw, ph) = export_png(
-                            &frame,
-                            &atlas,
-                            28,
-                            params.crt_bloom,
-                            params.scanlines,
-                            &out_path,
-                        )?;
+                        let (pw, ph) = export_png(&frame, &atlas, 28, &params, &out_path)?;
                         eprintln!(
-                            "Saved PNG {} ({pw}x{ph}px, {}x{} cells, {}/95 unique glyphs, {:.2} ms, RSS {})",
+                            "Saved PNG {} ({pw}x{ph}px, {}x{} cells, {}/95 unique glyphs, {:.2} ms, RSS {})\nLook Code: {}",
                             out_path.display(),
                             frame.cols,
                             frame.rows,
                             frame.unique_glyphs,
                             frame.render_ms,
-                            format_rss_mb()
+                            format_rss_mb(),
+                            params.to_look_code()
                         );
                     }
-                    "svg" => export_svg(&frame, inc_bg, &out_path)?,
-                    "html" | "htm" => export_html(&frame, inc_bg, &out_path)?,
-                    "ans" => export_ansi(&frame, inc_bg, &out_path)?,
+                    "svg" => export_svg(&frame, &params, &out_path)?,
+                    "html" | "htm" => export_html(&frame, &params, &out_path)?,
+                    "ans" => export_ansi(&frame, &params, &out_path)?,
                     _ => export_txt(&frame, &out_path)?,
                 }
             } else {
-                let inc_bg = params.color_mode == ColorMode::DualColor;
-                println!("{}", frame_to_ansi_string(&frame, inc_bg));
+                println!("{}", frame_to_ansi_string(&frame, &params));
             }
             Ok(())
         }
         Some(Commands::Video {
             input,
             output,
+            look,
             cols,
             fps,
             charset,
             color,
+            tritone,
+            oled_black,
+            black_gate,
+            transparent,
+            wireframe,
+            wireframe_sens,
+            audio_reactive,
             stability,
             crunch,
             edge,
             bloom,
         }) => {
             let atlas = GlyphAtlas::default_embedded(20);
-            let mut params = RenderParams {
-                cols,
-                temporal_stability: stability,
-                directional_crunch: crunch,
-                edge_weight: edge,
-                crt_bloom: bloom,
-                ..RenderParams::default()
-            };
-            if let Some(cs) = CharsetPreset::from_cli(&charset) {
+            let mut params = RenderParams::default();
+            if let Some(code) = look.as_deref() {
+                params.apply_look_code(code)?;
+            }
+            if let Some(c) = cols {
+                params.cols = c;
+            }
+            if let Some(cs) = charset.as_deref().and_then(CharsetPreset::from_cli) {
                 params.charset = cs;
             }
-            if let Some(cm) = ColorMode::from_cli(&color) {
+            if let Some(cm) = color.as_deref().and_then(ColorMode::from_cli) {
                 params.color_mode = cm;
+            }
+            if let Some(tt) = tritone.as_deref() {
+                params.tritone = parse_tritone_arg(tt)?;
+                params.color_mode = ColorMode::TriTone;
+            }
+            if oled_black {
+                params.oled_black = true;
+                params.transparent_bg = false;
+            }
+            if let Some(bg) = black_gate {
+                params.black_gate = bg.clamp(0.0, 0.35);
+            }
+            if transparent {
+                params.transparent_bg = true;
+                params.oled_black = false;
+            }
+            if wireframe {
+                params.wireframe_only = true;
+            }
+            if let Some(ws) = wireframe_sens {
+                params.wireframe_sensitivity = ws.clamp(0.2, 3.0);
+            }
+            if let Some(ar) = audio_reactive {
+                params.audio_reactive = ar.clamp(0.0, 2.0);
+            }
+            if let Some(st) = stability {
+                params.temporal_stability = st;
+            }
+            if let Some(cr) = crunch {
+                params.directional_crunch = cr;
+            }
+            if let Some(ew) = edge {
+                params.edge_weight = ew;
+            }
+            if bloom {
+                params.crt_bloom = true;
             }
 
             let progress = TranscodeProgress::new(0);
@@ -303,14 +489,23 @@ pub fn run_entry() -> Result<(), String> {
                 transcode_video_streaming(&input, &output, &atlas, &params, fps, progress)?;
             let _ = reporter.join();
             eprintln!(
-                "\rDone! Rendered {} frames ({}x{}px) in {:.2}s ({:.1} FPS) · Peak/Final RSS {}",
+                "\rDone! Rendered {} frames ({}x{}px) in {:.2}s ({:.1} FPS) · Peak/Final RSS {}\nLook Code: {}",
                 summary.frames_rendered,
                 summary.out_width,
                 summary.out_height,
                 summary.elapsed_secs,
                 summary.avg_fps,
-                format_rss_mb()
+                format_rss_mb(),
+                params.to_look_code()
             );
+            Ok(())
+        }
+        Some(Commands::Look { code }) => {
+            let mut params = RenderParams::default();
+            if let Some(c) = code {
+                params.apply_look_code(&c)?;
+            }
+            println!("{}", params.to_look_code());
             Ok(())
         }
         Some(Commands::Bench { cols, iters }) => {
@@ -322,7 +517,6 @@ pub fn run_entry() -> Result<(), String> {
             };
             let mut frame = AsciiFrame::new();
 
-            // Warmup pass
             convert_image_buffer(&rgba, 1280, 720, 4, &atlas, &params, true, &mut frame);
 
             let t0 = Instant::now();
@@ -360,10 +554,7 @@ pub fn run_entry() -> Result<(), String> {
                     out.latest_tag, out.html_url
                 );
             } else {
-                println!(
-                    "Up to date (latest release: {}, installed: v{APP_VERSION})",
-                    out.latest_tag
-                );
+                println!("Up to date! Latest GitHub release is {}.", out.latest_tag);
             }
             Ok(())
         }

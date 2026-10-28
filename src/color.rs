@@ -1,7 +1,19 @@
 use serde::{Deserialize, Serialize};
 
-/// Default deep obsidian canvas background for pure foreground modes.
+/// Default deep matte studio obsidian background (`#090B10`) for standard LCD/IPS displays.
 pub const DEFAULT_BG: [u8; 3] = [9, 11, 16];
+
+/// True pitch-black (`#000000`) shutting physical OLED subpixels completely off.
+pub const OLED_BG: [u8; 3] = [0, 0, 0];
+
+#[inline(always)]
+pub fn active_canvas_bg(oled_black: bool) -> [u8; 3] {
+    if oled_black {
+        OLED_BG
+    } else {
+        DEFAULT_BG
+    }
+}
 
 /// 4x4 normalized Bayer ordered dithering matrix in `[-0.5, +0.5]`.
 pub const BAYER_4X4: [[f32; 4]; 4] = [
@@ -11,12 +23,114 @@ pub const BAYER_4X4: [[f32; 4]; 4] = [
     [0.46875, -0.03125, 0.34375, -0.15625],
 ];
 
+/// Custom 3-stop color gradient (`Shadow -> Midtone -> Highlight`) for poster/duotone/tritone looks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TriTonePalette {
+    pub shadow: [u8; 3],
+    pub midtone: [u8; 3],
+    pub highlight: [u8; 3],
+}
+
+impl Default for TriTonePalette {
+    fn default() -> Self {
+        Self::SOLAR_FLARE
+    }
+}
+
+impl TriTonePalette {
+    pub const SOLAR_FLARE: Self = Self {
+        shadow: [42, 10, 82],      // Deep Violet
+        midtone: [225, 29, 72],    // Electric Crimson
+        highlight: [253, 224, 71], // Solar Gold
+    };
+
+    pub const TOKYO_MIDNIGHT: Self = Self {
+        shadow: [18, 24, 92],      // Indigo Night
+        midtone: [192, 38, 211],   // Neon Orchid
+        highlight: [56, 236, 255], // Laser Cyan
+    };
+
+    pub const BLADE_TEAL_AMBER: Self = Self {
+        shadow: [10, 58, 74],      // Deep Petrol Teal
+        midtone: [20, 148, 168],   // Cinema Cyan
+        highlight: [255, 158, 44], // Sodium Vapor Amber
+    };
+
+    pub const EMERALD_ICE: Self = Self {
+        shadow: [8, 52, 42],        // Deep Pine
+        midtone: [16, 185, 129],    // Emerald
+        highlight: [224, 247, 255], // Glacial Ice
+    };
+
+    pub const PRESETS: [(&'static str, Self); 4] = [
+        ("Solar Flare", Self::SOLAR_FLARE),
+        ("Tokyo", Self::TOKYO_MIDNIGHT),
+        ("Blade", Self::BLADE_TEAL_AMBER),
+        ("Emerald", Self::EMERALD_ICE),
+    ];
+
+    pub fn sample(self, y: f32) -> [u8; 3] {
+        let t_clamped = y.clamp(0.0, 1.0);
+        let (c0, c1, t) = if t_clamped < 0.5 {
+            (self.shadow, self.midtone, t_clamped * 2.0)
+        } else {
+            (self.midtone, self.highlight, (t_clamped - 0.5) * 2.0)
+        };
+        [
+            (c0[0] as f32 + (c1[0] as f32 - c0[0] as f32) * t).round() as u8,
+            (c0[1] as f32 + (c1[1] as f32 - c0[1] as f32) * t).round() as u8,
+            (c0[2] as f32 + (c1[2] as f32 - c0[2] as f32) * t).round() as u8,
+        ]
+    }
+
+    pub fn to_hex_triplet(self) -> String {
+        format!(
+            "{:02X}{:02X}{:02X}-{:02X}{:02X}{:02X}-{:02X}{:02X}{:02X}",
+            self.shadow[0],
+            self.shadow[1],
+            self.shadow[2],
+            self.midtone[0],
+            self.midtone[1],
+            self.midtone[2],
+            self.highlight[0],
+            self.highlight[1],
+            self.highlight[2],
+        )
+    }
+
+    pub fn from_hex_triplet(s: &str) -> Option<Self> {
+        let sep = if s.contains('-') { '-' } else { ',' };
+        let mut parts = s.trim().split(sep);
+        let sh = parse_hex_rgb(parts.next()?)?;
+        let mid = parse_hex_rgb(parts.next()?)?;
+        let hi = parse_hex_rgb(parts.next()?)?;
+        Some(Self {
+            shadow: sh,
+            midtone: mid,
+            highlight: hi,
+        })
+    }
+}
+
+pub fn parse_hex_rgb(hex: &str) -> Option<[u8; 3]> {
+    let h = hex.trim().trim_start_matches('#');
+    if h.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&h[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&h[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&h[4..6], 16).ok()?;
+    Some([r, g, b])
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ColorMode {
     /// 24-bit TrueColor with ink-coverage luminance compensation so sparse glyphs stay vibrant.
     TrueColor,
     /// Demoscene/BBS Dual-Color: crisp foreground glyph + shadowed ambient cell background.
     DualColor,
+    /// Custom 3-stop Shadow -> Midtone -> Highlight gradient ramp.
+    TriTone,
     /// Warm vintage P3 Amber CRT phosphor curve.
     PhosphorAmber,
     /// Classic P1 Green terminal phosphor curve.
@@ -32,9 +146,10 @@ pub enum ColorMode {
 }
 
 impl ColorMode {
-    pub const ALL: [ColorMode; 8] = [
+    pub const ALL: [ColorMode; 9] = [
         ColorMode::TrueColor,
         ColorMode::DualColor,
+        ColorMode::TriTone,
         ColorMode::PhosphorAmber,
         ColorMode::PhosphorGreen,
         ColorMode::Cyberpunk,
@@ -47,6 +162,7 @@ impl ColorMode {
         match self {
             ColorMode::TrueColor => "TrueColor 24-bit",
             ColorMode::DualColor => "Dual-Color (FG + Ambient BG)",
+            ColorMode::TriTone => "Custom Tri-Tone (Shadow/Mid/High)",
             ColorMode::PhosphorAmber => "CRT Amber Phosphor",
             ColorMode::PhosphorGreen => "CRT Green Phosphor",
             ColorMode::Cyberpunk => "Cyberpunk Neon",
@@ -60,6 +176,7 @@ impl ColorMode {
         match self {
             ColorMode::TrueColor => "truecolor",
             ColorMode::DualColor => "dual",
+            ColorMode::TriTone => "tritone",
             ColorMode::PhosphorAmber => "amber",
             ColorMode::PhosphorGreen => "green",
             ColorMode::Cyberpunk => "cyberpunk",
@@ -73,6 +190,7 @@ impl ColorMode {
         match name.trim().to_ascii_lowercase().as_str() {
             "truecolor" | "24bit" | "rgb" => Some(Self::TrueColor),
             "dual" | "dualcolor" | "bbs" => Some(Self::DualColor),
+            "tritone" | "duotone" | "ramp" => Some(Self::TriTone),
             "amber" | "crt-amber" => Some(Self::PhosphorAmber),
             "green" | "crt-green" | "matrix" => Some(Self::PhosphorGreen),
             "cyberpunk" | "neon" => Some(Self::Cyberpunk),
@@ -146,8 +264,8 @@ pub fn grade_rgb(
     (r, g, b)
 }
 
-/// Compute `(fg, bg)` colors for a matched cell, applying ink-coverage luminance compensation
-/// so thin structural glyphs (`/`, `\`, `;`, `(`) retain rich color saturation and brightness.
+/// Compute `(fg, bg)` colors for a matched cell, honoring `oled_black` (`#000000`) and `TriTone`.
+#[allow(clippy::too_many_arguments)]
 #[inline]
 pub fn resolve_cell_colors(
     mode: ColorMode,
@@ -156,13 +274,16 @@ pub fn resolve_cell_colors(
     b: f32,
     boost: f32,
     bg_intensity: f32,
+    oled_black: bool,
+    tritone: &TriTonePalette,
 ) -> ([u8; 3], [u8; 3]) {
+    let base_bg = active_canvas_bg(oled_black);
+
     let apply_boost = |cr: f32, cg: f32, cb: f32, factor: f32| -> [u8; 3] {
         let mr = cr * factor;
         let mg = cg * factor;
         let mb = cb * factor;
         let peak = mr.max(mg).max(mb);
-        // Soft shoulder roll-off above 1.0 so bright colors don't desaturate into flat white
         let scale = if peak > 1.0 {
             (1.0 + 0.25 * (peak - 1.0)).min(1.12) / peak
         } else {
@@ -176,17 +297,37 @@ pub fn resolve_cell_colors(
     };
 
     match mode {
-        ColorMode::TrueColor => (apply_boost(r, g, b, boost), DEFAULT_BG),
+        ColorMode::TrueColor => (apply_boost(r, g, b, boost), base_bg),
         ColorMode::DualColor => {
             let fg = apply_boost(r, g, b, boost * 1.06);
-            // Quantize & darken ambient cell background for crisp contrast against foreground ink
             let bg_scale = bg_intensity.clamp(0.0, 0.65);
+            // In OLED mode, square low-luma background contribution so dark areas drop cleanly to #000000
+            let oled_toe = if oled_black {
+                luma_rgb(r, g, b).clamp(0.0, 1.0).sqrt()
+            } else {
+                1.0
+            };
+            let s = bg_scale * oled_toe;
             let bg = [
-                ((DEFAULT_BG[0] as f32) * (1.0 - bg_scale) + (r * 255.0) * bg_scale) as u8,
-                ((DEFAULT_BG[1] as f32) * (1.0 - bg_scale) + (g * 255.0) * bg_scale) as u8,
-                ((DEFAULT_BG[2] as f32) * (1.0 - bg_scale) + (b * 255.0) * bg_scale) as u8,
+                ((base_bg[0] as f32) * (1.0 - s) + (r * 255.0) * s) as u8,
+                ((base_bg[1] as f32) * (1.0 - s) + (g * 255.0) * s) as u8,
+                ((base_bg[2] as f32) * (1.0 - s) + (b * 255.0) * s) as u8,
             ];
             (fg, bg)
+        }
+        ColorMode::TriTone => {
+            let y = luma_rgb(r, g, b).clamp(0.0, 1.0);
+            let (c0, c1, t) = if y < 0.5 {
+                (tritone.shadow, tritone.midtone, y * 2.0)
+            } else {
+                (tritone.midtone, tritone.highlight, (y - 0.5) * 2.0)
+            };
+            let cr = (c0[0] as f32 + (c1[0] as f32 - c0[0] as f32) * t) * (1.0 / 255.0);
+            let cg = (c0[1] as f32 + (c1[1] as f32 - c0[1] as f32) * t) * (1.0 / 255.0);
+            let cb = (c0[2] as f32 + (c1[2] as f32 - c0[2] as f32) * t) * (1.0 / 255.0);
+            // Attenuate deep shadow stop slightly by luma so near-black doesn't glow artificially bright
+            let env = (0.28 + 0.72 * y).min(1.0);
+            (apply_boost(cr * env, cg * env, cb * env, boost), base_bg)
         }
         ColorMode::PhosphorAmber => {
             let y = (luma_rgb(r, g, b) * boost).clamp(0.0, 1.15);
@@ -195,7 +336,7 @@ pub fn resolve_cell_colors(
                 ((y.powf(1.22) * 184.0 + (y - 0.75).max(0.0) * 180.0).clamp(0.0, 245.0)) as u8,
                 ((y.powf(2.4) * 72.0).clamp(0.0, 95.0)) as u8,
             ];
-            (fg, [14, 9, 4])
+            (fg, if oled_black { OLED_BG } else { [14, 9, 4] })
         }
         ColorMode::PhosphorGreen => {
             let y = (luma_rgb(r, g, b) * boost).clamp(0.0, 1.15);
@@ -204,29 +345,31 @@ pub fn resolve_cell_colors(
                 (y.min(1.0) * 255.0) as u8,
                 ((y.powf(1.35) * 125.0).clamp(0.0, 155.0)) as u8,
             ];
-            (fg, [5, 14, 8])
+            (fg, if oled_black { OLED_BG } else { [5, 14, 8] })
         }
         ColorMode::Cyberpunk => {
             let y = luma_rgb(r, g, b);
             let warmth = (r - b).clamp(-1.0, 1.0) * 0.5 + 0.5;
-            // Blend electric cyan (0.10, 0.95, 1.0) <-> neon magenta-coral (1.0, 0.22, 0.78)
             let cr = (0.12 + 0.88 * warmth) * (0.28 + 0.85 * y);
             let cg = (0.95 - 0.65 * warmth + 0.25 * g) * (0.22 + 0.85 * y);
             let cb = (1.00 - 0.15 * warmth) * (0.35 + 0.75 * y);
-            (apply_boost(cr, cg, cb, boost * 0.95), [12, 8, 22])
+            (
+                apply_boost(cr, cg, cb, boost * 0.95),
+                if oled_black { OLED_BG } else { [12, 8, 22] },
+            )
         }
         ColorMode::Ansi16 => {
             let raw = apply_boost(r, g, b, boost);
-            (nearest_ansi16(raw), DEFAULT_BG)
+            (nearest_ansi16(raw), base_bg)
         }
         ColorMode::Xterm256 => {
             let raw = apply_boost(r, g, b, boost);
-            (quantize_xterm256(raw), DEFAULT_BG)
+            (quantize_xterm256(raw), base_bg)
         }
         ColorMode::Monochrome => {
             let y = (luma_rgb(r, g, b) * boost).clamp(0.0, 1.0);
             let fg = [(y * 246.0) as u8, (y * 244.0) as u8, (y * 238.0) as u8];
-            (fg, [10, 11, 14])
+            (fg, if oled_black { OLED_BG } else { [10, 11, 14] })
         }
     }
 }
@@ -264,7 +407,6 @@ fn quantize_xterm256(rgb: [u8; 3]) -> [u8; 3] {
         best
     };
     let cube = [snap(rgb[0]), snap(rgb[1]), snap(rgb[2])];
-    // Compare against 24-step xterm grayscale ramp
     let avg = ((rgb[0] as u16 + rgb[1] as u16 + rgb[2] as u16) / 3) as u8;
     let g_idx = ((avg.saturating_sub(8) as u16 * 23 + 114) / 230).min(23) as u8;
     let g_val = 8 + g_idx * 10;

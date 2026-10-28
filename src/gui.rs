@@ -1,6 +1,6 @@
 use crate::charset::{CharsetPreset, ASCII_COUNT, ASCII_MIN};
-use crate::color::ColorMode;
-use crate::engine::{convert_image_buffer, rasterize_rgba, AsciiFrame, RenderParams};
+use crate::color::{ColorMode, TriTonePalette};
+use crate::engine::{convert_image_buffer_with_audio, rasterize_rgba, AsciiFrame, RenderParams};
 use crate::export::{
     export_ansi, export_html, export_png, export_svg, export_txt, frame_to_ansi_string,
 };
@@ -51,6 +51,7 @@ struct ActiveTranscodeJob {
 pub struct LumaGlyphApp {
     atlas: GlyphAtlas,
     params: RenderParams,
+    look_code_buf: String,
     source_kind: SourceKind,
     source_rgba: Vec<u8>,
     source_channels: usize,
@@ -73,9 +74,10 @@ pub struct LumaGlyphApp {
     auto_fit: bool,
     pan_offset: Vec2,
 
-    // Motion & video state
+    // Motion, audio-reactive & video state
     motion_paused: bool,
     motion_start: Instant,
+    live_audio_energy: f32,
     video_frames_seen: u64,
     ffmpeg_info: Option<String>,
     transcode_job: Option<ActiveTranscodeJob>,
@@ -103,6 +105,7 @@ impl LumaGlyphApp {
 
         let atlas = GlyphAtlas::default_embedded(20);
         let params = boot.initial_params.unwrap_or_default();
+        let look_code_buf = params.to_look_code();
         let preset = boot.initial_preset.unwrap_or(SamplePreset::CyberSculpture);
 
         let sample_w = 960;
@@ -119,6 +122,7 @@ impl LumaGlyphApp {
         let mut app = Self {
             atlas,
             params,
+            look_code_buf,
             source_kind: if boot.live_motion {
                 SourceKind::LiveMotion(preset)
             } else {
@@ -136,13 +140,14 @@ impl LumaGlyphApp {
             orig_tex: None,
             ascii_px_w: 0,
             ascii_px_h: 0,
-            split_enabled: boot.split_wipe.is_some() || true,
+            split_enabled: boot.split_wipe != Some(0.0),
             split_ratio: boot.split_wipe.unwrap_or(0.34),
             zoom: boot.initial_zoom.unwrap_or(1.0),
             auto_fit: boot.initial_zoom.is_none(),
             pan_offset: Vec2::ZERO,
             motion_paused: false,
             motion_start: Instant::now(),
+            live_audio_energy: 0.0,
             video_frames_seen: 0,
             ffmpeg_info: detect_ffmpeg_version(),
             transcode_job: None,
@@ -158,10 +163,6 @@ impl LumaGlyphApp {
             auto_exit_after_frames: boot.auto_exit_after_frames,
         };
 
-        if boot.split_wipe == Some(0.0) {
-            app.split_enabled = false;
-        }
-
         if let Some(path) = boot.initial_media {
             app.load_media_path(path);
         }
@@ -173,6 +174,10 @@ impl LumaGlyphApp {
         self.status_toast = Some((msg.into(), Instant::now()));
     }
 
+    fn sync_look_code(&mut self) {
+        self.look_code_buf = self.params.to_look_code();
+    }
+
     fn load_sample(&mut self, preset: SamplePreset, animated: bool) {
         let w = 960;
         let h = 600;
@@ -180,6 +185,7 @@ impl LumaGlyphApp {
         self.source_channels = 4;
         self.source_w = w;
         self.source_h = h;
+        self.live_audio_energy = 0.0;
         self.source_kind = if animated {
             self.motion_start = Instant::now();
             self.motion_paused = false;
@@ -208,16 +214,23 @@ impl LumaGlyphApp {
                         .and_then(|s| s.to_str())
                         .unwrap_or("video")
                         .to_string();
+                    let has_audio = !stream.audio_envelope.is_empty();
                     self.source_w = stream.dec_w;
                     self.source_h = stream.dec_h;
                     self.source_channels = 3;
                     self.source_rgba = vec![0u8; (stream.dec_w * stream.dec_h * 3) as usize];
                     self.source_kind = SourceKind::VideoFile(stream);
                     self.video_frames_seen = 0;
+                    self.live_audio_energy = 0.0;
                     self.ascii_frame.prev_glyphs.clear();
                     self.source_dirty = true;
                     self.ascii_dirty = true;
-                    self.set_toast(format!("Streaming video: {fname} (flat 2-frame pipe)"));
+                    let audio_note = if has_audio {
+                        "audio envelope synced"
+                    } else {
+                        "silent stream"
+                    };
+                    self.set_toast(format!("Streaming video: {fname} ({audio_note})"));
                 }
                 Err(e) => self.set_toast(e),
             }
@@ -235,6 +248,7 @@ impl LumaGlyphApp {
                     self.source_h = h;
                     self.source_channels = 4;
                     self.source_rgba = rgba.into_raw();
+                    self.live_audio_energy = 0.0;
                     self.source_kind = SourceKind::StaticImage {
                         name: fname.clone(),
                     };
@@ -249,23 +263,31 @@ impl LumaGlyphApp {
     }
 
     fn refresh_pipelines(&mut self, ctx: &egui::Context) {
-        // 1. Poll live motion or streaming video frame
-        match &self.source_kind {
+        // 1. Poll live motion or streaming video frame (+ synchronized audio beat energy)
+        match &mut self.source_kind {
             SourceKind::LiveMotion(preset) => {
                 if !self.motion_paused {
                     let t = self.motion_start.elapsed().as_secs_f32();
                     self.source_rgba =
                         generate_sample_rgba(*preset, self.source_w, self.source_h, t);
                     self.source_channels = 4;
+                    // Synthetic 124-BPM studio pulse when testing Audio-Reactive on procedural scenes
+                    if self.params.audio_reactive > 0.001 {
+                        let phase = (t * (124.0 / 60.0)).fract();
+                        self.live_audio_energy = (1.0 - phase).powi(4);
+                    } else {
+                        self.live_audio_energy = 0.0;
+                    }
                     self.source_dirty = true;
                     self.ascii_dirty = true;
                     ctx.request_repaint();
                 }
             }
             SourceKind::VideoFile(stream) => {
-                if let Some(rgb) = stream.poll_latest_frame() {
+                if let Some((rgb, audio_e)) = stream.poll_latest_frame() {
                     self.source_rgba = rgb;
                     self.source_channels = 3;
+                    self.live_audio_energy = audio_e;
                     self.video_frames_seen += 1;
                     self.source_dirty = true;
                     self.ascii_dirty = true;
@@ -274,7 +296,9 @@ impl LumaGlyphApp {
                     ctx.request_repaint_after(std::time::Duration::from_millis(14));
                 }
             }
-            _ => {}
+            _ => {
+                self.live_audio_energy = 0.0;
+            }
         }
 
         // 2. Upload original source texture ONLY when split-wipe is enabled and source changed
@@ -302,11 +326,12 @@ impl LumaGlyphApp {
 
         // 3. Recompute genuine 95-char shape-vector ASCII + rasterize atlas to single GPU texture
         if self.ascii_dirty || self.ascii_tex.is_none() {
+            self.sync_look_code();
             let use_temporal = matches!(
                 self.source_kind,
                 SourceKind::LiveMotion(_) | SourceKind::VideoFile(_)
             );
-            convert_image_buffer(
+            convert_image_buffer_with_audio(
                 &self.source_rgba,
                 self.source_w,
                 self.source_h,
@@ -314,13 +339,15 @@ impl LumaGlyphApp {
                 &self.atlas,
                 &self.params,
                 use_temporal,
+                self.live_audio_energy,
                 &mut self.ascii_frame,
             );
+            let bloom_boost = self.live_audio_energy * self.params.audio_reactive * 0.65;
             let (pw, ph) = rasterize_rgba(
                 &self.ascii_frame,
                 &self.atlas,
-                self.params.crt_bloom,
-                self.params.scanlines,
+                &self.params,
+                bloom_boost,
                 &mut self.raster_rgba,
             );
             self.ascii_px_w = pw;
@@ -389,7 +416,7 @@ impl LumaGlyphApp {
 
     fn draw_top_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.spacing_mut().item_spacing.x = 7.0;
 
             // Brand badge
             Frame::new()
@@ -414,10 +441,7 @@ impl LumaGlyphApp {
 
             ui.separator();
 
-            if ui
-                .button(RichText::new("Open Image / GIF").size(12.5))
-                .clicked()
-            {
+            if ui.button(RichText::new("Open Image").size(12.0)).clicked() {
                 if let Some(path) = rfd::FileDialog::new()
                     .add_filter("Images", &["png", "jpg", "jpeg", "webp", "gif", "bmp"])
                     .pick_file()
@@ -426,7 +450,7 @@ impl LumaGlyphApp {
                 }
             }
 
-            if ui.button(RichText::new("Open Video").size(12.5)).clicked() {
+            if ui.button(RichText::new("Open Video").size(12.0)).clicked() {
                 if let Some(path) = rfd::FileDialog::new()
                     .add_filter("Videos", &["mp4", "mkv", "mov", "webm", "avi", "m4v"])
                     .pick_file()
@@ -436,8 +460,8 @@ impl LumaGlyphApp {
             }
 
             egui::ComboBox::from_id_salt("showcase_combo")
-                .selected_text("Showcase Scenes")
-                .width(148.0)
+                .selected_text("Scenes")
+                .width(105.0)
                 .show_ui(ui, |ui| {
                     for p in SamplePreset::ALL {
                         if ui.selectable_label(false, p.label()).clicked() {
@@ -457,7 +481,7 @@ impl LumaGlyphApp {
 
             let is_live = matches!(self.source_kind, SourceKind::LiveMotion(_));
             if ui
-                .selectable_label(is_live, RichText::new("Live 60fps Motion").size(12.0))
+                .selectable_label(is_live, RichText::new("Live 60fps").size(11.8))
                 .clicked()
             {
                 let cur = match self.source_kind {
@@ -469,8 +493,50 @@ impl LumaGlyphApp {
 
             ui.separator();
 
+            // Quick Studio Mode Pills (v0.2.0 highlights!)
             if ui
-                .selectable_label(self.split_enabled, RichText::new("Split-Wipe").size(12.0))
+                .selectable_label(
+                    self.params.oled_black,
+                    RichText::new("OLED #000000").size(11.8),
+                )
+                .on_hover_text("True #000000 pitch-black canvas for zero OLED subpixel glow")
+                .clicked()
+            {
+                self.params.oled_black = !self.params.oled_black;
+                if self.params.oled_black {
+                    self.params.transparent_bg = false;
+                }
+                self.ascii_dirty = true;
+            }
+
+            if ui
+                .selectable_label(
+                    self.params.transparent_bg,
+                    RichText::new("Alpha Cutout").size(11.8),
+                )
+                .on_hover_text("True RGBA [0,0,0,0] transparent background for overlays")
+                .clicked()
+            {
+                self.params.transparent_bg = !self.params.transparent_bg;
+                self.ascii_dirty = true;
+            }
+
+            if ui
+                .selectable_label(
+                    self.params.wireframe_only,
+                    RichText::new("Neon Wireframe").size(11.8),
+                )
+                .on_hover_text("Contour-only edge extraction dropping flat interior fills")
+                .clicked()
+            {
+                self.params.wireframe_only = !self.params.wireframe_only;
+                self.ascii_dirty = true;
+            }
+
+            ui.separator();
+
+            if ui
+                .selectable_label(self.split_enabled, RichText::new("Split-Wipe").size(11.8))
                 .clicked()
             {
                 self.split_enabled = !self.split_enabled;
@@ -480,16 +546,16 @@ impl LumaGlyphApp {
             }
 
             if ui
-                .selectable_label(self.auto_fit, RichText::new("Fit").size(12.0))
+                .selectable_label(self.auto_fit, RichText::new("Fit").size(11.8))
                 .clicked()
             {
                 self.auto_fit = true;
                 self.pan_offset = Vec2::ZERO;
             }
-            for &(label, z) in &[("100%", 1.0f32), ("200%", 2.0), ("350% Loupe", 3.5)] {
+            for &(label, z) in &[("100%", 1.0f32), ("200%", 2.0), ("350%", 3.5)] {
                 let active = !self.auto_fit && (self.zoom - z).abs() < 0.08;
                 if ui
-                    .selectable_label(active, RichText::new(label).size(12.0))
+                    .selectable_label(active, RichText::new(label).size(11.8))
                     .clicked()
                 {
                     self.auto_fit = false;
@@ -517,13 +583,12 @@ impl LumaGlyphApp {
                     Color32::from_rgb(148, 163, 184)
                 };
                 if ui
-                    .button(RichText::new(offline_label).color(upd_color).size(11.5))
+                    .button(RichText::new(offline_label).color(upd_color).size(11.2))
                     .clicked()
                 {
                     self.show_update_window = !self.show_update_window;
                 }
 
-                // Memory & speed pill
                 let fps_est = if self.ascii_frame.render_ms > 0.05 {
                     (1000.0 / self.ascii_frame.render_ms).min(9999.0)
                 } else {
@@ -539,10 +604,9 @@ impl LumaGlyphApp {
                     Color32::from_rgb(245, 158, 11),
                 );
 
-                // Genuine ASCII diversity pill
                 telemetry_pill(
                     ui,
-                    &format!("{} / 95 ASCII GLYPHS", self.ascii_frame.unique_glyphs),
+                    &format!("{} / 95 GLYPHS", self.ascii_frame.unique_glyphs),
                     Color32::from_rgb(14, 33, 29),
                     Color32::from_rgb(52, 211, 153),
                 );
@@ -554,130 +618,79 @@ impl LumaGlyphApp {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 8.0;
+                ui.spacing_mut().item_spacing.y = 5.0;
 
-                // 1. Grid & Genuine ASCII Typography
-                studio_card(ui, "TYPOGRAPHY & GLYPH SET", |ui| {
-                    let mut changed = false;
-
+                // 1. OLED Pitch-Black, Alpha Cutout, Neon Wireframe & Audio-Reactive
+                studio_card(ui, "OLED #000000 · ALPHA · WIREFRAME · AUDIO", |ui| {
+                    let mut c = false;
                     ui.horizontal(|ui| {
-                        ui.label("Columns");
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(
-                                RichText::new(format!(
-                                    "{}x{} cells",
-                                    self.ascii_frame.cols, self.ascii_frame.rows
-                                ))
-                                .color(Color32::from_rgb(125, 211, 252))
-                                .size(11.5),
-                            );
-                        });
-                    });
-                    changed |= ui
-                        .add(egui::Slider::new(&mut self.params.cols, 40..=320))
-                        .changed();
-
-                    ui.add_space(3.0);
-                    ui.label("Character Set");
-                    egui::ComboBox::from_id_salt("charset_combo")
-                        .selected_text(self.params.charset.label())
-                        .width(ui.available_width())
-                        .show_ui(ui, |ui| {
-                            for preset in CharsetPreset::ALL {
-                                if ui
-                                    .selectable_value(
-                                        &mut self.params.charset,
-                                        preset,
-                                        preset.label(),
-                                    )
-                                    .changed()
-                                {
-                                    changed = true;
-                                }
-                            }
-                        });
-
-                    if self.params.charset == CharsetPreset::Custom {
-                        ui.label("Custom Characters / Phrase");
                         if ui
-                            .text_edit_singleline(&mut self.params.custom_chars)
+                            .checkbox(&mut self.params.oled_black, "True OLED #000000")
                             .changed()
                         {
-                            changed = true;
-                        }
-                    }
-
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(&self.atlas.font_name)
-                                .size(11.0)
-                                .color(Color32::from_rgb(148, 163, 184)),
-                        );
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.small_button("Load .TTF").clicked() {
-                                if let Some(p) = rfd::FileDialog::new()
-                                    .add_filter("Font", &["ttf", "otf"])
-                                    .pick_file()
-                                {
-                                    if let Ok(bytes) = std::fs::read(&p) {
-                                        let name = p
-                                            .file_stem()
-                                            .and_then(|s| s.to_str())
-                                            .unwrap_or("Custom Font")
-                                            .to_string();
-                                        match GlyphAtlas::from_font_bytes(name, bytes, 20) {
-                                            Ok(new_atlas) => {
-                                                self.atlas = new_atlas;
-                                                changed = true;
-                                            }
-                                            Err(e) => self.set_toast(e),
-                                        }
-                                    }
-                                }
+                            if self.params.oled_black {
+                                self.params.transparent_bg = false;
                             }
-                        });
+                            c = true;
+                        }
+                        if ui
+                            .checkbox(&mut self.params.transparent_bg, "Alpha RGBA")
+                            .changed()
+                        {
+                            if self.params.transparent_bg {
+                                self.params.oled_black = false;
+                            }
+                            c = true;
+                        }
                     });
 
-                    if changed {
-                        self.ascii_dirty = true;
-                    }
-                });
+                    c |= labeled_slider(
+                        ui,
+                        "Shadow Noise Gate",
+                        &mut self.params.black_gate,
+                        0.00..=0.25,
+                    );
 
-                // 2. 8D Shape-Vector & Edge Lock Physics
-                studio_card(ui, "8D SHAPE-VECTOR & EDGE PHYSICS", |ui| {
-                    let mut c = false;
+                    ui.horizontal(|ui| {
+                        c |= ui
+                            .checkbox(
+                                &mut self.params.wireframe_only,
+                                "Neon Wireframe (Contour-Only)",
+                            )
+                            .changed();
+                    });
+                    if self.params.wireframe_only {
+                        c |= labeled_slider(
+                            ui,
+                            "Contour Sensitivity",
+                            &mut self.params.wireframe_sensitivity,
+                            0.35..=2.50,
+                        );
+                    }
+
                     c |= labeled_slider(
                         ui,
-                        "Directional Crunch",
-                        &mut self.params.directional_crunch,
-                        0.0..=3.0,
+                        "Audio-Reactive Beat",
+                        &mut self.params.audio_reactive,
+                        0.00..=2.00,
                     );
-                    c |= labeled_slider(
-                        ui,
-                        "Structure-Tensor Edge",
-                        &mut self.params.edge_weight,
-                        0.0..=2.0,
-                    );
-                    c |= labeled_slider(
-                        ui,
-                        "Video Anti-Flicker",
-                        &mut self.params.temporal_stability,
-                        0.0..=0.45,
-                    );
-                    c |= labeled_slider(
-                        ui,
-                        "Subject Vignette",
-                        &mut self.params.vignette_focus,
-                        0.0..=1.0,
-                    );
+                    if self.params.audio_reactive > 0.001 {
+                        let meter = (self.live_audio_energy * self.params.audio_reactive * 0.75)
+                            .clamp(0.0, 1.0);
+                        ui.add(
+                            egui::ProgressBar::new(meter)
+                                .desired_height(6.0)
+                                .fill(Color32::from_rgb(236, 72, 153)),
+                        );
+                    }
+
                     if c {
                         self.ascii_dirty = true;
                     }
                 });
 
-                // 3. Color Physics & Grading
-                studio_card(ui, "COLOR ENGINE & GRADING", |ui| {
+                // 2. Color Engine & Custom Tri-Tone Ramp Picker
+                studio_card(ui, "COLOR ENGINE & CUSTOM TRI-TONE", |ui| {
                     let mut c = false;
                     egui::ComboBox::from_id_salt("color_mode_combo")
                         .selected_text(self.params.color_mode.label())
@@ -693,13 +706,44 @@ impl LumaGlyphApp {
                             }
                         });
 
+                    if self.params.color_mode == ColorMode::TriTone {
+                        ui.add_space(2.0);
+                        draw_tritone_bar(ui, &self.params.tritone);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Ramp:").size(11.2));
+                            c |= ui
+                                .color_edit_button_srgb(&mut self.params.tritone.shadow)
+                                .on_hover_text("Shadow stop")
+                                .changed();
+                            ui.label("->");
+                            c |= ui
+                                .color_edit_button_srgb(&mut self.params.tritone.midtone)
+                                .on_hover_text("Midtone stop")
+                                .changed();
+                            ui.label("->");
+                            c |= ui
+                                .color_edit_button_srgb(&mut self.params.tritone.highlight)
+                                .on_hover_text("Highlight stop")
+                                .changed();
+                        });
+                        ui.horizontal(|ui| {
+                            for (lbl, pal) in TriTonePalette::PRESETS {
+                                if ui.small_button(lbl).clicked() {
+                                    self.params.tritone = pal;
+                                    c = true;
+                                }
+                            }
+                        });
+                    }
+
                     c |= labeled_slider(
                         ui,
                         "Ink Luminance Boost",
                         &mut self.params.luminance_comp,
                         0.0..=1.0,
                     );
-                    if self.params.color_mode == ColorMode::DualColor {
+                    if self.params.color_mode == ColorMode::DualColor && !self.params.transparent_bg
+                    {
                         c |= labeled_slider(
                             ui,
                             "Dual-BG Depth",
@@ -738,7 +782,152 @@ impl LumaGlyphApp {
                     }
                 });
 
-                // 4. Live Active Glyph Spectrum (proves genuine wide ASCII usage!)
+                // 3. Grid & Genuine ASCII Typography
+                studio_card(ui, "TYPOGRAPHY & GLYPH SET", |ui| {
+                    let mut changed = false;
+
+                    ui.horizontal(|ui| {
+                        ui.label("Columns");
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{}x{} cells",
+                                    self.ascii_frame.cols, self.ascii_frame.rows
+                                ))
+                                .color(Color32::from_rgb(125, 211, 252))
+                                .size(11.5),
+                            );
+                        });
+                    });
+                    changed |= ui
+                        .add(egui::Slider::new(&mut self.params.cols, 40..=320))
+                        .changed();
+
+                    ui.label("Character Set");
+                    egui::ComboBox::from_id_salt("charset_combo")
+                        .selected_text(self.params.charset.label())
+                        .width(ui.available_width())
+                        .show_ui(ui, |ui| {
+                            for preset in CharsetPreset::ALL {
+                                if ui
+                                    .selectable_value(
+                                        &mut self.params.charset,
+                                        preset,
+                                        preset.label(),
+                                    )
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                            }
+                        });
+
+                    if self.params.charset == CharsetPreset::Custom {
+                        ui.label("Custom Characters / Phrase");
+                        if ui
+                            .text_edit_singleline(&mut self.params.custom_chars)
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                    }
+
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(&self.atlas.font_name)
+                                .size(11.0)
+                                .color(Color32::from_rgb(148, 163, 184)),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.small_button("Load .TTF").clicked() {
+                                if let Some(p) = rfd::FileDialog::new()
+                                    .add_filter("Font", &["ttf", "otf"])
+                                    .pick_file()
+                                {
+                                    if let Ok(bytes) = std::fs::read(&p) {
+                                        let name = p
+                                            .file_stem()
+                                            .and_then(|s| s.to_str())
+                                            .unwrap_or("Custom Font")
+                                            .to_string();
+                                        match GlyphAtlas::from_font_bytes(name, bytes, 20) {
+                                            Ok(new_atlas) => {
+                                                self.atlas = new_atlas;
+                                                changed = true;
+                                            }
+                                            Err(e) => self.set_toast(e),
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    });
+
+                    if changed {
+                        self.ascii_dirty = true;
+                    }
+                });
+
+                // 4. 8D Shape-Vector & Edge Lock Physics
+                studio_card(ui, "8D SHAPE-VECTOR & EDGE PHYSICS", |ui| {
+                    let mut c = false;
+                    c |= labeled_slider(
+                        ui,
+                        "Directional Crunch",
+                        &mut self.params.directional_crunch,
+                        0.0..=3.0,
+                    );
+                    c |= labeled_slider(
+                        ui,
+                        "Structure-Tensor Edge",
+                        &mut self.params.edge_weight,
+                        0.0..=2.0,
+                    );
+                    c |= labeled_slider(
+                        ui,
+                        "Video Anti-Flicker",
+                        &mut self.params.temporal_stability,
+                        0.0..=0.45,
+                    );
+                    c |= labeled_slider(
+                        ui,
+                        "Subject Vignette",
+                        &mut self.params.vignette_focus,
+                        0.0..=1.0,
+                    );
+                    if c {
+                        self.ascii_dirty = true;
+                    }
+                });
+
+                // 5. One-Line Shareable Look Codes (lg2:)
+                studio_card(ui, "SHAREABLE LOOK CODE (lg2:)", |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.look_code_buf)
+                            .font(FontId::new(10.8, FontFamily::Monospace))
+                            .desired_width(ui.available_width()),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Copy Look").clicked() {
+                            let code = self.params.to_look_code();
+                            self.look_code_buf = code.clone();
+                            ui.ctx().copy_text(code);
+                            self.set_toast("Copied shareable lg2: Look Code to clipboard");
+                        }
+                        if ui.small_button("Apply Edited Code").clicked() {
+                            let code = self.look_code_buf.clone();
+                            match self.params.apply_look_code(&code) {
+                                Ok(()) => {
+                                    self.ascii_dirty = true;
+                                    self.set_toast("Applied lg2: Look Code");
+                                }
+                                Err(e) => self.set_toast(e),
+                            }
+                        }
+                    });
+                });
+
+                // 6. Live Active Glyph Spectrum
                 studio_card(ui, "ACTIVE GLYPH SPECTRUM", |ui| {
                     let mut pairs: Vec<(u8, u32)> = (0..ASCII_COUNT)
                         .filter_map(|i| {
@@ -762,7 +951,7 @@ impl LumaGlyphApp {
                     Frame::new()
                         .fill(Color32::from_rgb(10, 13, 20))
                         .corner_radius(CornerRadius::same(4))
-                        .inner_margin(Margin::symmetric(8, 6))
+                        .inner_margin(Margin::symmetric(8, 5))
                         .show(ui, |ui| {
                             ui.label(
                                 RichText::new(if top_preview.is_empty() {
@@ -770,13 +959,13 @@ impl LumaGlyphApp {
                                 } else {
                                     &top_preview
                                 })
-                                .font(FontId::new(13.0, FontFamily::Monospace))
+                                .font(FontId::new(12.5, FontFamily::Monospace))
                                 .color(Color32::from_rgb(56, 189, 248)),
                             );
                         });
                 });
 
-                // 5. Export Studio (Image + Video + Terminal ANSI)
+                // 7. Export Studio (Image + Alpha Video + Terminal ANSI)
                 studio_card(ui, "EXPORT STUDIO", |ui| {
                     ui.horizontal(|ui| {
                         if ui.button("Copy ASCII").clicked() {
@@ -784,9 +973,8 @@ impl LumaGlyphApp {
                             self.set_toast("Copied plain ASCII to clipboard");
                         }
                         if ui.button("Copy TrueColor ANSI").clicked() {
-                            let inc_bg = self.params.color_mode == ColorMode::DualColor;
                             ui.ctx()
-                                .copy_text(frame_to_ansi_string(&self.ascii_frame, inc_bg));
+                                .copy_text(frame_to_ansi_string(&self.ascii_frame, &self.params));
                             self.set_toast("Copied 24-bit ANSI escape art to clipboard");
                         }
                     });
@@ -805,8 +993,7 @@ impl LumaGlyphApp {
                                     &self.ascii_frame,
                                     &self.atlas,
                                     h_px,
-                                    self.params.crt_bloom,
-                                    self.params.scanlines,
+                                    &self.params,
                                     &p,
                                 ) {
                                     Ok((w, h)) => self.set_toast(format!("Saved PNG ({w}x{h})")),
@@ -820,8 +1007,7 @@ impl LumaGlyphApp {
                                 .add_filter("SVG", &["svg"])
                                 .save_file()
                             {
-                                let inc = self.params.color_mode == ColorMode::DualColor;
-                                match export_svg(&self.ascii_frame, inc, &p) {
+                                match export_svg(&self.ascii_frame, &self.params, &p) {
                                     Ok(()) => self.set_toast("Saved vector SVG"),
                                     Err(e) => self.set_toast(e),
                                 }
@@ -833,9 +1019,8 @@ impl LumaGlyphApp {
                                 .add_filter("HTML", &["html"])
                                 .save_file()
                             {
-                                let inc = self.params.color_mode == ColorMode::DualColor;
-                                match export_html(&self.ascii_frame, inc, &p) {
-                                    Ok(()) => self.set_toast("Saved dark standalone HTML"),
+                                match export_html(&self.ascii_frame, &self.params, &p) {
+                                    Ok(()) => self.set_toast("Saved standalone HTML"),
                                     Err(e) => self.set_toast(e),
                                 }
                             }
@@ -846,8 +1031,7 @@ impl LumaGlyphApp {
                                 .add_filter("ANSI Art", &["ans"])
                                 .save_file()
                             {
-                                let inc = self.params.color_mode == ColorMode::DualColor;
-                                match export_ansi(&self.ascii_frame, inc, &p) {
+                                match export_ansi(&self.ascii_frame, &self.params, &p) {
                                     Ok(()) => self.set_toast("Saved 24-bit terminal .ans"),
                                     Err(e) => self.set_toast(e),
                                 }
@@ -877,10 +1061,15 @@ impl LumaGlyphApp {
                             .unwrap_or(0);
                         ui.separator();
                         ui.label(
-                            RichText::new("Streaming Video Transcoder (Flat RAM)")
+                            RichText::new("Streaming Video Transcoder (Flat RAM + Alpha)")
                                 .strong()
                                 .color(Color32::from_rgb(125, 211, 252)),
                         );
+                        let default_ext = if self.params.transparent_bg {
+                            "lumaglyph_alpha.webm"
+                        } else {
+                            "lumaglyph_ascii.mp4"
+                        };
                         if let Some(job) = &self.transcode_job {
                             let done = job.progress.frames_done.load(Ordering::Relaxed);
                             let frac = if job.progress.total_frames_est > 0 {
@@ -896,12 +1085,15 @@ impl LumaGlyphApp {
                                 job.progress.cancel_requested.store(true, Ordering::Relaxed);
                             }
                         } else if ui
-                            .button("Export ASCII Video (.mp4 / .gif / .ans)")
+                            .button("Export ASCII Video (.mp4 / .webm / .mov / .gif / .ans)")
                             .clicked()
                         {
                             if let Some(out_path) = rfd::FileDialog::new()
-                                .set_file_name("lumaglyph_ascii.mp4")
-                                .add_filter("Video / Animation", &["mp4", "gif", "ans", "mkv"])
+                                .set_file_name(default_ext)
+                                .add_filter(
+                                    "Video / Animation",
+                                    &["mp4", "webm", "mov", "gif", "ans", "mkv"],
+                                )
                                 .save_file()
                             {
                                 let progress = TranscodeProgress::new(est_frames);
@@ -937,14 +1129,18 @@ impl LumaGlyphApp {
         let avail = ui.available_rect_before_wrap();
         let (response, painter) = ui.allocate_painter(avail.size(), Sense::click_and_drag());
 
-        // Deep obsidian studio backdrop
-        painter.rect_filled(avail, 0.0, Color32::from_rgb(8, 10, 15));
+        // True #000000 pitch-black surround when OLED mode is active, otherwise deep studio obsidian
+        let surround = if self.params.oled_black {
+            Color32::BLACK
+        } else {
+            Color32::from_rgb(8, 10, 15)
+        };
+        painter.rect_filled(avail, 0.0, surround);
 
         if self.ascii_px_w == 0 || self.ascii_px_h == 0 {
             return;
         }
 
-        // Handle scroll zoom
         if response.hovered() {
             let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
             if scroll_y.abs() > 0.5 {
@@ -968,7 +1164,6 @@ impl LumaGlyphApp {
         let center = avail.center() + self.pan_offset;
         let dest_rect = Rect::from_center_size(center, draw_size);
 
-        // Dragging either moves the split-wipe curtain or pans when zoomed in
         let split_x = dest_rect.left() + dest_rect.width() * self.split_ratio;
         let pointer_pos = response.interact_pointer_pos();
         let near_split = self.split_enabled
@@ -995,24 +1190,28 @@ impl LumaGlyphApp {
             }
         }
 
-        // Subtle frame border around rendered canvas
-        painter.rect_stroke(
-            dest_rect.expand(1.0),
-            CornerRadius::same(3),
-            Stroke::new(1.0_f32, Color32::from_rgb(36, 44, 64)),
-            StrokeKind::Outside,
-        );
+        // Draw transparency checkerboard behind `dest_rect` when `transparent_bg` is enabled
+        if self.params.transparent_bg {
+            draw_alpha_checkerboard(&painter, dest_rect.intersect(avail));
+        }
+
+        if !self.params.oled_black {
+            painter.rect_stroke(
+                dest_rect.expand(1.0),
+                CornerRadius::same(3),
+                Stroke::new(1.0_f32, Color32::from_rgb(36, 44, 64)),
+                StrokeKind::Outside,
+            );
+        }
 
         let uv_full = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
 
-        // Draw ASCII texture (full rect, clipped to canvas)
         if let Some(ascii_tex) = &self.ascii_tex {
             painter
                 .with_clip_rect(avail)
                 .image(ascii_tex.id(), dest_rect, uv_full, Color32::WHITE);
         }
 
-        // Overlay Original Source on the left of the split-wipe curtain
         if self.split_enabled {
             if let Some(orig_tex) = &self.orig_tex {
                 let wipe_x = (dest_rect.left() + dest_rect.width() * self.split_ratio)
@@ -1028,7 +1227,6 @@ impl LumaGlyphApp {
                     Color32::WHITE,
                 );
 
-                // Glowing vertical curtain line + circular drag handle
                 let line_top = dest_rect.top().max(avail.top());
                 let line_bot = dest_rect.bottom().min(avail.bottom());
                 if line_bot > line_top {
@@ -1051,7 +1249,6 @@ impl LumaGlyphApp {
                         Color32::from_rgb(186, 230, 253),
                     );
 
-                    // Corner comparison badges
                     let badge_y = line_top + 14.0;
                     if wipe_x - dest_rect.left() > 95.0 {
                         draw_canvas_badge(
@@ -1061,11 +1258,21 @@ impl LumaGlyphApp {
                             Color32::from_rgb(148, 163, 184),
                         );
                     }
-                    if dest_rect.right() - wipe_x > 145.0 {
+                    if dest_rect.right() - wipe_x > 165.0 {
+                        let right_tag = if self.params.wireframe_only && self.params.transparent_bg
+                        {
+                            "NEON WIREFRAME · RGBA ALPHA"
+                        } else if self.params.oled_black {
+                            "TRUE OLED #000000 · 95-CHAR ASCII"
+                        } else if self.params.color_mode == ColorMode::TriTone {
+                            "CUSTOM TRI-TONE · 95-CHAR ASCII"
+                        } else {
+                            "GENUINE 95-CHAR ASCII"
+                        };
                         draw_canvas_badge(
                             &painter,
                             Pos2::new(wipe_x + 12.0, badge_y),
-                            "GENUINE 95-CHAR ASCII",
+                            right_tag,
                             Color32::from_rgb(56, 189, 248),
                         );
                     }
@@ -1073,7 +1280,7 @@ impl LumaGlyphApp {
             }
         }
 
-        // Hover Cell Inspector HUD (bottom-left of viewport)
+        // Hover Cell Inspector HUD
         if let Some(hover) = response.hover_pos() {
             if dest_rect.contains(hover) && self.ascii_frame.cols > 0 && self.ascii_frame.rows > 0 {
                 let rel_x = ((hover.x - dest_rect.left()) / dest_rect.width()).clamp(0.0, 0.9999);
@@ -1081,8 +1288,13 @@ impl LumaGlyphApp {
                 let c = (rel_x * self.ascii_frame.cols as f32) as usize;
                 let r = (rel_y * self.ascii_frame.rows as f32) as usize;
                 let cell = self.ascii_frame.cells[r * self.ascii_frame.cols as usize + c];
+                let bg_desc = if self.params.transparent_bg {
+                    "RGBA(0,0,0,0)".to_string()
+                } else {
+                    format!("#{:02X}{:02X}{:02X}", cell.bg[0], cell.bg[1], cell.bg[2])
+                };
                 let info = format!(
-                    "Cell ({c}, {r})  Glyph '{}' (0x{:02X})  FG #{:02X}{:02X}{:02X}",
+                    "Cell ({c}, {r})  Glyph '{}' (0x{:02X})  FG #{:02X}{:02X}{:02X}  BG {bg_desc}",
                     cell.ch as char, cell.ch, cell.fg[0], cell.fg[1], cell.fg[2]
                 );
                 draw_canvas_badge(
@@ -1094,7 +1306,6 @@ impl LumaGlyphApp {
             }
         }
 
-        // Status toast notification (bottom-right of viewport)
         if let Some((msg, when)) = &self.status_toast {
             if when.elapsed().as_secs_f32() < 5.0 {
                 draw_canvas_badge(
@@ -1136,11 +1347,12 @@ impl LumaGlyphApp {
                     }
                     ui.label(
                         RichText::new(format!(
-                            "Video: {}x{} @ {:.1} FPS · Frame #{}",
+                            "Video: {}x{} @ {:.1} FPS · Frame #{} · Beat {:.0}%",
                             stream.meta.width,
                             stream.meta.height,
                             stream.meta.fps,
-                            self.video_frames_seen
+                            self.video_frames_seen,
+                            (self.live_audio_energy * 100.0).min(100.0)
                         ))
                         .color(Color32::from_rgb(125, 211, 252))
                         .size(12.0),
@@ -1159,10 +1371,11 @@ impl LumaGlyphApp {
                 SourceKind::Sample(p) => {
                     ui.label(
                         RichText::new(format!(
-                            "Scene: {} ({}x{}) — drag blue Split-Wipe bar or scroll to zoom",
+                            "Scene: {} ({}x{}) — Look Code {}",
                             p.label(),
                             self.source_w,
-                            self.source_h
+                            self.source_h,
+                            &self.look_code_buf[..self.look_code_buf.len().min(36)]
                         ))
                         .color(Color32::from_rgb(148, 163, 184))
                         .size(12.0),
@@ -1295,9 +1508,9 @@ impl eframe::App for LumaGlyphApp {
             .show(ctx, |ui| self.draw_bottom_transport(ui));
 
         egui::SidePanel::left("left_control_deck")
-            .default_width(316.0)
-            .min_width(290.0)
-            .max_width(370.0)
+            .default_width(324.0)
+            .min_width(296.0)
+            .max_width(380.0)
             .frame(
                 Frame::new()
                     .fill(Color32::from_rgb(15, 19, 28))
@@ -1306,8 +1519,13 @@ impl eframe::App for LumaGlyphApp {
             )
             .show(ctx, |ui| self.draw_control_deck(ui));
 
+        let central_bg = if self.params.oled_black {
+            Color32::BLACK
+        } else {
+            Color32::from_rgb(8, 10, 15)
+        };
         egui::CentralPanel::default()
-            .frame(Frame::new().fill(Color32::from_rgb(8, 10, 15)))
+            .frame(Frame::new().fill(central_bg))
             .show(ctx, |ui| self.draw_viewport(ui));
 
         self.draw_update_modal(ctx);
@@ -1318,6 +1536,53 @@ impl eframe::App for LumaGlyphApp {
                 ctx.request_repaint();
             } else {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+    }
+}
+
+fn draw_tritone_bar(ui: &mut egui::Ui, pal: &TriTonePalette) {
+    let desired = Vec2::new(ui.available_width(), 12.0);
+    let (rect, _) = ui.allocate_exact_size(desired, Sense::hover());
+    let painter = ui.painter();
+    let steps = 32usize;
+    let sw = rect.width() / (steps as f32);
+    for i in 0..steps {
+        let t = (i as f32 + 0.5) / (steps as f32);
+        let [r, g, b] = pal.sample(t);
+        let seg = Rect::from_min_max(
+            Pos2::new(rect.left() + (i as f32) * sw, rect.top()),
+            Pos2::new(rect.left() + ((i + 1) as f32) * sw + 0.5, rect.bottom()),
+        );
+        painter.rect_filled(seg, 0.0, Color32::from_rgb(r, g, b));
+    }
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(2),
+        Stroke::new(1.0_f32, Color32::from_rgb(56, 70, 96)),
+        StrokeKind::Outside,
+    );
+}
+
+fn draw_alpha_checkerboard(painter: &egui::Painter, rect: Rect) {
+    if rect.width() <= 0.0 || rect.height() <= 0.0 {
+        return;
+    }
+    let tile = 16.0f32;
+    let c_dark = Color32::from_rgb(13, 16, 23);
+    let c_light = Color32::from_rgb(24, 30, 42);
+    painter.rect_filled(rect, 0.0, c_dark);
+
+    let cols = (rect.width() / tile).ceil() as usize;
+    let rows = (rect.height() / tile).ceil() as usize;
+    let clipped = painter.with_clip_rect(rect);
+    for r in 0..rows {
+        for c in 0..cols {
+            if (r + c) & 1 == 1 {
+                let x0 = rect.left() + (c as f32) * tile;
+                let y0 = rect.top() + (r as f32) * tile;
+                let sub = Rect::from_min_size(Pos2::new(x0, y0), Vec2::splat(tile));
+                clipped.rect_filled(sub, 0.0, c_light);
             }
         }
     }
@@ -1368,7 +1633,7 @@ fn labeled_slider(
     range: std::ops::RangeInclusive<f32>,
 ) -> bool {
     ui.horizontal(|ui| {
-        ui.label(RichText::new(label).size(11.8));
+        ui.label(RichText::new(label).size(11.6));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.add(egui::Slider::new(val, range).show_value(true))
                 .changed()

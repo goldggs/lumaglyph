@@ -1,23 +1,22 @@
-use crate::color::DEFAULT_BG;
-use crate::engine::{rasterize_rgba, AsciiFrame};
+use crate::color::{active_canvas_bg, ColorMode};
+use crate::engine::{rasterize_rgba, AsciiFrame, RenderParams};
 use crate::glyph_atlas::GlyphAtlas;
 use image::{ImageBuffer, RgbaImage};
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::path::Path;
 
-/// Export `AsciiFrame` as a crisp PNG image using `scale_cell_h` (e.g. `20` = 1x, `36` = ~2x).
+/// Export `AsciiFrame` as a crisp PNG image (supports True OLED `#000000` and true RGBA transparency).
 pub fn export_png(
     frame: &AsciiFrame,
     base_atlas: &GlyphAtlas,
     scale_cell_h: usize,
-    crt_bloom: bool,
-    scanlines: bool,
+    params: &RenderParams,
     path: &Path,
 ) -> Result<(usize, usize), String> {
     let atlas = base_atlas.with_cell_height(scale_cell_h);
     let mut rgba = Vec::new();
-    let (w, h) = rasterize_rgba(frame, &atlas, crt_bloom, scanlines, &mut rgba);
+    let (w, h) = rasterize_rgba(frame, &atlas, params, 0.0, &mut rgba);
     if w == 0 || h == 0 {
         return Err("Empty ASCII frame".to_string());
     }
@@ -33,11 +32,12 @@ pub fn export_txt(frame: &AsciiFrame, path: &Path) -> Result<(), String> {
     fs::write(path, frame.to_plain_text()).map_err(|e| format!("Failed to write TXT: {e}"))
 }
 
-/// Build a 24-bit TrueColor ANSI string (`\x1b[38;2;R;G;Bm` + optional `\x1b[48;2;R;G;Bm`),
-/// grouping identical adjacent color runs so `cat art.ans` renders instantaneously in terminals.
-pub fn frame_to_ansi_string(frame: &AsciiFrame, include_bg: bool) -> String {
+/// Build a 24-bit TrueColor ANSI string (`\x1b[38;2;R;G;Bm` + optional `\x1b[48;2;R;G;Bm`).
+pub fn frame_to_ansi_string(frame: &AsciiFrame, params: &RenderParams) -> String {
     let cols = frame.cols as usize;
     let rows = frame.rows as usize;
+    let include_bg =
+        (params.color_mode == ColorMode::DualColor || params.oled_black) && !params.transparent_bg;
     let mut out = String::with_capacity(cols * rows * 10);
 
     for r in 0..rows {
@@ -72,8 +72,8 @@ pub fn frame_to_ansi_string(frame: &AsciiFrame, include_bg: bool) -> String {
     out
 }
 
-pub fn export_ansi(frame: &AsciiFrame, include_bg: bool, path: &Path) -> Result<(), String> {
-    let s = frame_to_ansi_string(frame, include_bg);
+pub fn export_ansi(frame: &AsciiFrame, params: &RenderParams, path: &Path) -> Result<(), String> {
+    let s = frame_to_ansi_string(frame, params);
     fs::write(path, s).map_err(|e| format!("Failed to write ANSI file: {e}"))
 }
 
@@ -88,25 +88,29 @@ fn xml_escape_char(ch: u8, out: &mut String) {
     }
 }
 
-/// Export standalone scalable `.svg` with run-length grouped color `<tspan>` spans.
-pub fn export_svg(frame: &AsciiFrame, include_bg_cells: bool, path: &Path) -> Result<(), String> {
+/// Export standalone scalable `.svg` (omits backdrop `<rect>` when `transparent_bg` is enabled).
+pub fn export_svg(frame: &AsciiFrame, params: &RenderParams, path: &Path) -> Result<(), String> {
     let cols = frame.cols as usize;
     let rows = frame.rows as usize;
     let cw = 9.6f32;
     let ch = 16.0f32;
     let width = (cols as f32 * cw).ceil() as u32 + 24;
     let height = (rows as f32 * ch).ceil() as u32 + 24;
+    let base_bg = active_canvas_bg(params.oled_black);
+    let include_bg_cells = params.color_mode == ColorMode::DualColor && !params.transparent_bg;
 
     let mut svg = String::with_capacity(cols * rows * 16 + 1024);
     let _ = writeln!(
         svg,
         r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" width="{width}" height="{height}">"##
     );
-    let _ = writeln!(
-        svg,
-        r##"<rect width="100%" height="100%" fill="#{0:02X}{1:02X}{2:02X}"/>"##,
-        DEFAULT_BG[0], DEFAULT_BG[1], DEFAULT_BG[2]
-    );
+    if !params.transparent_bg {
+        let _ = writeln!(
+            svg,
+            r##"<rect width="100%" height="100%" fill="#{0:02X}{1:02X}{2:02X}"/>"##,
+            base_bg[0], base_bg[1], base_bg[2]
+        );
+    }
 
     if include_bg_cells {
         svg.push_str("<g shape-rendering=\"crispEdges\">\n");
@@ -120,7 +124,7 @@ pub fn export_svg(frame: &AsciiFrame, include_bg_cells: bool, path: &Path) -> Re
                 while c < cols && row_slice[c].bg == bg {
                     c += 1;
                 }
-                if bg != DEFAULT_BG {
+                if bg != base_bg {
                     let x = 12.0 + start as f32 * cw;
                     let y = 12.0 + r as f32 * ch;
                     let w = (c - start) as f32 * cw;
@@ -167,10 +171,17 @@ pub fn export_svg(frame: &AsciiFrame, include_bg_cells: bool, path: &Path) -> Re
     fs::write(path, svg).map_err(|e| format!("Failed to write SVG: {e}"))
 }
 
-/// Export standalone dark-themed `.html` document.
-pub fn export_html(frame: &AsciiFrame, include_bg: bool, path: &Path) -> Result<(), String> {
+/// Export standalone dark-themed `.html` document (supports OLED `#000000` and transparent body).
+pub fn export_html(frame: &AsciiFrame, params: &RenderParams, path: &Path) -> Result<(), String> {
     let cols = frame.cols as usize;
     let rows = frame.rows as usize;
+    let base_bg = active_canvas_bg(params.oled_black);
+    let include_bg = params.color_mode == ColorMode::DualColor && !params.transparent_bg;
+    let bg_css = if params.transparent_bg {
+        "transparent".to_string()
+    } else {
+        format!("#{:02X}{:02X}{:02X}", base_bg[0], base_bg[1], base_bg[2])
+    };
     let mut html = String::with_capacity(cols * rows * 18 + 1024);
 
     let _ = writeln!(
@@ -184,7 +195,7 @@ pub fn export_html(frame: &AsciiFrame, include_bg: bool, path: &Path) -> Result<
   body {{
     margin: 0;
     padding: 24px;
-    background: #{0:02X}{1:02X}{2:02X};
+    background: {bg_css};
     color: #e5e9f0;
     display: flex;
     justify-content: center;
@@ -200,8 +211,7 @@ pub fn export_html(frame: &AsciiFrame, include_bg: bool, path: &Path) -> Result<
 </style>
 </head>
 <body>
-<pre>"#,
-        DEFAULT_BG[0], DEFAULT_BG[1], DEFAULT_BG[2]
+<pre>"#
     );
 
     for r in 0..rows {
@@ -210,7 +220,7 @@ pub fn export_html(frame: &AsciiFrame, include_bg: bool, path: &Path) -> Result<
         while c < cols {
             let fg = row_slice[c].fg;
             let bg = row_slice[c].bg;
-            if include_bg && bg != DEFAULT_BG {
+            if include_bg && bg != base_bg {
                 let _ = write!(
                     html,
                     r#"<span style="color:#{:02X}{:02X}{:02X};background:#{:02X}{:02X}{:02X}">"#,

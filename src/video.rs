@@ -1,5 +1,6 @@
-use crate::color::ColorMode;
-use crate::engine::{convert_image_buffer, rasterize_rgb24_even, AsciiFrame, RenderParams};
+use crate::engine::{
+    convert_image_buffer_with_audio, rasterize_rgb24_even, rasterize_rgba, AsciiFrame, RenderParams,
+};
 use crate::export::frame_to_ansi_string;
 use crate::glyph_atlas::GlyphAtlas;
 use std::fs::File;
@@ -7,7 +8,7 @@ use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -141,6 +142,93 @@ pub fn probe_video(path: &Path) -> Result<VideoMetadata, String> {
     })
 }
 
+/// Stream mono 8 kHz `s16le` PCM from `ffmpeg` in tiny 1-frame chunks to compute a crisp
+/// per-frame beat/onset envelope (`0.0..=1.25`) with near-zero memory overhead and zero extra crates.
+/// Gracefully returns an empty `Vec` if the input file has no audio track.
+pub fn extract_audio_envelope(input_path: &Path, target_fps: f64) -> Vec<f32> {
+    let fps = target_fps.clamp(1.0, 120.0);
+    let sample_rate = 8000usize;
+    let samples_per_frame = ((sample_rate as f64) / fps).round().max(32.0) as usize;
+    let chunk_bytes = samples_per_frame * 2;
+
+    let mut cmd = Command::new(resolve_tool_binary("ffmpeg"));
+    cmd.args(["-v", "error", "-nostdin", "-i"])
+        .arg(input_path)
+        .args(["-vn", "-ac", "1", "-ar", "8000", "-f", "s16le", "pipe:1"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    configure_no_window(&mut cmd);
+
+    let Ok(mut child) = cmd.spawn() else {
+        return Vec::new();
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        return Vec::new();
+    };
+
+    let mut raw_energy: Vec<f32> = Vec::with_capacity(1024);
+    let mut pcm_buf = vec![0u8; chunk_bytes];
+    let mut slow_ema = 0.0f32;
+
+    loop {
+        let mut got = 0usize;
+        while got < chunk_bytes {
+            match stdout.read(&mut pcm_buf[got..]) {
+                Ok(0) => break,
+                Ok(n) => got += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    got = 0;
+                    break;
+                }
+            }
+        }
+        if got < 2 {
+            break;
+        }
+        let sample_count = got / 2;
+        let mut sum_sq = 0.0f64;
+        for pair in pcm_buf[..sample_count * 2].chunks_exact(2) {
+            let s = i16::from_le_bytes([pair[0], pair[1]]) as f64 / 32768.0;
+            sum_sq += s * s;
+        }
+        let rms = (sum_sq / (sample_count as f64)).sqrt() as f32;
+        let onset = (rms - slow_ema).max(0.0);
+        slow_ema = slow_ema * 0.82 + rms * 0.18;
+        // Blend sustained RMS body with snappy transient flux for punchy kick/snare reaction
+        raw_energy.push(rms * 0.55 + onset * 2.15);
+    }
+
+    let _ = child.wait();
+    if raw_energy.is_empty() {
+        return raw_energy;
+    }
+
+    let mut sorted = raw_energy.clone();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let p95 = sorted[(sorted.len() * 95 / 100).min(sorted.len() - 1)];
+    if p95 < 1e-4 {
+        raw_energy.fill(0.0);
+        return raw_energy;
+    }
+
+    // Light attack/release smoothing + 95th-percentile normalization
+    let mut smooth = 0.0f32;
+    for val in &mut raw_energy {
+        let norm = (*val / p95).clamp(0.0, 1.35);
+        if norm > smooth {
+            smooth = smooth * 0.25 + norm * 0.75; // fast attack
+        } else {
+            smooth = smooth * 0.62 + norm * 0.38; // musical release
+        }
+        *val = if smooth < 0.03 { 0.0 } else { smooth };
+    }
+
+    raw_energy
+}
+
 /// Live progress state shared lock-free between worker thread and GUI/CLI.
 pub struct TranscodeProgress {
     pub frames_done: AtomicU64,
@@ -169,8 +257,9 @@ pub struct TranscodeSummary {
     pub out_height: usize,
 }
 
-/// Stream a video file frame-by-frame into an ASCII video (`.mp4`/`.mkv`/`.webm`),
+/// Stream a video file frame-by-frame into an ASCII video (`.mp4`/`.mkv`/`.webm`/`.mov`),
 /// looping `.gif`, or playable `.ans` terminal animation while maintaining flat RAM usage.
+/// Supports Audio-Reactive beat modulation and Transparent Alpha video overlays (`.webm`/`.mov`/`.gif`).
 pub fn transcode_video_streaming(
     input_path: &Path,
     output_path: &Path,
@@ -182,8 +271,12 @@ pub fn transcode_video_streaming(
     let meta = probe_video(input_path)?;
     let fps = target_fps_override.unwrap_or(meta.fps).clamp(1.0, 120.0);
 
-    // Pre-scale decoded frames to ~4x6 pixels per character cell so even 4K inputs
-    // use <1.5 MB per frame buffer without losing sub-cell shape accuracy.
+    let audio_env = if params.audio_reactive > 0.001 {
+        extract_audio_envelope(input_path, fps)
+    } else {
+        Vec::new()
+    };
+
     let cols = params.cols.clamp(16, 400);
     let est_rows = ((cols as f32) * (meta.height as f32 / meta.width as f32) * atlas.aspect)
         .round()
@@ -227,7 +320,7 @@ pub fn transcode_video_streaming(
     let frame_in_bytes = (dec_w as usize) * (dec_h as usize) * 3;
     let mut in_rgb = vec![0u8; frame_in_bytes];
     let mut ascii_frame = AsciiFrame::new();
-    let mut out_rgb = Vec::new();
+    let mut out_buf = Vec::new();
     let mut frames_rendered = 0u64;
     let mut out_dims = (0usize, 0usize);
 
@@ -235,7 +328,6 @@ pub fn transcode_video_streaming(
         let file = File::create(output_path)
             .map_err(|e| format!("Failed creating ANSI stream file: {e}"))?;
         let mut writer = BufWriter::new(file);
-        let include_bg = params.color_mode == ColorMode::DualColor;
         writer
             .write_all(b"\x1b[2J\x1b[?25l")
             .map_err(|e| e.to_string())?;
@@ -244,7 +336,11 @@ pub fn transcode_video_streaming(
             if progress.cancel_requested.load(Ordering::Relaxed) {
                 break;
             }
-            convert_image_buffer(
+            let audio_e = audio_env
+                .get(frames_rendered as usize)
+                .copied()
+                .unwrap_or(0.0);
+            convert_image_buffer_with_audio(
                 &in_rgb,
                 dec_w,
                 dec_h,
@@ -252,11 +348,12 @@ pub fn transcode_video_streaming(
                 atlas,
                 params,
                 true,
+                audio_e,
                 &mut ascii_frame,
             );
             out_dims = (ascii_frame.cols as usize, ascii_frame.rows as usize);
             writer.write_all(b"\x1b[H").map_err(|e| e.to_string())?;
-            let ans = frame_to_ansi_string(&ascii_frame, include_bg);
+            let ans = frame_to_ansi_string(&ascii_frame, params);
             writer
                 .write_all(ans.as_bytes())
                 .map_err(|e| e.to_string())?;
@@ -275,7 +372,12 @@ pub fn transcode_video_streaming(
             if progress.cancel_requested.load(Ordering::Relaxed) {
                 break;
             }
-            convert_image_buffer(
+            let audio_e = audio_env
+                .get(frames_rendered as usize)
+                .copied()
+                .unwrap_or(0.0);
+            let bloom_boost = audio_e * params.audio_reactive * 0.65;
+            convert_image_buffer_with_audio(
                 &in_rgb,
                 dec_w,
                 dec_h,
@@ -283,15 +385,15 @@ pub fn transcode_video_streaming(
                 atlas,
                 params,
                 true,
+                audio_e,
                 &mut ascii_frame,
             );
-            let (ow, oh) = rasterize_rgb24_even(
-                &ascii_frame,
-                atlas,
-                params.crt_bloom,
-                params.scanlines,
-                &mut out_rgb,
-            );
+
+            let (ow, oh) = if params.transparent_bg {
+                rasterize_rgba(&ascii_frame, atlas, params, bloom_boost, &mut out_buf)
+            } else {
+                rasterize_rgb24_even(&ascii_frame, atlas, params, bloom_boost, &mut out_buf)
+            };
             out_dims = (ow, oh);
 
             if gif_enc.is_none() {
@@ -304,7 +406,15 @@ pub fn transcode_video_streaming(
                 gif_enc = Some(enc);
             }
             if let Some(enc) = gif_enc.as_mut() {
-                let mut gframe = gif::Frame::from_rgb_speed(ow as u16, oh as u16, &out_rgb, 15);
+                let mut gframe = if params.transparent_bg {
+                    let mut rgba_copy = out_buf.clone();
+                    let mut gf =
+                        gif::Frame::from_rgba_speed(ow as u16, oh as u16, &mut rgba_copy, 15);
+                    gf.dispose = gif::DisposalMethod::Background;
+                    gf
+                } else {
+                    gif::Frame::from_rgb_speed(ow as u16, oh as u16, &out_buf, 15)
+                };
                 gframe.delay = delay_cs;
                 enc.write_frame(&gframe)
                     .map_err(|e| format!("GIF write frame error: {e}"))?;
@@ -316,6 +426,8 @@ pub fn transcode_video_streaming(
         }
     } else {
         // MP4 / MKV / MOV / WebM streaming encode via ffmpeg stdin while preserving audio!
+        // Supports True Alpha Video (`.webm` VP9 yuva420p or `.mov` RGBA PNG) when `transparent_bg` is enabled.
+        let alpha_video = params.transparent_bg && (ext == "webm" || ext == "mov");
         let mut enc_child: Option<std::process::Child> = None;
         let mut enc_stdin: Option<std::process::ChildStdin> = None;
 
@@ -323,7 +435,12 @@ pub fn transcode_video_streaming(
             if progress.cancel_requested.load(Ordering::Relaxed) {
                 break;
             }
-            convert_image_buffer(
+            let audio_e = audio_env
+                .get(frames_rendered as usize)
+                .copied()
+                .unwrap_or(0.0);
+            let bloom_boost = audio_e * params.audio_reactive * 0.65;
+            convert_image_buffer_with_audio(
                 &in_rgb,
                 dec_w,
                 dec_h,
@@ -331,15 +448,15 @@ pub fn transcode_video_streaming(
                 atlas,
                 params,
                 true,
+                audio_e,
                 &mut ascii_frame,
             );
-            let (ow, oh) = rasterize_rgb24_even(
-                &ascii_frame,
-                atlas,
-                params.crt_bloom,
-                params.scanlines,
-                &mut out_rgb,
-            );
+
+            let (ow, oh) = if alpha_video {
+                rasterize_rgba(&ascii_frame, atlas, params, bloom_boost, &mut out_buf)
+            } else {
+                rasterize_rgb24_even(&ascii_frame, atlas, params, bloom_boost, &mut out_buf)
+            };
             out_dims = (ow, oh);
 
             if enc_child.is_none() {
@@ -351,7 +468,7 @@ pub fn transcode_video_streaming(
                     "-f",
                     "rawvideo",
                     "-pix_fmt",
-                    "rgb24",
+                    if alpha_video { "rgba" } else { "rgb24" },
                     "-s",
                     &format!("{ow}x{oh}"),
                     "-r",
@@ -361,31 +478,86 @@ pub fn transcode_video_streaming(
                     "-i",
                 ])
                 .arg(input_path)
-                .args([
-                    "-map",
-                    "0:v:0",
-                    "-map",
-                    "1:a?",
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "fast",
-                    "-crf",
-                    "18",
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-c:a",
-                    "aac",
-                    "-b:a",
-                    "192k",
-                    "-movflags",
-                    "+faststart",
-                    "-shortest",
-                ])
-                .arg(output_path)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped());
+                .args(["-map", "0:v:0", "-map", "1:a?"]);
+
+                if alpha_video && ext == "webm" {
+                    ecmd.args([
+                        "-c:v",
+                        "libvpx-vp9",
+                        "-pix_fmt",
+                        "yuva420p",
+                        "-b:v",
+                        "0",
+                        "-crf",
+                        "24",
+                        "-deadline",
+                        "realtime",
+                        "-cpu-used",
+                        "4",
+                        "-auto-alt-ref",
+                        "0",
+                        "-c:a",
+                        "libopus",
+                        "-b:a",
+                        "160k",
+                        "-shortest",
+                    ]);
+                } else if alpha_video && ext == "mov" {
+                    ecmd.args([
+                        "-c:v",
+                        "png",
+                        "-pix_fmt",
+                        "rgba",
+                        "-c:a",
+                        "aac",
+                        "-b:a",
+                        "192k",
+                        "-shortest",
+                    ]);
+                } else if ext == "webm" {
+                    ecmd.args([
+                        "-c:v",
+                        "libvpx-vp9",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-b:v",
+                        "0",
+                        "-crf",
+                        "24",
+                        "-deadline",
+                        "realtime",
+                        "-cpu-used",
+                        "4",
+                        "-c:a",
+                        "libopus",
+                        "-b:a",
+                        "160k",
+                        "-shortest",
+                    ]);
+                } else {
+                    ecmd.args([
+                        "-c:v",
+                        "libx264",
+                        "-preset",
+                        "fast",
+                        "-crf",
+                        "18",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-c:a",
+                        "aac",
+                        "-b:a",
+                        "192k",
+                        "-movflags",
+                        "+faststart",
+                        "-shortest",
+                    ]);
+                }
+
+                ecmd.arg(output_path)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped());
                 configure_no_window(&mut ecmd);
 
                 let mut child = ecmd
@@ -397,7 +569,7 @@ pub fn transcode_video_streaming(
 
             if let Some(stdin) = enc_stdin.as_mut() {
                 stdin
-                    .write_all(&out_rgb)
+                    .write_all(&out_buf)
                     .map_err(|e| format!("Encoder pipe write error: {e}"))?;
             }
 
@@ -454,13 +626,16 @@ fn read_exact_or_eof(r: &mut impl Read, buf: &mut [u8]) -> Result<bool, String> 
     Ok(true)
 }
 
-/// Bounded 2-frame live preview video streamer for smooth GUI playback with flat RAM.
+/// Bounded 2-frame live preview video streamer for smooth GUI playback with flat RAM
+/// and synchronized per-frame audio-reactive beat envelope.
 pub struct LiveVideoStream {
     pub path: PathBuf,
     pub meta: VideoMetadata,
     pub dec_w: u32,
     pub dec_h: u32,
-    rx: Receiver<Vec<u8>>,
+    pub audio_envelope: Vec<f32>,
+    pub current_audio_energy: f32,
+    rx: Receiver<(usize, Vec<u8>)>,
     stop_flag: Arc<AtomicBool>,
     pub paused: Arc<AtomicBool>,
 }
@@ -471,15 +646,16 @@ impl LiveVideoStream {
         let scale = (640.0 / (meta.width.max(meta.height) as f64)).min(1.0);
         let dec_w = (((meta.width as f64 * scale).round() as u32).max(64) + 1) & !1;
         let dec_h = (((meta.height as f64 * scale).round() as u32).max(64) + 1) & !1;
+        let fps = meta.fps.clamp(5.0, 60.0);
+        let audio_envelope = extract_audio_envelope(path, fps);
 
-        let (tx, rx): (SyncSender<Vec<u8>>, Receiver<Vec<u8>>) = mpsc::sync_channel(2);
+        let (tx, rx) = mpsc::sync_channel::<(usize, Vec<u8>)>(2);
         let stop_flag = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(false));
 
         let thread_stop = Arc::clone(&stop_flag);
         let thread_paused = Arc::clone(&paused);
         let pbuf = path.to_path_buf();
-        let fps = meta.fps.clamp(5.0, 60.0);
 
         std::thread::Builder::new()
             .name("lumaglyph-video-preview".to_string())
@@ -513,6 +689,7 @@ impl LiveVideoStream {
                         break;
                     };
 
+                    let mut frame_idx = 0usize;
                     let mut next_tick = Instant::now();
                     loop {
                         if thread_stop.load(Ordering::Relaxed) {
@@ -528,11 +705,12 @@ impl LiveVideoStream {
                         let mut buf = vec![0u8; frame_bytes];
                         match read_exact_or_eof(&mut stdout, &mut buf) {
                             Ok(true) => {
-                                if tx.send(buf).is_err() {
+                                if tx.send((frame_idx, buf)).is_err() {
                                     let _ = child.kill();
                                     let _ = child.wait();
                                     return;
                                 }
+                                frame_idx += 1;
                                 next_tick += frame_dur;
                                 let now = Instant::now();
                                 if next_tick > now {
@@ -555,19 +733,27 @@ impl LiveVideoStream {
             meta,
             dec_w,
             dec_h,
+            audio_envelope,
+            current_audio_energy: 0.0,
             rx,
             stop_flag,
             paused,
         })
     }
 
-    /// Non-blocking drain to latest decoded frame so the GUI never lags behind.
-    pub fn poll_latest_frame(&self) -> Option<Vec<u8>> {
-        let mut latest = None;
-        while let Ok(f) = self.rx.try_recv() {
-            latest = Some(f);
+    /// Non-blocking drain to latest decoded frame and its synchronized audio beat energy.
+    pub fn poll_latest_frame(&mut self) -> Option<(Vec<u8>, f32)> {
+        let mut latest: Option<(usize, Vec<u8>)> = None;
+        while let Ok(item) = self.rx.try_recv() {
+            latest = Some(item);
         }
-        latest
+        if let Some((idx, buf)) = latest {
+            let e = self.audio_envelope.get(idx).copied().unwrap_or(0.0);
+            self.current_audio_energy = e;
+            Some((buf, e))
+        } else {
+            None
+        }
     }
 }
 

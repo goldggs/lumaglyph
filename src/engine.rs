@@ -1,5 +1,8 @@
 use crate::charset::{CharsetPreset, ASCII_COUNT, ASCII_MIN};
-use crate::color::{luma_rgb, resolve_cell_colors, ColorMode, BAYER_4X4, DEFAULT_BG};
+use crate::color::{
+    active_canvas_bg, luma_rgb, resolve_cell_colors, ColorMode, TriTonePalette, BAYER_4X4,
+    DEFAULT_BG,
+};
 use crate::glyph_atlas::{GlyphAtlas, GlyphVector};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -33,6 +36,18 @@ pub struct RenderParams {
     pub charset: CharsetPreset,
     pub custom_chars: String,
     pub color_mode: ColorMode,
+    pub tritone: TriTonePalette,
+    /// True `#000000` pitch-black background shutting physical OLED subpixels completely off.
+    pub oled_black: bool,
+    /// Shadow noise gate (`0.00..=0.25`): snaps near-black sensor/video grain cleanly to `' '` + BG.
+    pub black_gate: f32,
+    /// Render non-ink background with true `RGBA [0,0,0,0]` alpha transparency for overlays.
+    pub transparent_bg: bool,
+    /// Contour / Neon Wireframe mode: drops flat fills and illuminates only structural edges.
+    pub wireframe_only: bool,
+    pub wireframe_sensitivity: f32,
+    /// Audio-reactive modulation depth (`0.0..=2.0`) pulsing luma boost, edges & bloom on beats.
+    pub audio_reactive: f32,
     pub brightness: f32,
     pub contrast: f32,
     pub saturation: f32,
@@ -63,6 +78,13 @@ impl Default for RenderParams {
             charset: CharsetPreset::Genuine95,
             custom_chars: " .:-=+*#%@".to_string(),
             color_mode: ColorMode::TrueColor,
+            tritone: TriTonePalette::default(),
+            oled_black: false,
+            black_gate: 0.03,
+            transparent_bg: false,
+            wireframe_only: false,
+            wireframe_sensitivity: 1.15,
+            audio_reactive: 0.0,
             brightness: 0.02,
             contrast: 1.18,
             saturation: 1.22,
@@ -135,8 +157,6 @@ struct ActiveGlyph {
     vec: GlyphVector,
 }
 
-/// Convert a packed RGB24 (`stride = 3`) or RGBA32 (`stride = 4`) image buffer into `AsciiFrame`.
-/// Reuses `frame.cells` and `frame.prev_glyphs` in place for flat memory consumption.
 #[allow(clippy::too_many_arguments)]
 pub fn convert_image_buffer(
     pixels: &[u8],
@@ -146,6 +166,33 @@ pub fn convert_image_buffer(
     atlas: &GlyphAtlas,
     params: &RenderParams,
     use_temporal: bool,
+    frame: &mut AsciiFrame,
+) {
+    convert_image_buffer_with_audio(
+        pixels,
+        img_w,
+        img_h,
+        channels,
+        atlas,
+        params,
+        use_temporal,
+        0.0,
+        frame,
+    );
+}
+
+/// Convert a packed RGB24 (`stride = 3`) or RGBA32 (`stride = 4`) image buffer into `AsciiFrame`,
+/// applying OLED black-floor gating, wireframe contour extraction, and optional `audio_energy` beat pulse.
+#[allow(clippy::too_many_arguments)]
+pub fn convert_image_buffer_with_audio(
+    pixels: &[u8],
+    img_w: u32,
+    img_h: u32,
+    channels: usize,
+    atlas: &GlyphAtlas,
+    params: &RenderParams,
+    use_temporal: bool,
+    audio_energy: f32,
     frame: &mut AsciiFrame,
 ) {
     assert!(channels == 3 || channels == 4, "channels must be 3 or 4");
@@ -160,7 +207,6 @@ pub fn convert_image_buffer(
         .max(1.0) as u32;
     let total_cells = (cols as usize) * (rows as usize);
 
-    // If grid resolution changed, reset temporal history cleanly
     let has_valid_history = use_temporal
         && params.temporal_stability > 0.001
         && frame.cols == cols
@@ -173,7 +219,14 @@ pub fn convert_image_buffer(
         frame.cells.resize(total_cells, AsciiCell::default());
     }
 
-    // Build compact active glyph table in L1 cache (<= 95 * 36 bytes = 3.4 KB)
+    // Audio-reactive modulation pulse (`0.0` when disabled or silent)
+    let beat = (audio_energy.clamp(0.0, 1.5) * params.audio_reactive).clamp(0.0, 2.0);
+    let eff_brightness = (params.brightness + beat * 0.065).clamp(-0.5, 0.5);
+    let eff_contrast = (params.contrast * (1.0 + beat * 0.14)).clamp(0.3, 3.2);
+    let eff_sat = (params.saturation * (1.0 + beat * 0.25)).clamp(0.0, 3.0);
+    let eff_ew = (params.edge_weight * (1.0 + beat * 0.55)).clamp(0.0, 3.0);
+    let eff_lum_comp = (params.luminance_comp + beat * 0.38).clamp(0.0, 1.45);
+
     let mask = params.charset.active_mask(&params.custom_chars);
     let mut active_list = [ActiveGlyph {
         idx: 0,
@@ -182,12 +235,19 @@ pub fn convert_image_buffer(
     let mut active_len = 0usize;
     let mut direct_vec_by_idx = [None::<GlyphVector>; ASCII_COUNT];
 
-    let ew = params.edge_weight;
     for idx in 0..ASCII_COUNT {
         if mask[idx] {
+            // In Wireframe-Only mode, cap ultra-dense block fills (`@`, `Q`, `B`, `W`, `M`, `#`)
+            // unless user explicitly selected a tiny custom charset, so contours stay crisp!
+            if params.wireframe_only
+                && params.charset != CharsetPreset::Custom
+                && atlas.coverage[idx] > 0.72
+            {
+                continue;
+            }
             let mut gv = atlas.vectors[idx];
-            gv.v[6] *= ew;
-            gv.v[7] *= ew;
+            gv.v[6] *= eff_ew;
+            gv.v[7] *= eff_ew;
             active_list[active_len] = ActiveGlyph {
                 idx: idx as u8,
                 vec: gv,
@@ -195,6 +255,13 @@ pub fn convert_image_buffer(
             direct_vec_by_idx[idx] = Some(gv);
             active_len += 1;
         }
+    }
+    if active_len == 0 {
+        active_list[0] = ActiveGlyph {
+            idx: 0,
+            vec: atlas.vectors[0],
+        };
+        active_len = 1;
     }
     let active = &active_list[..active_len];
 
@@ -204,8 +271,7 @@ pub fn convert_image_buffer(
     let h_max = (img_h - 1) as isize;
     let img_w_usize = img_w as usize;
 
-    // Precompute 256-entry 1D tone LUT (brightness + contrast + gamma + invert) in L1 cache
-    // to eliminate ~1M `powf` calls per frame!
+    // Precompute 256-entry 1D tone LUT in L1 cache (zero `powf` per pixel!)
     let mut tone_lut = [0.0f32; 256];
     let inv_gamma = 1.0 / params.gamma.max(0.15);
     let has_gamma = (params.gamma - 1.0).abs() > 1e-3;
@@ -214,16 +280,15 @@ pub fn convert_image_buffer(
         if params.invert {
             x = 1.0 - x;
         }
-        x = ((x - 0.5) * params.contrast + 0.5 + params.brightness).clamp(0.0, 1.0);
+        x = ((x - 0.5) * eff_contrast + 0.5 + eff_brightness).clamp(0.0, 1.0);
         if has_gamma {
             x = x.powf(inv_gamma);
         }
         *out = x;
     }
 
-    // Precompute 256-entry directional crunch curve LUT
-    let crunch_exp = 1.0 + params.directional_crunch.clamp(0.0, 3.5);
-    let do_crunch = params.directional_crunch > 0.01;
+    let crunch_exp = 1.0 + (params.directional_crunch + beat * 0.25).clamp(0.0, 3.8);
+    let do_crunch = params.directional_crunch > 0.01 || params.wireframe_only;
     let mut crunch_lut = [0.0f32; 256];
     if do_crunch {
         for (i, out) in crunch_lut.iter_mut().enumerate() {
@@ -231,10 +296,9 @@ pub fn convert_image_buffer(
         }
     }
 
-    // Precompute per-glyph ink luminance boost table (95 floats)
     let mut boost_lut = [1.0f32; ASCII_COUNT];
-    if params.luminance_comp > 0.001 {
-        let exp = params.luminance_comp * 0.58;
+    if eff_lum_comp > 0.001 {
+        let exp = eff_lum_comp * 0.58;
         for (out_b, &cov) in boost_lut.iter_mut().zip(atlas.coverage.iter()) {
             if cov > 0.01 {
                 *out_b = (1.0 / cov.max(0.24)).powf(exp);
@@ -242,9 +306,6 @@ pub fn convert_image_buffer(
         }
     }
 
-    let sat = params.saturation;
-
-    // Fast clamped pixel fetcher returning graded `(r, g, b, luma)` with zero `powf`!
     let sample_point = |fx: f32, fy: f32| -> (f32, f32, f32, f32) {
         let step_x = (cell_px_w * 0.14).max(0.5);
         let step_y = (cell_px_h * 0.14).max(0.5);
@@ -278,32 +339,29 @@ pub fn convert_image_buffer(
         let g0 = sg * 0.25;
         let b0 = sb * 0.25;
         let y = luma_rgb(r0, g0, b0);
-        let r = (y + (r0 - y) * sat).clamp(0.0, 1.0);
-        let g = (y + (g0 - y) * sat).clamp(0.0, 1.0);
-        let b = (y + (b0 - y) * sat).clamp(0.0, 1.0);
+        let r = (y + (r0 - y) * eff_sat).clamp(0.0, 1.0);
+        let g = (y + (g0 - y) * eff_sat).clamp(0.0, 1.0);
+        let b = (y + (b0 - y) * eff_sat).clamp(0.0, 1.0);
         (r, g, b, luma_rgb(r, g, b))
     };
 
-    // Sub-cell centers in normalized [0..1] cell coordinates (staggered 2x3)
     const SUB_POS: [(f32, f32); 6] = [
-        (0.26, 0.18), // TL
-        (0.74, 0.18), // TR
-        (0.24, 0.50), // ML
-        (0.76, 0.50), // MR
-        (0.26, 0.82), // BL
-        (0.74, 0.82), // BR
+        (0.26, 0.18),
+        (0.74, 0.18),
+        (0.24, 0.50),
+        (0.76, 0.50),
+        (0.26, 0.82),
+        (0.74, 0.82),
     ];
-    // External neighbor offsets around the cell for directional contrast crunching
-    const EXT_POS: [(f32, f32); 4] = [
-        (0.50, -0.24), // Top neighbor
-        (0.50, 1.24),  // Bottom neighbor
-        (-0.26, 0.50), // Left neighbor
-        (1.26, 0.50),  // Right neighbor
-    ];
+    const EXT_POS: [(f32, f32); 4] = [(0.50, -0.24), (0.50, 1.24), (-0.26, 0.50), (1.26, 0.50)];
 
     let dither_amp = params.dither * 0.22;
     let vig_strength = params.vignette_focus.clamp(0.0, 1.0);
     let hysteresis = params.temporal_stability * 0.14;
+    let black_gate = params.black_gate.clamp(0.0, 0.35);
+    let floor_bg = active_canvas_bg(params.oled_black);
+    let wf_mode = params.wireframe_only;
+    let wf_sens = params.wireframe_sensitivity.clamp(0.2, 3.0);
     let prev_slice = frame.prev_glyphs.as_slice();
     let cols_usize = cols as usize;
     let rows_f = rows as f32;
@@ -321,11 +379,10 @@ pub fn convert_image_buffer(
             for (col_idx, out_cell) in row_cells.iter_mut().enumerate() {
                 let x0 = (col_idx as f32) * cell_px_w;
 
-                // Optional vignette focus falloff toward frame edges
                 let vig_mul = if vig_strength > 0.001 {
                     let nx_norm = ((col_idx as f32 + 0.5) / cols_f) * 2.0 - 1.0;
                     let r2 = (nx_norm * nx_norm + ny_norm * ny_norm) * 0.62;
-                    (1.0 - vig_strength * r2.clamp(0.0, 1.0)).clamp(0.08, 1.0)
+                    (1.0 - vig_strength * r2.clamp(0.0, 1.0)).clamp(0.0, 1.0)
                 } else {
                     1.0
                 };
@@ -341,13 +398,17 @@ pub fn convert_image_buffer(
                 let mut sum_g = 0.0f32;
                 let mut sum_b = 0.0f32;
                 let mut weight_rgb = 0.0f32;
+                let mut peak_raw_y = 0.0f32;
 
                 for k in 0..6 {
                     let (sx, sy) = SUB_POS[k];
                     let (r, g, b, y) = sample_point(x0 + sx * cell_px_w, y0 + sy * cell_px_h);
-                    let yd = (y * vig_mul + dither_delta).clamp(0.0, 1.0);
+                    let y_vig = y * vig_mul;
+                    if y_vig > peak_raw_y {
+                        peak_raw_y = y_vig;
+                    }
+                    let yd = (y_vig + dither_delta).clamp(0.0, 1.0);
                     sub_luma[k] = yd;
-                    // Weight foreground color toward illuminated parts of the cell so dark edges don't muddy hues
                     let cw = 0.15 + yd;
                     sum_r += r * vig_mul * cw;
                     sum_g += g * vig_mul * cw;
@@ -355,7 +416,21 @@ pub fn convert_image_buffer(
                     weight_rgb += cw;
                 }
 
-                // Compute internal structure-tensor orientation BEFORE contrast crunching
+                // OLED Shadow Noise Gate: snap near-black grain directly to pitch-black empty cell
+                if peak_raw_y <= black_gate {
+                    if frame.prev_glyphs.len() == total_cells {
+                        // handled after par_chunks
+                    }
+                    *out_cell = AsciiCell {
+                        ch: b' ',
+                        flags: 0,
+                        fg: floor_bg,
+                        bg: floor_bg,
+                    };
+                    continue;
+                }
+
+                // Internal structure-tensor orientation
                 let gx = ((sub_luma[1] - sub_luma[0])
                     + 1.5 * (sub_luma[3] - sub_luma[2])
                     + (sub_luma[5] - sub_luma[4]))
@@ -365,32 +440,59 @@ pub fn convert_image_buffer(
                 let jyy = gy * gy;
                 let jxy = gx * gy;
                 let trace = jxx + jyy;
-                let (o0, o1) = if trace > 1e-5 && ew > 0.001 {
-                    let edge_mag = (trace.sqrt() * 2.35).min(1.0);
+
+                // External neighbor samples for directional crunch & wireframe contour detection
+                let mut local_max = sub_luma.iter().copied().fold(0.0f32, f32::max);
+                let mut local_min = sub_luma.iter().copied().fold(1.0f32, f32::min);
+                if do_crunch {
+                    for &(ex, ey) in &EXT_POS {
+                        let (_, _, _, y_ext) =
+                            sample_point(x0 + ex * cell_px_w, y0 + ey * cell_px_h);
+                        let ye = (y_ext * vig_mul).clamp(0.0, 1.0);
+                        local_max = local_max.max(ye);
+                        local_min = local_min.min(ye);
+                    }
+                }
+
+                // Neon Wireframe / Contour-Only filter: drop flat uniform interiors cleanly to `' '`
+                if wf_mode {
+                    let span = (local_max - local_min) * wf_sens;
+                    let grad_mag = trace.sqrt() * 2.4 * wf_sens;
+                    let edge_energy = span.max(grad_mag);
+                    if edge_energy < 0.16 {
+                        *out_cell = AsciiCell {
+                            ch: b' ',
+                            flags: 0,
+                            fg: floor_bg,
+                            bg: floor_bg,
+                        };
+                        continue;
+                    }
+                    // Strip uniform base plateau so only the directional edge ridge drives glyph shape
+                    let base_floor = local_min * 0.90;
+                    let norm_span = (local_max - base_floor).max(0.08);
+                    let gain = (edge_energy * 1.15).clamp(0.25, 0.85) / norm_span;
+                    for v in &mut sub_luma {
+                        *v = ((*v - base_floor).max(0.0) * gain).clamp(0.0, 0.82);
+                    }
+                } else if do_crunch && local_max > 0.02 {
+                    let scale255 = 255.0 / local_max;
+                    for v in &mut sub_luma {
+                        let idx = ((*v * scale255).clamp(0.0, 255.0) + 0.5) as usize;
+                        *v = crunch_lut[idx] * local_max;
+                    }
+                }
+
+                let orient_boost = if wf_mode { 1.45 } else { 1.0 };
+                let (o0, o1) = if trace > 1e-5 && eff_ew > 0.001 {
+                    let edge_mag = (trace.sqrt() * 2.35 * orient_boost).min(1.25);
                     (
-                        ((jxx - jyy) / trace) * edge_mag * ew,
-                        ((2.0 * jxy) / trace) * edge_mag * ew,
+                        ((jxx - jyy) / trace) * edge_mag * eff_ew,
+                        ((2.0 * jxy) / trace) * edge_mag * eff_ew,
                     )
                 } else {
                     (0.0, 0.0)
                 };
-
-                // Directional contrast crunch using 4 external neighbor samples
-                if do_crunch {
-                    let mut local_max = sub_luma.iter().copied().fold(0.0f32, f32::max);
-                    for &(ex, ey) in &EXT_POS {
-                        let (_, _, _, y_ext) =
-                            sample_point(x0 + ex * cell_px_w, y0 + ey * cell_px_h);
-                        local_max = local_max.max((y_ext * vig_mul).clamp(0.0, 1.0));
-                    }
-                    if local_max > 0.02 {
-                        let scale255 = 255.0 / local_max;
-                        for v in &mut sub_luma {
-                            let idx = ((*v * scale255).clamp(0.0, 255.0) + 0.5) as usize;
-                            *v = crunch_lut[idx] * local_max;
-                        }
-                    }
-                }
 
                 let target = [
                     sub_luma[0],
@@ -403,7 +505,6 @@ pub fn convert_image_buffer(
                     o1,
                 ];
 
-                // SIMD-friendly 8-float squared Euclidean distance scan across active glyphs
                 let mut best_idx = active[0].idx;
                 let mut best_dist = f32::MAX;
 
@@ -427,7 +528,6 @@ pub fn convert_image_buffer(
                     }
                 }
 
-                // Video temporal hysteresis: keep previous frame's glyph unless the new match wins decisively
                 if has_valid_history {
                     let flat_i = row_idx * cols_usize + col_idx;
                     let prev_g = prev_slice[flat_i] as usize;
@@ -458,15 +558,20 @@ pub fn convert_image_buffer(
                 let cell_g = sum_g * inv_w;
                 let cell_b = sum_b * inv_w;
 
-                let boost = boost_lut[best_idx as usize];
-                let (fg, bg) = resolve_cell_colors(
+                let boost = boost_lut[best_idx as usize] * (if wf_mode { 1.18 } else { 1.0 });
+                let (fg, mut bg) = resolve_cell_colors(
                     params.color_mode,
                     cell_r,
                     cell_g,
                     cell_b,
                     boost,
                     params.bg_intensity,
+                    params.oled_black,
+                    &params.tritone,
                 );
+                if wf_mode {
+                    bg = floor_bg;
+                }
 
                 *out_cell = AsciiCell {
                     ch: ASCII_MIN + best_idx,
@@ -477,7 +582,6 @@ pub fn convert_image_buffer(
             }
         });
 
-    // Update temporal history & glyph diversity statistics in one linear pass
     if frame.prev_glyphs.len() != total_cells {
         frame.prev_glyphs.resize(total_cells, 0);
     }
@@ -491,20 +595,20 @@ pub fn convert_image_buffer(
     frame.render_ms = t0.elapsed().as_secs_f64() * 1000.0;
 }
 
-/// Rasterize `AsciiFrame` into a contiguous RGBA32 pixel buffer (`out_w * out_h * 4` bytes)
-/// using parallel row blitting from `GlyphAtlas`. Zero allocations once `out_rgba` is sized.
+/// Rasterize `AsciiFrame` into a contiguous RGBA32 pixel buffer (`out_w * out_h * 4` bytes).
+/// Supports True OLED `#000000` background, true `RGBA [0,0,0,0]` alpha transparency, and beat-pulsed CRT bloom.
 pub fn rasterize_rgba(
     frame: &AsciiFrame,
     atlas: &GlyphAtlas,
-    crt_bloom: bool,
-    scanlines: bool,
+    params: &RenderParams,
+    bloom_boost: f32,
     out_rgba: &mut Vec<u8>,
 ) -> (usize, usize) {
     let out_w = (frame.cols as usize) * atlas.cell_w;
     let out_h = (frame.rows as usize) * atlas.cell_h;
     let needed = out_w * out_h * 4;
     if out_rgba.len() != needed {
-        out_rgba.resize(needed, 255);
+        out_rgba.resize(needed, 0);
     }
     if out_w == 0 || out_h == 0 {
         return (0, 0);
@@ -514,8 +618,13 @@ pub fn rasterize_rgba(
     let cell_h = atlas.cell_h;
     let cols = frame.cols as usize;
     let row_pixel_bytes = out_w * 4;
+    let transparent = params.transparent_bg;
+    let do_bloom = params.crt_bloom || bloom_boost > 0.05;
+    let bloom_scale =
+        ((if params.crt_bloom { 1.0 } else { 0.0 }) + bloom_boost * 1.35).clamp(0.0, 2.6);
+    let bloom_mul = (bloom_scale * 16.0).round() as u16;
+    let scanlines = params.scanlines;
 
-    // Parallelize by character row (`cell_h` pixel scanlines per task)
     out_rgba
         .par_chunks_mut(row_pixel_bytes * cell_h)
         .enumerate()
@@ -524,7 +633,7 @@ pub fn rasterize_rgba(
             for local_y in 0..cell_h {
                 let abs_y = cell_row * cell_h + local_y;
                 let scan_mul: u16 = if scanlines && (abs_y & 1 == 1) {
-                    208 // subtle ~18% CRT scanline attenuation
+                    208
                 } else {
                     256
                 };
@@ -541,13 +650,8 @@ pub fn rasterize_rgba(
 
                     for gx in 0..cell_w {
                         let a = src_line[gx] as u16;
-                        let inv_a = 255 - a;
-                        let mut r = (fg[0] as u16 * a + bg[0] as u16 * inv_a) / 255;
-                        let mut g = (fg[1] as u16 * a + bg[1] as u16 * inv_a) / 255;
-                        let mut b = (fg[2] as u16 * a + bg[2] as u16 * inv_a) / 255;
-
-                        if crt_bloom && a < 210 {
-                            // Sample immediate neighbors inside glyph cell for soft phosphor halo
+                        let mut halo = 0u16;
+                        if do_bloom && a < 220 && cell.ch != b' ' {
                             let left_a = if gx > 0 { src_line[gx - 1] as u16 } else { 0 };
                             let right_a = if gx + 1 < cell_w {
                                 src_line[gx + 1] as u16
@@ -564,19 +668,38 @@ pub fn rasterize_rgba(
                             } else {
                                 0
                             };
-                            let halo = (left_a + right_a + up_a + dn_a) >> 4; // / 16
+                            halo = ((left_a + right_a + up_a + dn_a) * bloom_mul) >> 8;
+                        }
+
+                        let o = px_base + gx * 4;
+                        if transparent {
+                            let out_a = (((a + halo).min(255) * scan_mul) >> 8) as u8;
+                            if out_a == 0 {
+                                dst_line[o] = 0;
+                                dst_line[o + 1] = 0;
+                                dst_line[o + 2] = 0;
+                                dst_line[o + 3] = 0;
+                            } else {
+                                dst_line[o] = fg[0];
+                                dst_line[o + 1] = fg[1];
+                                dst_line[o + 2] = fg[2];
+                                dst_line[o + 3] = out_a;
+                            }
+                        } else {
+                            let inv_a = 255 - a;
+                            let mut r = (fg[0] as u16 * a + bg[0] as u16 * inv_a) / 255;
+                            let mut g = (fg[1] as u16 * a + bg[1] as u16 * inv_a) / 255;
+                            let mut b = (fg[2] as u16 * a + bg[2] as u16 * inv_a) / 255;
                             if halo > 0 {
                                 r = (r + ((fg[0] as u16 * halo) >> 8)).min(255);
                                 g = (g + ((fg[1] as u16 * halo) >> 8)).min(255);
                                 b = (b + ((fg[2] as u16 * halo) >> 8)).min(255);
                             }
+                            dst_line[o] = ((r * scan_mul) >> 8) as u8;
+                            dst_line[o + 1] = ((g * scan_mul) >> 8) as u8;
+                            dst_line[o + 2] = ((b * scan_mul) >> 8) as u8;
+                            dst_line[o + 3] = 255;
                         }
-
-                        let o = px_base + gx * 4;
-                        dst_line[o] = ((r * scan_mul) >> 8) as u8;
-                        dst_line[o + 1] = ((g * scan_mul) >> 8) as u8;
-                        dst_line[o + 2] = ((b * scan_mul) >> 8) as u8;
-                        dst_line[o + 3] = 255;
                     }
                 }
             }
@@ -590,18 +713,18 @@ pub fn rasterize_rgba(
 pub fn rasterize_rgb24_even(
     frame: &AsciiFrame,
     atlas: &GlyphAtlas,
-    crt_bloom: bool,
-    scanlines: bool,
+    params: &RenderParams,
+    bloom_boost: f32,
     out_rgb: &mut Vec<u8>,
 ) -> (usize, usize) {
     let raw_w = (frame.cols as usize) * atlas.cell_w;
     let raw_h = (frame.rows as usize) * atlas.cell_h;
-    // Pad up by 1px if odd so H.264 yuv420p encoders accept any column/font geometry
     let out_w = (raw_w + 1) & !1;
     let out_h = (raw_h + 1) & !1;
+    let pad_bg = active_canvas_bg(params.oled_black);
     let needed = out_w * out_h * 3;
     if out_rgb.len() != needed {
-        out_rgb.resize(needed, DEFAULT_BG[0]);
+        out_rgb.resize(needed, pad_bg[0]);
     }
     if raw_w == 0 || raw_h == 0 {
         return (0, 0);
@@ -611,6 +734,11 @@ pub fn rasterize_rgb24_even(
     let cell_h = atlas.cell_h;
     let cols = frame.cols as usize;
     let row_pixel_bytes = out_w * 3;
+    let do_bloom = params.crt_bloom || bloom_boost > 0.05;
+    let bloom_scale =
+        ((if params.crt_bloom { 1.0 } else { 0.0 }) + bloom_boost * 1.35).clamp(0.0, 2.6);
+    let bloom_mul = (bloom_scale * 32.0).round() as u16;
+    let scanlines = params.scanlines;
 
     out_rgb[..raw_h * row_pixel_bytes]
         .par_chunks_mut(row_pixel_bytes * cell_h)
@@ -642,14 +770,14 @@ pub fn rasterize_rgb24_even(
                         let mut g = (fg[1] as u16 * a + bg[1] as u16 * inv_a) / 255;
                         let mut b = (fg[2] as u16 * a + bg[2] as u16 * inv_a) / 255;
 
-                        if crt_bloom && a < 210 {
+                        if do_bloom && a < 220 && cell.ch != b' ' {
                             let left_a = if gx > 0 { src_line[gx - 1] as u16 } else { 0 };
                             let right_a = if gx + 1 < cell_w {
                                 src_line[gx + 1] as u16
                             } else {
                                 0
                             };
-                            let halo = (left_a + right_a) >> 3;
+                            let halo = ((left_a + right_a) * bloom_mul) >> 8;
                             if halo > 0 {
                                 r = (r + ((fg[0] as u16 * halo) >> 8)).min(255);
                                 g = (g + ((fg[1] as u16 * halo) >> 8)).min(255);
@@ -665,9 +793,9 @@ pub fn rasterize_rgb24_even(
                 }
                 if out_w > raw_w {
                     let o = raw_w * 3;
-                    dst_line[o] = DEFAULT_BG[0];
-                    dst_line[o + 1] = DEFAULT_BG[1];
-                    dst_line[o + 2] = DEFAULT_BG[2];
+                    dst_line[o] = pad_bg[0];
+                    dst_line[o + 1] = pad_bg[1];
+                    dst_line[o + 2] = pad_bg[2];
                 }
             }
         });
@@ -675,7 +803,7 @@ pub fn rasterize_rgb24_even(
     if out_h > raw_h {
         let last_start = raw_h * row_pixel_bytes;
         for px in out_rgb[last_start..].chunks_exact_mut(3) {
-            px.copy_from_slice(&DEFAULT_BG);
+            px.copy_from_slice(&pad_bg);
         }
     }
 
