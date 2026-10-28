@@ -6,12 +6,12 @@ use crate::export::{
 };
 use crate::glyph_atlas::GlyphAtlas;
 use crate::gui::{launch_gui, GuiBootOptions, SettingsTab};
-use crate::samples::{generate_sample_rgba, SamplePreset};
 use crate::telemetry::format_rss_mb;
 use crate::theme::StudioTheme;
 use crate::updater::{
     check_latest_release_blocking, download_and_verify_release_blocking, format_build_report,
-    AppPreferences, APP_VERSION, DEFAULT_GITHUB_REPO,
+    relaunch_executable, update_and_prepare_relaunch_blocking, AppPreferences, APP_VERSION,
+    DEFAULT_GITHUB_REPO,
 };
 use crate::video::{detect_ffmpeg_version, transcode_video_streaming, TranscodeProgress};
 use clap::{Parser, Subcommand};
@@ -68,8 +68,6 @@ pub enum Commands {
         wireframe: bool,
         #[arg(long)]
         audio_reactive: Option<f32>,
-        #[arg(long)]
-        split: Option<f32>,
         #[arg(long)]
         zoom: Option<f32>,
         #[arg(long)]
@@ -185,17 +183,40 @@ pub enum Commands {
         #[arg(long, default_value_t = 120)]
         iters: u32,
     },
-    /// Manually check GitHub Releases or download a SHA-256 verified binary update (no background telemetry).
+    /// Manually check GitHub Releases, download a verified binary, or install & relaunch in-place.
     CheckUpdate {
         #[arg(long)]
         repo: Option<String>,
         /// Download, SHA-256 verify, inspect native binary header, and extract the latest release binary.
         #[arg(long)]
         download: bool,
+        /// Rebuild (if inside a clean Cargo checkout) or install the verified release binary in-place.
+        #[arg(long)]
+        install: bool,
+        /// Automatically launch the updated binary immediately after `--install`.
+        #[arg(long)]
+        relaunch: bool,
+        /// Force rebuilding from the verified GitHub release tag in a local Cargo/Git checkout.
+        #[arg(long)]
+        from_source: bool,
         /// Destination directory when `--download` is set (defaults to current working directory).
         #[arg(long)]
         dest: Option<PathBuf>,
-        /// Permit `--download` from a custom `--repo` other than the canonical repository.
+        /// Permit `--download` / `--install` from a custom `--repo` other than the canonical repository.
+        #[arg(long)]
+        allow_custom_repo: bool,
+    },
+    /// Rebuild or install the latest verified GitHub release in-place and automatically launch it.
+    #[command(visible_alias = "update")]
+    SelfUpdate {
+        #[arg(long)]
+        repo: Option<String>,
+        /// Force rebuilding from the verified GitHub release tag in a local Cargo/Git checkout.
+        #[arg(long)]
+        from_source: bool,
+        /// Skip automatically launching the newly installed binary after updating.
+        #[arg(long)]
+        no_relaunch: bool,
         #[arg(long)]
         allow_custom_repo: bool,
     },
@@ -220,7 +241,15 @@ pub fn should_attach_parent_console<S: AsRef<str>>(args: &[S]) -> bool {
     }
     if matches!(
         first,
-        "image" | "video" | "look" | "build-info" | "info" | "bench" | "check-update"
+        "image"
+            | "video"
+            | "look"
+            | "build-info"
+            | "info"
+            | "bench"
+            | "check-update"
+            | "self-update"
+            | "update"
     ) {
         return true;
     }
@@ -267,7 +296,6 @@ pub fn run_entry() -> Result<(), String> {
             transparent,
             wireframe,
             audio_reactive,
-            split,
             zoom,
             bloom,
             show_updates,
@@ -328,7 +356,6 @@ pub fn run_entry() -> Result<(), String> {
                 initial_params: Some(params),
                 theme_override,
                 open_settings_tab,
-                split_wipe: split,
                 initial_zoom: zoom,
                 show_update_modal: show_updates,
                 auto_exit_after_frames: exit_after_frames,
@@ -560,7 +587,32 @@ pub fn run_entry() -> Result<(), String> {
         }
         Some(Commands::Bench { cols, iters }) => {
             let atlas = GlyphAtlas::default_embedded(20);
-            let rgba = generate_sample_rgba(SamplePreset::CyberSculpture, 1280, 720, 0.25);
+            let bw = 1280u32;
+            let bh = 720u32;
+            let mut rgba = vec![0u8; (bw * bh * 4) as usize];
+            for y in 0..bh {
+                let ny = (y as f32 - 360.0) / 360.0;
+                for x in 0..bw {
+                    let nx = (x as f32 - 640.0) / 360.0;
+                    let r2 = (nx * nx + ny * ny).sqrt();
+                    let spoke = if (ny.atan2(nx) * 7.0).sin() > 0.12 {
+                        1.0f32
+                    } else {
+                        0.08
+                    };
+                    let ring = if (r2 > 0.2 && r2 < 0.5) || (r2 > 0.65 && r2 < 0.92) {
+                        1.0f32
+                    } else {
+                        0.05
+                    };
+                    let idx = ((y * bw + x) * 4) as usize;
+                    rgba[idx] = ((ring * spoke * 245.0).clamp(0.0, 255.0)) as u8;
+                    rgba[idx + 1] = ((((nx + 1.5) * 0.33) * 230.0).clamp(0.0, 255.0)) as u8;
+                    rgba[idx + 2] =
+                        (((1.0 - (r2 * 0.6).min(1.0)) * spoke * 245.0).clamp(0.0, 255.0)) as u8;
+                    rgba[idx + 3] = 255;
+                }
+            }
             let params = RenderParams {
                 cols,
                 ..RenderParams::default()
@@ -597,19 +649,36 @@ pub fn run_entry() -> Result<(), String> {
         Some(Commands::CheckUpdate {
             repo,
             download,
+            install,
+            relaunch,
+            from_source,
             dest,
             allow_custom_repo,
         }) => {
             let prefs = AppPreferences::load();
             let slug = repo.unwrap_or_else(|| {
-                if download && !allow_custom_repo {
+                if (download || install) && !allow_custom_repo {
                     DEFAULT_GITHUB_REPO.to_string()
                 } else {
                     prefs.github_repo
                 }
             });
 
-            if download {
+            if install {
+                let out =
+                    update_and_prepare_relaunch_blocking(&slug, from_source, !allow_custom_repo)?;
+                println!("Updated release  : {} ({})", out.tag, out.method);
+                println!("SHA-256          : {}", out.sha256_hex);
+                println!(
+                    "Installed binary : {} ({:.2} MB)",
+                    out.installed_exe.display(),
+                    (out.binary_size_bytes as f64) / (1024.0 * 1024.0)
+                );
+                if relaunch {
+                    let pid = relaunch_executable(&out.installed_exe, &[])?;
+                    println!("Launched updated LumaGlyph (PID {pid}).");
+                }
+            } else if download {
                 let target_dir = dest.unwrap_or_else(|| PathBuf::from("."));
                 let out =
                     download_and_verify_release_blocking(&slug, &target_dir, !allow_custom_repo)?;
@@ -631,6 +700,27 @@ pub fn run_entry() -> Result<(), String> {
                 } else {
                     println!("Up to date. Latest GitHub release is {}.", out.latest_tag);
                 }
+            }
+            Ok(())
+        }
+        Some(Commands::SelfUpdate {
+            repo,
+            from_source,
+            no_relaunch,
+            allow_custom_repo,
+        }) => {
+            let slug = repo.unwrap_or_else(|| DEFAULT_GITHUB_REPO.to_string());
+            let out = update_and_prepare_relaunch_blocking(&slug, from_source, !allow_custom_repo)?;
+            println!("Updated release  : {} ({})", out.tag, out.method);
+            println!("SHA-256          : {}", out.sha256_hex);
+            println!(
+                "Installed binary : {} ({:.2} MB)",
+                out.installed_exe.display(),
+                (out.binary_size_bytes as f64) / (1024.0 * 1024.0)
+            );
+            if !no_relaunch {
+                let pid = relaunch_executable(&out.installed_exe, &[])?;
+                println!("Launched updated LumaGlyph (PID {pid}).");
             }
             Ok(())
         }

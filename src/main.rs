@@ -35,6 +35,8 @@ mod win_console {
 }
 
 fn main() {
+    let _ = lumaglyph::updater::cleanup_stale_old_executables();
+
     #[cfg(target_os = "windows")]
     let cli_mode = {
         let raw_args: Vec<String> = std::env::args().collect();

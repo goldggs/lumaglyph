@@ -11,9 +11,9 @@ use crate::theme::{
     AccentPreset, CheckerContrast, CornerStyle, StudioTheme, ThemePalette, UiDensity,
 };
 use crate::updater::{
-    format_build_report, spawn_release_check, spawn_verified_release_download, AppPreferences,
-    ReleaseCheckOutcome, VerifiedDownloadOutcome, APP_VERSION, BUILD_GIT_SHA, BUILD_PROFILE,
-    BUILD_RUSTC_VERSION, BUILD_TARGET_TRIPLE, DEFAULT_GITHUB_REPO,
+    format_build_report, relaunch_executable, spawn_release_check, spawn_verified_self_update,
+    AppPreferences, ReleaseCheckOutcome, VerifiedInstallOutcome, APP_VERSION, BUILD_GIT_SHA,
+    BUILD_PROFILE, BUILD_RUSTC_VERSION, BUILD_TARGET_TRIPLE, DEFAULT_GITHUB_REPO,
 };
 use crate::video::{
     detect_ffmpeg_version, set_video_pipeline_prefs, transcode_video_streaming, LiveVideoStream,
@@ -98,7 +98,6 @@ pub struct GuiBootOptions {
     pub initial_params: Option<RenderParams>,
     pub theme_override: Option<StudioTheme>,
     pub open_settings_tab: Option<SettingsTab>,
-    pub split_wipe: Option<f32>,
     pub initial_zoom: Option<f32>,
     pub show_update_modal: bool,
     pub auto_exit_after_frames: Option<u32>,
@@ -129,21 +128,18 @@ pub struct LumaGlyphApp {
     source_channels: usize,
     source_w: u32,
     source_h: u32,
-    source_dirty: bool,
     ascii_dirty: bool,
 
     ascii_frame: AsciiFrame,
     raster_rgba: Vec<u8>,
     ascii_tex: Option<TextureHandle>,
-    orig_tex: Option<TextureHandle>,
     ascii_px_w: usize,
     ascii_px_h: usize,
 
     // Workstation layout & viewport state
+    inspector_open: bool,
     inspector_tab: InspectorTab,
     zen_mode: bool,
-    split_enabled: bool,
-    split_ratio: f32,
     zoom: f32,
     auto_fit: bool,
     pan_offset: Vec2,
@@ -168,8 +164,8 @@ pub struct LumaGlyphApp {
     settings_tab: SettingsTab,
     update_rx: Option<Receiver<Result<ReleaseCheckOutcome, String>>>,
     update_status: Option<Result<ReleaseCheckOutcome, String>>,
-    download_rx: Option<Receiver<Result<VerifiedDownloadOutcome, String>>>,
-    download_status: Option<Result<VerifiedDownloadOutcome, String>>,
+    self_update_rx: Option<Receiver<Result<VerifiedInstallOutcome, String>>>,
+    self_update_status: Option<Result<VerifiedInstallOutcome, String>>,
 
     // Automated frame capture exit
     frames_drawn: u32,
@@ -238,18 +234,15 @@ impl LumaGlyphApp {
             source_channels: 4,
             source_w: 0,
             source_h: 0,
-            source_dirty: false,
             ascii_dirty: false,
             ascii_frame: AsciiFrame::new(),
             raster_rgba: Vec::new(),
             ascii_tex: None,
-            orig_tex: None,
             ascii_px_w: 0,
             ascii_px_h: 0,
+            inspector_open: false,
             inspector_tab: InspectorTab::All,
             zen_mode: false,
-            split_enabled: boot.split_wipe.is_some_and(|v| v > 0.0),
-            split_ratio: boot.split_wipe.unwrap_or(0.50),
             zoom: boot.initial_zoom.unwrap_or(1.0),
             auto_fit: boot.initial_zoom.is_none(),
             pan_offset: Vec2::ZERO,
@@ -268,8 +261,8 @@ impl LumaGlyphApp {
             settings_tab: initial_tab,
             update_rx,
             update_status: None,
-            download_rx: None,
-            download_status: None,
+            self_update_rx: None,
+            self_update_status: None,
             frames_drawn: 0,
             auto_exit_after_frames: boot.auto_exit_after_frames,
         };
@@ -288,6 +281,7 @@ impl LumaGlyphApp {
 
     fn close_media(&mut self) {
         self.source_kind = SourceKind::Empty;
+        self.inspector_open = false;
         self.source_rgba.clear();
         self.source_rgba.shrink_to_fit();
         self.raster_rgba.clear();
@@ -298,12 +292,34 @@ impl LumaGlyphApp {
         self.ascii_px_h = 0;
         self.ascii_frame = AsciiFrame::new();
         self.ascii_tex = None;
-        self.orig_tex = None;
-        self.source_dirty = false;
         self.ascii_dirty = false;
         self.live_audio_energy = 0.0;
         self.video_frames_seen = 0;
         self.pan_offset = Vec2::ZERO;
+    }
+
+    fn reset_ascii_to_default(&mut self) {
+        self.params = RenderParams::default();
+        self.atlas = GlyphAtlas::default_embedded(self.prefs.atlas_cell_height.clamp(12, 36));
+        self.auto_fit = true;
+        self.zoom = 1.0;
+        self.pan_offset = Vec2::ZERO;
+        self.sync_look_code();
+        self.ascii_dirty = true;
+        self.set_toast("Reset ASCII parameters to normal default");
+    }
+
+    fn reset_all_settings_to_default(&mut self) {
+        self.prefs = AppPreferences::default();
+        self.atlas = GlyphAtlas::default_embedded(self.prefs.atlas_cell_height);
+        self.persist_prefs();
+        self.params = RenderParams::default();
+        self.auto_fit = true;
+        self.zoom = 1.0;
+        self.pan_offset = Vec2::ZERO;
+        self.sync_look_code();
+        self.ascii_dirty = true;
+        self.set_toast("Restored all settings and ASCII parameters to default");
     }
 
     fn set_toast(&mut self, msg: impl Into<String>) {
@@ -409,10 +425,10 @@ impl LumaGlyphApp {
                     self.source_channels = 3;
                     self.source_rgba = vec![0u8; (stream.dec_w * stream.dec_h * 3) as usize];
                     self.source_kind = SourceKind::VideoFile(stream);
+                    self.inspector_open = true;
                     self.video_frames_seen = 0;
                     self.live_audio_energy = 0.0;
                     self.ascii_frame.prev_glyphs.clear();
-                    self.source_dirty = true;
                     self.ascii_dirty = true;
                     let audio_note = if has_audio {
                         "audio envelope synced"
@@ -441,8 +457,8 @@ impl LumaGlyphApp {
                     self.source_kind = SourceKind::StaticImage {
                         name: fname.clone(),
                     };
+                    self.inspector_open = true;
                     self.ascii_frame.prev_glyphs.clear();
-                    self.source_dirty = true;
                     self.ascii_dirty = true;
                     self.set_toast(format!("Loaded {fname} ({w}x{h})"));
                 }
@@ -484,11 +500,17 @@ impl LumaGlyphApp {
             if i.modifiers.command && i.modifiers.shift && i.key_pressed(Key::O) {
                 self.open_video_dialog();
             }
+            if i.modifiers.command && !i.modifiers.shift && i.key_pressed(Key::B) {
+                self.inspector_open = !self.inspector_open;
+            }
             if i.modifiers.command && !i.modifiers.shift && i.key_pressed(Key::W) {
                 self.close_media();
             }
             if i.modifiers.command && !i.modifiers.shift && i.key_pressed(Key::S) {
                 self.save_png_dialog();
+            }
+            if i.modifiers.command && i.modifiers.shift && i.key_pressed(Key::R) {
+                self.reset_ascii_to_default();
             }
             if i.modifiers.command && i.modifiers.shift && i.key_pressed(Key::C) {
                 let code = self.params.to_look_code();
@@ -498,12 +520,6 @@ impl LumaGlyphApp {
             if !i.modifiers.any() {
                 if i.key_pressed(Key::Tab) {
                     self.zen_mode = !self.zen_mode;
-                }
-                if i.key_pressed(Key::W) {
-                    self.split_enabled = !self.split_enabled;
-                    if self.split_enabled && self.has_media() {
-                        self.source_dirty = true;
-                    }
                 }
                 if i.key_pressed(Key::B) {
                     self.params.oled_black = !self.params.oled_black;
@@ -633,7 +649,6 @@ impl LumaGlyphApp {
                 self.source_channels = 3;
                 self.live_audio_energy = audio_e;
                 self.video_frames_seen += 1;
-                self.source_dirty = true;
                 self.ascii_dirty = true;
             }
             if !stream.paused.load(Ordering::Relaxed) {
@@ -648,71 +663,46 @@ impl LumaGlyphApp {
                 self.sync_look_code();
                 self.ascii_dirty = false;
             }
-            self.source_dirty = false;
-        } else {
-            if self.split_enabled && (self.source_dirty || self.orig_tex.is_none()) {
-                let color_img = if self.source_channels == 4 {
-                    ColorImage::from_rgba_unmultiplied(
-                        [self.source_w as usize, self.source_h as usize],
-                        &self.source_rgba,
-                    )
+        } else if self.ascii_dirty || self.ascii_tex.is_none() {
+            self.sync_look_code();
+            let use_temporal = matches!(self.source_kind, SourceKind::VideoFile(_));
+            convert_image_buffer_with_audio(
+                &self.source_rgba,
+                self.source_w,
+                self.source_h,
+                self.source_channels,
+                &self.atlas,
+                &self.params,
+                use_temporal,
+                self.live_audio_energy,
+                &mut self.ascii_frame,
+            );
+            let bloom_boost = self.live_audio_energy * self.params.audio_reactive * 0.65;
+            let (pw, ph) = rasterize_rgba(
+                &self.ascii_frame,
+                &self.atlas,
+                &self.params,
+                bloom_boost,
+                &mut self.raster_rgba,
+            );
+            self.ascii_px_w = pw;
+            self.ascii_px_h = ph;
+
+            if pw > 0 && ph > 0 {
+                let cimg = ColorImage::from_rgba_unmultiplied([pw, ph], &self.raster_rgba);
+                let opts = if self.zoom >= 1.8 {
+                    TextureOptions::NEAREST
                 } else {
-                    ColorImage::from_rgb(
-                        [self.source_w as usize, self.source_h as usize],
-                        &self.source_rgba,
-                    )
+                    TextureOptions::LINEAR
                 };
-                match &mut self.orig_tex {
-                    Some(tex) => tex.set(color_img, TextureOptions::LINEAR),
+                match &mut self.ascii_tex {
+                    Some(tex) => tex.set(cimg, opts),
                     None => {
-                        self.orig_tex =
-                            Some(ctx.load_texture("orig_media", color_img, TextureOptions::LINEAR));
+                        self.ascii_tex = Some(ctx.load_texture("ascii_canvas", cimg, opts));
                     }
                 }
-                self.source_dirty = false;
             }
-
-            if self.ascii_dirty || self.ascii_tex.is_none() {
-                self.sync_look_code();
-                let use_temporal = matches!(self.source_kind, SourceKind::VideoFile(_));
-                convert_image_buffer_with_audio(
-                    &self.source_rgba,
-                    self.source_w,
-                    self.source_h,
-                    self.source_channels,
-                    &self.atlas,
-                    &self.params,
-                    use_temporal,
-                    self.live_audio_energy,
-                    &mut self.ascii_frame,
-                );
-                let bloom_boost = self.live_audio_energy * self.params.audio_reactive * 0.65;
-                let (pw, ph) = rasterize_rgba(
-                    &self.ascii_frame,
-                    &self.atlas,
-                    &self.params,
-                    bloom_boost,
-                    &mut self.raster_rgba,
-                );
-                self.ascii_px_w = pw;
-                self.ascii_px_h = ph;
-
-                if pw > 0 && ph > 0 {
-                    let cimg = ColorImage::from_rgba_unmultiplied([pw, ph], &self.raster_rgba);
-                    let opts = if self.zoom >= 1.8 {
-                        TextureOptions::NEAREST
-                    } else {
-                        TextureOptions::LINEAR
-                    };
-                    match &mut self.ascii_tex {
-                        Some(tex) => tex.set(cimg, opts),
-                        None => {
-                            self.ascii_tex = Some(ctx.load_texture("ascii_canvas", cimg, opts));
-                        }
-                    }
-                }
-                self.ascii_dirty = false;
-            }
+            self.ascii_dirty = false;
         }
 
         if let Some(job) = &self.transcode_job {
@@ -751,18 +741,33 @@ impl LumaGlyphApp {
             }
         }
 
-        if let Some(rx) = &self.download_rx {
+        if let Some(rx) = &self.self_update_rx {
             ctx.request_repaint_after(std::time::Duration::from_millis(80));
             if let Ok(res) = rx.try_recv() {
-                match &res {
-                    Ok(done) => self.set_toast(format!(
-                        "Verified SHA-256 & saved {}",
-                        done.saved_path.display()
-                    )),
-                    Err(err) => self.set_toast(format!("Update verification blocked: {err}")),
+                self.self_update_rx = None;
+                match res {
+                    Ok(done) => {
+                        let _ = self.prefs.save();
+                        match relaunch_executable(&done.installed_exe, &[]) {
+                            Ok(_pid) => {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                std::process::exit(0);
+                            }
+                            Err(launch_err) => {
+                                let msg = format!(
+                                    "Installed {}, failed auto-launch: {launch_err}",
+                                    done.tag
+                                );
+                                self.set_toast(&msg);
+                                self.self_update_status = Some(Err(msg));
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        self.set_toast(format!("Update failed: {err}"));
+                        self.self_update_status = Some(Err(err));
+                    }
                 }
-                self.download_status = Some(res);
-                self.download_rx = None;
             }
         }
 
@@ -779,13 +784,8 @@ impl LumaGlyphApp {
 
             ui.label(
                 RichText::new("LUMAGLYPH")
-                    .font(plex_medium(12.5))
+                    .font(plex_medium(12.2))
                     .color(pal.text_primary),
-            );
-            ui.label(
-                RichText::new(format!("v{APP_VERSION}"))
-                    .font(mono_font(10.8))
-                    .color(pal.text_muted),
             );
 
             ui.separator();
@@ -844,14 +844,7 @@ impl LumaGlyphApp {
                 });
 
                 ui.menu_button("View", |ui| {
-                    if ui
-                        .checkbox(&mut self.split_enabled, "Split-Wipe Curtain       W")
-                        .changed()
-                        && self.split_enabled
-                        && self.has_media()
-                    {
-                        self.source_dirty = true;
-                    }
+                    ui.checkbox(&mut self.inspector_open, "Inspector Panel     Ctrl+B");
                     ui.checkbox(&mut self.zen_mode, "Zen Canvas Mode        Tab");
                     if ui
                         .checkbox(&mut self.prefs.show_cell_hud, "Hover Cell Readout")
@@ -864,6 +857,11 @@ impl LumaGlyphApp {
                         .changed()
                     {
                         self.persist_prefs();
+                    }
+                    ui.separator();
+                    if ui.button("Reset to Default  Ctrl+Shift+R").clicked() {
+                        self.reset_ascii_to_default();
+                        ui.close_menu();
                     }
                     ui.separator();
                     if ui.button("Zoom to Fit              0").clicked() {
@@ -883,23 +881,16 @@ impl LumaGlyphApp {
                             ui.close_menu();
                         }
                     }
-                    ui.separator();
-                    ui.menu_button("Theme", |ui| {
-                        for t in StudioTheme::ALL {
-                            if ui
-                                .radio_value(&mut self.prefs.theme, t, t.label())
-                                .changed()
-                            {
-                                self.persist_prefs();
-                                ui.close_menu();
-                            }
-                        }
-                    });
                 });
 
                 ui.menu_button("Presets", |ui| {
+                    if ui.button("Reset to Default         Ctrl+Shift+R").clicked() {
+                        self.reset_ascii_to_default();
+                        ui.close_menu();
+                    }
+                    ui.separator();
                     for (id, lbl) in [
-                        ("neutral", "Calibrated TrueColor (Default)"),
+                        ("neutral", "Normal TrueColor (Default)"),
                         ("oled_contrast", "OLED #000000 High-Contrast"),
                         ("rgba_contour", "Neon Contour Overlay (RGBA Alpha)"),
                         ("tokyo_tritone", "Tokyo Midnight Tri-Tone"),
@@ -963,31 +954,27 @@ impl LumaGlyphApp {
                     self.show_settings_window = !self.show_settings_window;
                 }
 
-                ui.separator();
-
-                let metrics = if self.has_media() {
+                if self.has_media() {
+                    ui.separator();
                     let fps_est = if self.ascii_frame.render_ms > 0.05 {
                         (1000.0 / self.ascii_frame.render_ms).min(9999.0)
                     } else {
                         9999.0
                     };
-                    format!(
-                        "{}x{}   |   {:02}/95 CHARS   |   {:.2} ms ({:.0} FPS)   |   RSS {}",
+                    let metrics = format!(
+                        "{}x{}   |   {:02}/95 CHARS   |   {:.2} ms ({:.0} FPS)",
                         self.ascii_frame.cols,
                         self.ascii_frame.rows,
                         self.ascii_frame.unique_glyphs,
                         self.ascii_frame.render_ms,
                         fps_est,
-                        self.rss_label
-                    )
-                } else {
-                    format!("RSS {}", self.rss_label)
-                };
-                ui.label(
-                    RichText::new(metrics)
-                        .font(mono_font(11.0))
-                        .color(pal.text_secondary),
-                );
+                    );
+                    ui.label(
+                        RichText::new(metrics)
+                            .font(mono_font(10.8))
+                            .color(pal.text_secondary),
+                    );
+                }
             });
         });
     }
@@ -1060,14 +1047,12 @@ impl LumaGlyphApp {
 
             ui.separator();
 
-            if workstation_toggle(ui, &pal, self.split_enabled, "Split-Wipe")
-                .on_hover_text("Source / ASCII comparison curtain (Key: W)")
+            if ui
+                .button("Reset to Default")
+                .on_hover_text("Reset all ASCII parameters to normal default (Ctrl+Shift+R)")
                 .clicked()
             {
-                self.split_enabled = !self.split_enabled;
-                if self.split_enabled {
-                    self.source_dirty = true;
-                }
+                self.reset_ascii_to_default();
             }
 
             // Right side: viewport zoom presets + Zen mode
@@ -1100,9 +1085,10 @@ impl LumaGlyphApp {
     fn draw_inspector_dock(&mut self, ui: &mut egui::Ui) {
         let pal = self.palette;
 
-        // Segmented workspace tab bar at top of Inspector
+        // Segmented workspace tab bar + one-click Reset to Default at top of Inspector
         ui.horizontal(|ui| {
-            let total_w = ui.available_width();
+            let reset_w = 50.0_f32;
+            let total_w = (ui.available_width() - reset_w - 6.0).max(160.0);
             let tab_w = (total_w - 12.0) / (InspectorTab::ALL.len() as f32);
             ui.spacing_mut().item_spacing.x = 4.0;
             for tab in InspectorTab::ALL {
@@ -1144,6 +1130,34 @@ impl LumaGlyphApp {
                 if resp.clicked() {
                     self.inspector_tab = tab;
                 }
+            }
+
+            let (r_rect, r_resp) = ui.allocate_exact_size(Vec2::new(reset_w, 23.0), Sense::click());
+            let r_fill = if r_resp.hovered() {
+                pal.control_hover
+            } else {
+                pal.control_bg
+            };
+            ui.painter()
+                .rect_filled(r_rect, CornerRadius::same(pal.radius), r_fill);
+            ui.painter().rect_stroke(
+                r_rect,
+                CornerRadius::same(pal.radius),
+                Stroke::new(1.0_f32, pal.border_subtle),
+                StrokeKind::Inside,
+            );
+            ui.painter().text(
+                r_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Reset",
+                plex_medium(11.1),
+                pal.text_secondary,
+            );
+            if r_resp
+                .on_hover_text("Reset all ASCII parameters to normal default (Ctrl+Shift+R)")
+                .clicked()
+            {
+                self.reset_ascii_to_default();
             }
         });
 
@@ -1197,7 +1211,7 @@ impl LumaGlyphApp {
                             "Shadow Gate",
                             &mut self.params.black_gate,
                             0.00..=0.25,
-                            0.03,
+                            0.02,
                             3,
                         );
                         if self.params.wireframe_only {
@@ -1297,7 +1311,7 @@ impl LumaGlyphApp {
                             "Luminance Comp",
                             &mut self.params.luminance_comp,
                             0.00..=1.00,
-                            0.68,
+                            0.65,
                             2,
                         );
                         if self.params.color_mode == ColorMode::DualColor
@@ -1309,7 +1323,7 @@ impl LumaGlyphApp {
                                 "Dual-BG Depth",
                                 &mut self.params.bg_intensity,
                                 0.04..=0.55,
-                                0.26,
+                                0.22,
                                 2,
                             );
                         }
@@ -1319,7 +1333,7 @@ impl LumaGlyphApp {
                             "Brightness",
                             &mut self.params.brightness,
                             -0.40..=0.40,
-                            0.02,
+                            0.00,
                             2,
                         );
                         c |= scrub_row_f32(
@@ -1328,7 +1342,7 @@ impl LumaGlyphApp {
                             "Contrast",
                             &mut self.params.contrast,
                             0.50..=2.40,
-                            1.18,
+                            1.00,
                             2,
                         );
                         c |= scrub_row_f32(
@@ -1337,7 +1351,7 @@ impl LumaGlyphApp {
                             "Saturation",
                             &mut self.params.saturation,
                             0.00..=2.20,
-                            1.22,
+                            1.00,
                             2,
                         );
                         c |= scrub_row_f32(
@@ -1346,7 +1360,7 @@ impl LumaGlyphApp {
                             "Gamma",
                             &mut self.params.gamma,
                             0.45..=2.00,
-                            0.96,
+                            1.00,
                             2,
                         );
                         c |= scrub_row_f32(
@@ -1355,7 +1369,7 @@ impl LumaGlyphApp {
                             "Bayer Dither",
                             &mut self.params.dither,
                             0.00..=1.00,
-                            0.08,
+                            0.04,
                             2,
                         );
 
@@ -1366,13 +1380,8 @@ impl LumaGlyphApp {
                                 .changed();
                             c |= ui.checkbox(&mut self.params.invert, "Invert").changed();
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui.small_button("Reset").clicked() {
-                                    let cols = self.params.cols;
-                                    self.params = RenderParams {
-                                        cols,
-                                        ..RenderParams::default()
-                                    };
-                                    c = true;
+                                if ui.small_button("Reset to Default").clicked() {
+                                    self.reset_ascii_to_default();
                                 }
                             });
                         });
@@ -1433,7 +1442,7 @@ impl LumaGlyphApp {
                             "Dir. Crunch",
                             &mut self.params.directional_crunch,
                             0.00..=3.00,
-                            1.40,
+                            1.25,
                             2,
                         );
                         c |= scrub_row_f32(
@@ -1442,7 +1451,7 @@ impl LumaGlyphApp {
                             "Edge Tensor",
                             &mut self.params.edge_weight,
                             0.00..=2.00,
-                            0.92,
+                            0.90,
                             2,
                         );
                         c |= scrub_row_f32(
@@ -1451,7 +1460,7 @@ impl LumaGlyphApp {
                             "Anti-Flicker",
                             &mut self.params.temporal_stability,
                             0.00..=0.45,
-                            0.16,
+                            0.20,
                             2,
                         );
                         c |= scrub_row_f32(
@@ -1691,12 +1700,179 @@ impl LumaGlyphApp {
             });
     }
 
+    fn draw_empty_workbench(
+        &mut self,
+        ui: &mut egui::Ui,
+        painter: &egui::Painter,
+        avail: Rect,
+        pointer_pos: Option<Pos2>,
+        clicked: bool,
+    ) {
+        let pal = self.palette;
+        let center = Pos2::new(
+            avail.center().x,
+            (avail.center().y - 18.0).max(avail.top() + 120.0),
+        );
+
+        // Subtle recessed tone matching VS Code's low-contrast empty-window watermark
+        let watermark_col = if pal.is_light {
+            Color32::from_rgba_unmultiplied(90, 92, 98, 95)
+        } else {
+            Color32::from_rgba_unmultiplied(150, 154, 166, 62)
+        };
+        let wordmark_col = if pal.is_light {
+            Color32::from_rgba_unmultiplied(88, 90, 96, 125)
+        } else {
+            Color32::from_rgba_unmultiplied(155, 160, 172, 92)
+        };
+        let hint_col = if pal.is_light {
+            Color32::from_rgba_unmultiplied(95, 98, 105, 165)
+        } else {
+            Color32::from_rgba_unmultiplied(146, 150, 162, 138)
+        };
+
+        // 1. Minimalist geometric frame/glyph mark (recessed vector hairlines, zero images/emojis)
+        let mark_c = Pos2::new(center.x, center.y - 88.0);
+        let half = 21.0_f32;
+        let leg = 8.5_f32;
+        let st = Stroke::new(1.5_f32, watermark_col);
+        for (sx, sy) in [(-1.0_f32, -1.0_f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+            let corner = Pos2::new(mark_c.x + sx * half, mark_c.y + sy * half);
+            painter.line_segment([corner, Pos2::new(corner.x - sx * leg, corner.y)], st);
+            painter.line_segment([corner, Pos2::new(corner.x, corner.y - sy * leg)], st);
+        }
+        // Subtle inner diagonal ASCII slash/backslash crosshairs
+        painter.line_segment(
+            [
+                Pos2::new(mark_c.x - 8.5, mark_c.y + 9.5),
+                Pos2::new(mark_c.x - 1.5, mark_c.y - 9.5),
+            ],
+            st,
+        );
+        painter.line_segment(
+            [
+                Pos2::new(mark_c.x + 1.5, mark_c.y - 9.5),
+                Pos2::new(mark_c.x + 8.5, mark_c.y + 9.5),
+            ],
+            st,
+        );
+        painter.line_segment(
+            [
+                Pos2::new(mark_c.x - 6.0, mark_c.y + 3.0),
+                Pos2::new(mark_c.x + 6.0, mark_c.y + 3.0),
+            ],
+            st,
+        );
+
+        // Recessed wordmark
+        painter.text(
+            Pos2::new(center.x, center.y - 44.0),
+            egui::Align2::CENTER_CENTER,
+            "L U M A G L Y P H",
+            plex_medium(12.5),
+            wordmark_col,
+        );
+
+        // 2. VS Code-style two-column shortcut rows
+        let rows: [(&str, &[&str], u8); 4] = [
+            ("Open Image", &["Ctrl", "O"], 1),
+            ("Open Video", &["Ctrl", "Shift", "O"], 2),
+            ("Toggle Inspector", &["Ctrl", "B"], 3),
+            ("Settings", &["Ctrl", ","], 4),
+        ];
+
+        let spine_x = center.x - 6.0;
+        let start_y = center.y - 6.0;
+        let row_h = 28.0_f32;
+
+        for (idx, (label, keys, action_id)) in rows.iter().enumerate() {
+            let cy = start_y + (idx as f32) * row_h;
+            let hit_rect = Rect::from_center_size(Pos2::new(center.x, cy), Vec2::new(290.0, 24.0));
+            let row_hovered = pointer_pos.is_some_and(|p| hit_rect.contains(p));
+            if row_hovered {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+
+            let lbl_col = if row_hovered {
+                pal.text_primary
+            } else {
+                pal.text_muted
+            };
+            painter.text(
+                Pos2::new(spine_x - 12.0, cy),
+                egui::Align2::RIGHT_CENTER,
+                *label,
+                egui::FontId::proportional(12.2),
+                lbl_col,
+            );
+
+            // Keycap badges on right of spine
+            let mut kx = spine_x + 6.0;
+            for (k_i, k) in keys.iter().enumerate() {
+                if k_i > 0 {
+                    painter.text(
+                        Pos2::new(kx + 4.0, cy),
+                        egui::Align2::CENTER_CENTER,
+                        "+",
+                        mono_font(10.5),
+                        hint_col,
+                    );
+                    kx += 11.0;
+                }
+                let galley =
+                    painter.layout_no_wrap((*k).to_string(), mono_font(10.6), pal.text_secondary);
+                let cap_w = (galley.size().x + 11.0).max(22.0);
+                let cap_h = 19.0_f32;
+                let cap_rect =
+                    Rect::from_min_size(Pos2::new(kx, cy - cap_h * 0.5), Vec2::new(cap_w, cap_h));
+                painter.rect_filled(cap_rect, CornerRadius::same(3), pal.control_bg);
+                painter.rect_stroke(
+                    cap_rect,
+                    CornerRadius::same(3),
+                    Stroke::new(1.0_f32, pal.border_subtle),
+                    StrokeKind::Inside,
+                );
+                painter.galley(
+                    cap_rect.center() - galley.size() * 0.5,
+                    galley,
+                    pal.text_secondary,
+                );
+                kx += cap_w + 3.0;
+            }
+
+            if row_hovered && clicked {
+                match *action_id {
+                    1 => self.open_image_dialog(),
+                    2 => self.open_video_dialog(),
+                    3 => self.inspector_open = !self.inspector_open,
+                    4 => {
+                        self.settings_tab = SettingsTab::Appearance;
+                        self.show_settings_window = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // 3. Quiet drop hint underneath
+        let foot_y = start_y + (rows.len() as f32) * row_h + 14.0;
+        painter.text(
+            Pos2::new(center.x, foot_y),
+            egui::Align2::CENTER_CENTER,
+            "Drop an image, video, or .ttf font file anywhere to open",
+            egui::FontId::proportional(11.3),
+            hint_col,
+        );
+    }
+
     fn draw_viewport(&mut self, ui: &mut egui::Ui) {
         let pal = self.palette;
         let avail = ui.available_rect_before_wrap();
         let (response, painter) = ui.allocate_painter(avail.size(), Sense::click_and_drag());
 
-        let surround = if self.params.oled_black {
+        let surround = if !self.has_media() {
+            pal.panel_bg
+        } else if self.params.oled_black {
             Color32::BLACK
         } else {
             pal.viewport_bg
@@ -1706,7 +1882,7 @@ impl LumaGlyphApp {
         let dragging_file = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
         if dragging_file {
             painter.rect_stroke(
-                avail.shrink(6.0),
+                avail.shrink(8.0),
                 CornerRadius::same(2),
                 Stroke::new(1.0_f32, pal.accent),
                 StrokeKind::Inside,
@@ -1714,6 +1890,13 @@ impl LumaGlyphApp {
         }
 
         if !self.has_media() || self.ascii_px_w == 0 || self.ascii_px_h == 0 {
+            self.draw_empty_workbench(
+                ui,
+                &painter,
+                avail,
+                response.hover_pos(),
+                response.clicked(),
+            );
             if let Some((msg, when)) = &self.status_toast {
                 if when.elapsed().as_secs_f32() < 4.5 {
                     draw_viewport_tag(
@@ -1751,30 +1934,8 @@ impl LumaGlyphApp {
         let center = avail.center() + self.pan_offset;
         let dest_rect = Rect::from_center_size(center, draw_size);
 
-        let split_x = dest_rect.left() + dest_rect.width() * self.split_ratio;
-        let pointer_pos = response.interact_pointer_pos();
-        let near_split = self.split_enabled
-            && pointer_pos
-                .map(|p| (p.x - split_x).abs() < 16.0 && dest_rect.contains(p))
-                .unwrap_or(false);
-
-        if near_split {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-        }
-
-        if response.dragged() {
-            if self.split_enabled
-                && pointer_pos
-                    .map(|p| (p.x - split_x).abs() < 40.0)
-                    .unwrap_or(false)
-            {
-                if let Some(p) = pointer_pos {
-                    self.split_ratio =
-                        ((p.x - dest_rect.left()) / dest_rect.width().max(1.0)).clamp(0.03, 0.97);
-                }
-            } else if !self.auto_fit {
-                self.pan_offset += response.drag_delta();
-            }
+        if response.dragged() && !self.auto_fit {
+            self.pan_offset += response.drag_delta();
         }
 
         if self.params.transparent_bg {
@@ -1801,81 +1962,6 @@ impl LumaGlyphApp {
             painter
                 .with_clip_rect(avail)
                 .image(ascii_tex.id(), dest_rect, uv_full, Color32::WHITE);
-        }
-
-        if self.split_enabled {
-            if let Some(orig_tex) = &self.orig_tex {
-                let wipe_x = (dest_rect.left() + dest_rect.width() * self.split_ratio)
-                    .clamp(avail.left(), avail.right());
-                let left_clip = Rect::from_min_max(
-                    Pos2::new(avail.left(), avail.top()),
-                    Pos2::new(wipe_x, avail.bottom()),
-                );
-                painter.with_clip_rect(left_clip).image(
-                    orig_tex.id(),
-                    dest_rect,
-                    uv_full,
-                    Color32::WHITE,
-                );
-
-                // Precision hairline wipe rule + rectangular grip
-                let line_top = dest_rect.top().max(avail.top());
-                let line_bot = dest_rect.bottom().min(avail.bottom());
-                if line_bot > line_top {
-                    let rule_col = Color32::from_rgba_unmultiplied(220, 222, 228, 195);
-                    painter.line_segment(
-                        [Pos2::new(wipe_x, line_top), Pos2::new(wipe_x, line_bot)],
-                        Stroke::new(1.0_f32, rule_col),
-                    );
-                    let grip = Rect::from_center_size(
-                        Pos2::new(wipe_x, (line_top + line_bot) * 0.5),
-                        Vec2::new(14.0, 26.0),
-                    );
-                    painter.rect_filled(
-                        grip,
-                        CornerRadius::same(2),
-                        Color32::from_rgba_unmultiplied(20, 20, 23, 232),
-                    );
-                    painter.rect_stroke(
-                        grip,
-                        CornerRadius::same(2),
-                        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(180, 184, 192, 210)),
-                        StrokeKind::Inside,
-                    );
-                    for dx in [-2.0f32, 2.0] {
-                        painter.line_segment(
-                            [
-                                Pos2::new(grip.center().x + dx, grip.top() + 6.0),
-                                Pos2::new(grip.center().x + dx, grip.bottom() - 6.0),
-                            ],
-                            Stroke::new(1.0_f32, Color32::from_rgb(175, 178, 186)),
-                        );
-                    }
-
-                    let badge_y = line_top + 10.0;
-                    let visible_left = dest_rect.left().max(avail.left());
-                    let visible_right = dest_rect.right().min(avail.right());
-                    if wipe_x - visible_left > 84.0 {
-                        draw_viewport_tag(
-                            &painter,
-                            Pos2::new(visible_left + 10.0, badge_y),
-                            "SOURCE",
-                        );
-                    }
-                    if visible_right - wipe_x > 160.0 {
-                        let mode_tag = if self.params.wireframe_only && self.params.transparent_bg {
-                            "ASCII  |  WIREFRAME RGBA"
-                        } else if self.params.oled_black {
-                            "ASCII  |  OLED #000000"
-                        } else if self.params.color_mode == ColorMode::TriTone {
-                            "ASCII  |  TRI-TONE"
-                        } else {
-                            "ASCII  |  95-CHAR OUTPUT"
-                        };
-                        draw_viewport_tag(&painter, Pos2::new(wipe_x + 10.0, badge_y), mode_tag);
-                    }
-                }
-            }
         }
 
         if self.prefs.show_cell_hud {
@@ -1928,8 +2014,8 @@ impl LumaGlyphApp {
             match &mut self.source_kind {
                 SourceKind::Empty => {
                     ui.label(
-                        RichText::new("IDLE")
-                            .font(mono_font(10.8))
+                        RichText::new("Ready")
+                            .font(mono_font(10.6))
                             .color(pal.text_muted),
                     );
                 }
@@ -1943,46 +2029,42 @@ impl LumaGlyphApp {
                     }
                     ui.label(
                         RichText::new(format!(
-                            "VIDEO  |  {}x{} @ {:.1} FPS  |  FRAME #{}  |  BEAT {:02.0}%",
+                            "{}x{} @ {:.1} FPS   |   Frame #{}",
                             stream.meta.width,
                             stream.meta.height,
                             stream.meta.fps,
                             self.video_frames_seen,
-                            (self.live_audio_energy * 100.0).min(100.0)
                         ))
-                        .font(mono_font(10.8))
+                        .font(mono_font(10.6))
                         .color(pal.text_secondary),
                     );
                 }
                 SourceKind::StaticImage { name } => {
                     ui.label(
                         RichText::new(format!(
-                            "IMAGE  |  {name} ({}x{})  |  ZOOM {:.0}%",
-                            self.source_w,
-                            self.source_h,
-                            self.zoom * 100.0
+                            "{name}   |   {}x{} px",
+                            self.source_w, self.source_h
                         ))
-                        .font(mono_font(10.8))
+                        .font(mono_font(10.6))
                         .color(pal.text_muted),
                     );
                 }
             }
 
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let ff = self
-                    .ffmpeg_info
-                    .as_deref()
-                    .unwrap_or("ffmpeg not on PATH (Image/GIF active)");
-                ui.label(
-                    RichText::new(format!(
-                        "{}   |   Theme: {}",
-                        ff,
-                        self.prefs.theme.cli_name()
-                    ))
-                    .font(mono_font(10.6))
-                    .color(pal.text_muted),
-                );
-            });
+            if self.has_media() && self.ascii_frame.cols > 0 && self.ascii_frame.rows > 0 {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "{}x{} cells   |   {:.0}%",
+                            self.ascii_frame.cols,
+                            self.ascii_frame.rows,
+                            self.zoom * 100.0
+                        ))
+                        .font(mono_font(10.6))
+                        .color(pal.text_muted),
+                    );
+                });
+            }
         });
     }
 
@@ -2374,35 +2456,39 @@ impl LumaGlyphApp {
             }
         });
 
+        ui.label(
+            RichText::new(format!("Active Font: {}", self.atlas.font_name))
+                .font(mono_font(11.2))
+                .color(pal.text_secondary),
+        );
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(format!("Active Font: {}", self.atlas.font_name))
-                    .font(mono_font(11.2))
-                    .color(pal.text_secondary),
-            );
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.small_button("Reset to JetBrains Mono").clicked() {
-                    self.atlas =
-                        GlyphAtlas::default_embedded(self.prefs.atlas_cell_height.clamp(12, 36));
-                    self.ascii_dirty = true;
-                }
-                if ui.small_button("Load .TTF / .OTF...").clicked() {
-                    self.open_font_dialog();
-                }
-            });
+            if ui.small_button("Load .TTF / .OTF...").clicked() {
+                self.open_font_dialog();
+            }
+            if ui.small_button("Reset to JetBrains Mono").clicked() {
+                self.atlas =
+                    GlyphAtlas::default_embedded(self.prefs.atlas_cell_height.clamp(12, 36));
+                self.ascii_dirty = true;
+            }
         });
 
         ui.separator();
-        if ui
-            .button("Apply Startup Defaults to Current Canvas")
-            .clicked()
-        {
-            self.params.cols = self.prefs.default_cols;
-            self.params.charset = self.prefs.default_charset;
-            self.params.color_mode = self.prefs.default_color_mode;
-            self.params.oled_black = self.prefs.default_oled_black;
-            self.ascii_dirty = true;
-        }
+        ui.horizontal(|ui| {
+            if ui
+                .button("Reset ASCII Parameters to Normal Default")
+                .on_hover_text("Resets all color, contrast, edge, and effect controls back to normal default")
+                .clicked()
+            {
+                self.reset_ascii_to_default();
+            }
+            if ui
+                .button("Restore All Settings to Default")
+                .on_hover_text("Resets both workstation preferences and all ASCII parameters to factory default")
+                .clicked()
+            {
+                self.reset_all_settings_to_default();
+            }
+        });
 
         if changed {
             self.persist_prefs();
@@ -2511,6 +2597,11 @@ impl LumaGlyphApp {
             ("Ctrl + O", "Open image or animated GIF"),
             ("Ctrl + Shift + O", "Open video file"),
             ("Ctrl + W", "Close current media"),
+            ("Ctrl + B", "Show / hide left Inspector side panel"),
+            (
+                "Ctrl + Shift + R",
+                "Reset all ASCII parameters to normal default",
+            ),
             ("Ctrl + S", "Quick export PNG at configured DPI scale"),
             (
                 "Ctrl + Shift + C",
@@ -2522,7 +2613,6 @@ impl LumaGlyphApp {
                 "Toggle Zen Canvas Mode (hide side dock & status bar)",
             ),
             ("Space", "Play / pause loaded video file"),
-            ("W", "Toggle Source / ASCII Split-Wipe curtain"),
             ("B", "Toggle True OLED #000000 pitch-black canvas"),
             ("N", "Toggle Neon Wireframe contour-only mode"),
             ("[  /  ]", "Decrease / increase grid columns by 8"),
@@ -2716,34 +2806,25 @@ impl LumaGlyphApp {
                             .color(pal.warn),
                         );
                         ui.horizontal(|ui| {
-                            let dl_busy = self.download_rx.is_some();
-                            let dl_label = if dl_busy {
-                                "Verifying SHA-256 & Downloading..."
+                            let up_busy = self.self_update_rx.is_some();
+                            let up_label = if up_busy {
+                                "Updating & Relaunching...".to_string()
                             } else {
-                                "Download Verified Binary..."
+                                format!("Update & Relaunch ({})", info.latest_tag)
                             };
                             if ui
-                                .add_enabled(!dl_busy, egui::Button::new(dl_label))
+                                .add_enabled(!up_busy, egui::Button::new(up_label))
                                 .on_hover_text(
-                                    "Downloads archive over HTTPS, verifies SHA256SUMS.txt in constant time, and inspects native OS/CPU binary header",
+                                    "Rebuilds from the verified release tag (in a local Cargo checkout) or installs the SHA-256-verified release binary in-place, then automatically launches the new release",
                                 )
                                 .clicked()
                             {
-                                let default_dir = dirs::download_dir()
-                                    .or_else(dirs::home_dir)
-                                    .unwrap_or_else(|| PathBuf::from("."));
-                                if let Some(chosen) = rfd::FileDialog::new()
-                                    .set_directory(&default_dir)
-                                    .pick_folder()
-                                {
-                                    self.download_status = None;
-                                    self.download_rx = Some(spawn_verified_release_download(
-                                        self.prefs.github_repo.clone(),
-                                        chosen,
-                                    ));
-                                }
+                                let _ = self.prefs.save();
+                                self.self_update_status = None;
+                                self.self_update_rx =
+                                    Some(spawn_verified_self_update(self.prefs.github_repo.clone()));
                             }
-                            ui.hyperlink_to("Open GitHub Release Page", &info.html_url);
+                            ui.hyperlink_to("Release Notes", &info.html_url);
                         });
                     } else {
                         ui.label(
@@ -2762,24 +2843,8 @@ impl LumaGlyphApp {
             }
         }
 
-        if let Some(dl) = &self.download_status {
-            match dl {
-                Ok(done) => {
-                    ui.label(
-                        RichText::new(format!(
-                            "Verified {} (SHA-256 {}...) -> {}",
-                            done.tag,
-                            &done.sha256_hex[..16],
-                            done.saved_path.display()
-                        ))
-                        .font(mono_font(10.8))
-                        .color(pal.accent),
-                    );
-                }
-                Err(err) => {
-                    ui.label(RichText::new(err).size(11.1).color(pal.warn));
-                }
-            }
+        if let Some(Err(err)) = &self.self_update_status {
+            ui.label(RichText::new(err).size(11.1).color(pal.warn));
         }
     }
 }
@@ -2801,7 +2866,9 @@ impl eframe::App for LumaGlyphApp {
             )
             .show(ctx, |ui| self.draw_menu_strip(ui));
 
-        if !self.zen_mode {
+        let show_chrome = !self.zen_mode && (self.has_media() || self.inspector_open);
+
+        if show_chrome {
             egui::TopBottomPanel::top("workstation_command_strip")
                 .exact_height(31.0)
                 .frame(
@@ -2811,19 +2878,21 @@ impl eframe::App for LumaGlyphApp {
                         .stroke(Stroke::new(1.0_f32, pal.border_subtle)),
                 )
                 .show(ctx, |ui| self.draw_command_strip(ui));
+        }
 
-            if self.prefs.show_status_bar {
-                egui::TopBottomPanel::bottom("workstation_status_strip")
-                    .exact_height(24.0)
-                    .frame(
-                        Frame::new()
-                            .fill(pal.menu_bg)
-                            .inner_margin(Margin::symmetric(10, 3))
-                            .stroke(Stroke::new(1.0_f32, pal.border_subtle)),
-                    )
-                    .show(ctx, |ui| self.draw_status_strip(ui));
-            }
+        if !self.zen_mode && self.prefs.show_status_bar {
+            egui::TopBottomPanel::bottom("workstation_status_strip")
+                .exact_height(23.0)
+                .frame(
+                    Frame::new()
+                        .fill(pal.menu_bg)
+                        .inner_margin(Margin::symmetric(10, 3))
+                        .stroke(Stroke::new(1.0_f32, pal.border_subtle)),
+                )
+                .show(ctx, |ui| self.draw_status_strip(ui));
+        }
 
+        if !self.zen_mode && self.inspector_open {
             egui::SidePanel::left("workstation_inspector_dock")
                 .default_width(332.0)
                 .min_width(304.0)
@@ -2837,7 +2906,9 @@ impl eframe::App for LumaGlyphApp {
                 .show(ctx, |ui| self.draw_inspector_dock(ui));
         }
 
-        let central_bg = if self.params.oled_black {
+        let central_bg = if !self.has_media() {
+            pal.panel_bg
+        } else if self.params.oled_black {
             Color32::BLACK
         } else {
             pal.viewport_bg

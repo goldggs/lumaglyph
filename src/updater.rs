@@ -1035,6 +1035,15 @@ pub struct VerifiedDownloadOutcome {
     pub binary_size_bytes: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct VerifiedInstallOutcome {
+    pub tag: String,
+    pub method: String,
+    pub sha256_hex: String,
+    pub installed_exe: PathBuf,
+    pub binary_size_bytes: usize,
+}
+
 #[derive(Deserialize)]
 struct GithubAssetDto {
     name: String,
@@ -1462,6 +1471,451 @@ pub fn download_and_verify_release_with_policy(
         saved_path: final_path,
         binary_size_bytes: verified_bin.len(),
     })
+}
+
+/// Cleans up stale `<exe>.old` and `<exe>.old.<pid>.<nonce>` backup binaries left behind
+/// by a previous in-place self-update (notably on Windows where a running `.exe` can be renamed
+/// to `.old` while running, and then deleted once the newly launched process starts).
+pub fn cleanup_stale_old_executables() -> usize {
+    let Ok(exe) = std::env::current_exe() else {
+        return 0;
+    };
+    let (Some(dir), Some(name)) = (exe.parent(), exe.file_name().and_then(|s| s.to_str())) else {
+        return 0;
+    };
+    cleanup_stale_old_executables_in_dir(dir, name)
+}
+
+pub fn cleanup_stale_old_executables_in_dir(dir: &Path, exe_name: &str) -> usize {
+    if exe_name.is_empty() || exe_name.contains('/') || exe_name.contains('\\') {
+        return 0;
+    }
+    let exact_old = format!("{exe_name}.old");
+    let prefix_old = format!("{exe_name}.old.");
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if !ft.is_file() {
+            continue;
+        }
+        let Some(fname) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let is_numbered_old = fname.strip_prefix(&prefix_old).is_some_and(|rest| {
+            !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        });
+        if (fname == exact_old || is_numbered_old) && fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Atomically installs a verified native executable onto `target_exe` using a sibling staging file
+/// and safe `.old` rename swap (supporting running-executable replacement on Windows, macOS, and Linux)
+/// with automatic rollback if final placement fails.
+pub fn apply_verified_binary_to_path(
+    target_exe: &Path,
+    verified_bin: &[u8],
+    target: PlatformTarget,
+) -> Result<PathBuf, String> {
+    verify_executable_header(verified_bin, target)?;
+
+    let parent = target_exe
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let exe_name = target_exe
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "Invalid target executable path".to_string())?;
+
+    fs::create_dir_all(parent).map_err(|e| {
+        format!(
+            "Failed accessing target executable directory '{}': {e}",
+            parent.display()
+        )
+    })?;
+
+    let nonce = TMP_NONCE.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let stage_path = parent.join(format!(".{exe_name}.update.{pid}.{nonce}"));
+
+    let stage_res = (|| -> Result<(), String> {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&stage_path)
+            .map_err(|e| format!("Failed creating staged update binary: {e}"))?;
+        f.write_all(verified_bin)
+            .map_err(|e| format!("Failed writing staged update binary: {e}"))?;
+        f.sync_all()
+            .map_err(|e| format!("Failed syncing staged update binary: {e}"))?;
+        drop(f);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&stage_path, fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("Failed setting executable permissions: {e}"))?;
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = stage_res {
+        let _ = fs::remove_file(&stage_path);
+        return Err(e);
+    }
+
+    let primary_old = parent.join(format!("{exe_name}.old"));
+    if primary_old.exists() {
+        let _ = fs::remove_file(&primary_old);
+    }
+    let backup_path = if primary_old.exists() {
+        parent.join(format!("{exe_name}.old.{pid}.{nonce}"))
+    } else {
+        primary_old
+    };
+
+    let had_existing = target_exe.exists();
+    if had_existing {
+        if let Err(e) = fs::rename(target_exe, &backup_path) {
+            let _ = fs::remove_file(&stage_path);
+            return Err(format!(
+                "Failed moving existing executable '{}' aside for update: {e}",
+                target_exe.display()
+            ));
+        }
+    }
+
+    if let Err(e) = fs::rename(&stage_path, target_exe) {
+        if had_existing {
+            let _ = fs::rename(&backup_path, target_exe);
+        }
+        let _ = fs::remove_file(&stage_path);
+        return Err(format!(
+            "Failed installing new release binary at '{}': {e}",
+            target_exe.display()
+        ));
+    }
+
+    if had_existing {
+        // Succeeds immediately on Unix; on Windows if locked by running image, cleaned up on relaunch startup.
+        let _ = fs::remove_file(&backup_path);
+    }
+
+    Ok(target_exe.to_path_buf())
+}
+
+/// Full 8-layer verified release download + atomic in-place executable replacement.
+pub fn install_verified_release_with_policy(
+    repo: &str,
+    current_version: &str,
+    target: PlatformTarget,
+    target_exe: &Path,
+    policy: &EndpointPolicy,
+) -> Result<VerifiedInstallOutcome, String> {
+    let check = check_latest_release_with_policy(repo, current_version, Some(target), policy)?;
+
+    if !check.update_available {
+        return Err(format!(
+            "Refusing update install: remote release '{}' is not newer than installed v{current_version}",
+            check.latest_tag
+        ));
+    }
+
+    let archive_asset = check.platform_asset.ok_or_else(|| {
+        format!(
+            "Release '{}' does not publish expected asset '{}'",
+            check.latest_tag,
+            target.expected_archive_name()
+        )
+    })?;
+    let sums_asset = check.checksums_asset.ok_or_else(|| {
+        format!(
+            "Release '{}' is missing mandatory SHA256SUMS.txt manifest",
+            check.latest_tag
+        )
+    })?;
+
+    let sums_bytes = fetch_bytes_hardened(
+        &sums_asset.download_url,
+        "application/octet-stream",
+        MAX_CHECKSUM_FILE_BYTES,
+        Some(sums_asset.size),
+        policy,
+    )?;
+    let sums_text = std::str::from_utf8(&sums_bytes)
+        .map_err(|_| "SHA256SUMS.txt is not valid UTF-8 text".to_string())?;
+    let sums_map = parse_sha256sums(sums_text)?;
+    let expected_digest = sums_map.get(&archive_asset.name).ok_or_else(|| {
+        format!(
+            "SHA256SUMS.txt does not contain a checksum entry for '{}'",
+            archive_asset.name
+        )
+    })?;
+
+    let archive_bytes = fetch_bytes_hardened(
+        &archive_asset.download_url,
+        "application/octet-stream",
+        MAX_ARCHIVE_BYTES,
+        Some(archive_asset.size),
+        policy,
+    )?;
+
+    let actual_digest = sha256_bytes(&archive_bytes);
+    if !constant_time_eq_32(&actual_digest, expected_digest) {
+        return Err(format!(
+            "CRITICAL: SHA-256 checksum mismatch for '{}' (expected {}, got {}) — update aborted",
+            archive_asset.name,
+            hex_encode_32(expected_digest),
+            hex_encode_32(&actual_digest)
+        ));
+    }
+
+    let verified_bin = extract_verified_binary_from_archive(&archive_bytes, target)?;
+    let installed_exe = apply_verified_binary_to_path(target_exe, &verified_bin, target)?;
+
+    Ok(VerifiedInstallOutcome {
+        tag: check.latest_tag,
+        method: format!("verified-release-binary ({})", archive_asset.name),
+        sha256_hex: hex_encode_32(&actual_digest),
+        installed_exe,
+        binary_size_bytes: verified_bin.len(),
+    })
+}
+
+/// Detects if `exe_path` resides inside a local `lumaglyph` Cargo + Git checkout
+/// (e.g. `<repo>/target/release/lumaglyph[.exe]`).
+pub fn detect_local_cargo_checkout(exe_path: &Path) -> Option<PathBuf> {
+    let mut cursor = exe_path.parent()?;
+    for _ in 0..5 {
+        let cargo_toml = cursor.join("Cargo.toml");
+        let git_dir = cursor.join(".git");
+        if cargo_toml.is_file() && git_dir.exists() {
+            if let Ok(manifest) = fs::read_to_string(&cargo_toml) {
+                if manifest.contains("name = \"lumaglyph\"") {
+                    return Some(cursor.to_path_buf());
+                }
+            }
+        }
+        cursor = cursor.parent()?;
+    }
+    None
+}
+
+fn configure_hidden_subprocess(cmd: &mut std::process::Command) {
+    cmd.stdin(std::process::Stdio::null());
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+}
+
+/// Fetches the verified release tag from the canonical GitHub repository inside a local Cargo checkout,
+/// rebuilds `lumaglyph` in `--release --locked` mode with zero console window popups, verifies the
+/// compiled native binary header, and updates `target_exe`.
+pub fn rebuild_from_verified_release_tag(
+    repo: &str,
+    tag: &str,
+    repo_root: &Path,
+    target_exe: &Path,
+    require_canonical_repo: bool,
+) -> Result<VerifiedInstallOutcome, String> {
+    let (owner, name) = validate_repo_slug(repo, require_canonical_repo)?;
+    let clean_tag = validate_release_tag(tag)?;
+    let remote_url = format!("https://github.com/{owner}/{name}.git");
+    let refspec = format!("refs/tags/{clean_tag}:refs/tags/{clean_tag}");
+
+    // Ensure clean working tree before touching checkout state
+    let mut status_cmd = std::process::Command::new("git");
+    configure_hidden_subprocess(&mut status_cmd);
+    let status_out = status_cmd
+        .current_dir(repo_root)
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .output()
+        .map_err(|e| format!("git unavailable for source rebuild: {e}"))?;
+    if !status_out.status.success() || !status_out.stdout.is_empty() {
+        return Err(
+            "Local git checkout has uncommitted changes; skipping source rebuild".to_string(),
+        );
+    }
+
+    let mut fetch_cmd = std::process::Command::new("git");
+    configure_hidden_subprocess(&mut fetch_cmd);
+    let fetch_out = fetch_cmd
+        .current_dir(repo_root)
+        .args(["fetch", "--depth", "1", "--force", &remote_url, &refspec])
+        .output()
+        .map_err(|e| format!("Failed running git fetch: {e}"))?;
+    if !fetch_out.status.success() {
+        return Err(format!(
+            "git fetch failed: {}",
+            String::from_utf8_lossy(&fetch_out.stderr).trim()
+        ));
+    }
+
+    let mut checkout_cmd = std::process::Command::new("git");
+    configure_hidden_subprocess(&mut checkout_cmd);
+    let checkout_out = checkout_cmd
+        .current_dir(repo_root)
+        .args(["checkout", "--quiet", clean_tag])
+        .output()
+        .map_err(|e| format!("Failed checking out release tag '{clean_tag}': {e}"))?;
+    if !checkout_out.status.success() {
+        return Err(format!(
+            "git checkout '{clean_tag}' failed: {}",
+            String::from_utf8_lossy(&checkout_out.stderr).trim()
+        ));
+    }
+
+    let mut cargo_cmd = std::process::Command::new("cargo");
+    configure_hidden_subprocess(&mut cargo_cmd);
+    let build_out = cargo_cmd
+        .current_dir(repo_root)
+        .args(["build", "--release", "--locked"])
+        .output()
+        .map_err(|e| format!("Failed invoking cargo build: {e}"))?;
+    if !build_out.status.success() {
+        return Err(format!(
+            "cargo build --release --locked failed: {}",
+            String::from_utf8_lossy(&build_out.stderr).trim()
+        ));
+    }
+
+    let bin_name = if cfg!(target_os = "windows") {
+        "lumaglyph.exe"
+    } else {
+        "lumaglyph"
+    };
+    let built_path = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repo_root.join("target"))
+        .join("release")
+        .join(bin_name);
+
+    let built_bytes = fs::read(&built_path).map_err(|e| {
+        format!(
+            "Failed reading rebuilt release binary '{}': {e}",
+            built_path.display()
+        )
+    })?;
+    let digest = sha256_bytes(&built_bytes);
+
+    if let Some(target) = PlatformTarget::current() {
+        if built_path != target_exe {
+            apply_verified_binary_to_path(target_exe, &built_bytes, target)?;
+        } else {
+            verify_executable_header(&built_bytes, target)?;
+        }
+    }
+
+    let final_exe = if built_path == target_exe {
+        built_path
+    } else {
+        target_exe.to_path_buf()
+    };
+
+    Ok(VerifiedInstallOutcome {
+        tag: clean_tag.to_string(),
+        method: "cargo-release-rebuild".to_string(),
+        sha256_hex: hex_encode_32(&digest),
+        installed_exe: final_exe,
+        binary_size_bytes: built_bytes.len(),
+    })
+}
+
+/// Checks for a newer official GitHub release, rebuilds from source if running inside a clean local
+/// Cargo/Git checkout (or when `force_source_rebuild` is set) and seamlessly installs the SHA-256-verified
+/// prebuilt release binary onto `current_exe()` otherwise, ready for immediate automatic relaunch.
+pub fn update_and_prepare_relaunch_blocking(
+    repo: &str,
+    force_source_rebuild: bool,
+    require_canonical_repo: bool,
+) -> Result<VerifiedInstallOutcome, String> {
+    let current_exe = std::env::current_exe()
+        .map_err(|e| format!("Failed resolving current executable path: {e}"))?;
+    let policy = EndpointPolicy::production_github(require_canonical_repo);
+    let check =
+        check_latest_release_with_policy(repo, APP_VERSION, PlatformTarget::current(), &policy)?;
+
+    if !check.update_available {
+        return Err(format!(
+            "Already up to date (installed v{APP_VERSION}, latest release {})",
+            check.latest_tag
+        ));
+    }
+
+    if let Some(repo_root) = detect_local_cargo_checkout(&current_exe) {
+        match rebuild_from_verified_release_tag(
+            repo,
+            &check.latest_tag,
+            &repo_root,
+            &current_exe,
+            require_canonical_repo,
+        ) {
+            Ok(outcome) => return Ok(outcome),
+            Err(err) if force_source_rebuild => return Err(err),
+            Err(_) => {
+                // Fall through seamlessly to verified prebuilt GitHub release binary installation
+            }
+        }
+    } else if force_source_rebuild {
+        return Err(
+            "Current executable is not inside a local LumaGlyph Cargo/Git workspace".to_string(),
+        );
+    }
+
+    let target = PlatformTarget::current()
+        .ok_or_else(|| "Unsupported OS/CPU architecture for prebuilt binary update".to_string())?;
+    install_verified_release_with_policy(repo, APP_VERSION, target, &current_exe, &policy)
+}
+
+/// Background worker thread that installs/rebuilds the latest verified GitHub release onto `current_exe()`.
+pub fn spawn_verified_self_update(
+    repo: String,
+) -> Receiver<Result<VerifiedInstallOutcome, String>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("lumaglyph-self-update".to_string())
+        .spawn(move || {
+            let res = update_and_prepare_relaunch_blocking(&repo, false, false);
+            let _ = tx.send(res);
+        })
+        .ok();
+    rx
+}
+
+/// Spawns the newly updated executable (`exe_path`) as an independent process so the current
+/// process can exit immediately and hand off seamlessly to the new release.
+pub fn relaunch_executable(exe_path: &Path, args: &[String]) -> Result<u32, String> {
+    if !exe_path.is_file() {
+        return Err(format!(
+            "Updated executable '{}' does not exist",
+            exe_path.display()
+        ));
+    }
+    let mut cmd = std::process::Command::new(exe_path);
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    let child = cmd.spawn().map_err(|e| {
+        format!(
+            "Failed launching updated executable '{}': {e}",
+            exe_path.display()
+        )
+    })?;
+    Ok(child.id())
 }
 
 /// Clean strict SemVer comparison (`v0.3.1` > `0.3.0`) with zero external crate overhead.

@@ -224,10 +224,20 @@ fn main_rs_enforces_windows_gui_subsystem_with_zero_alloc_console() {
 #[test]
 fn gui_defaults_to_empty_canvas_with_zero_sample_scenes() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    assert!(
+        !manifest_dir.join("src/samples.rs").exists(),
+        "src/samples.rs must not exist in the codebase"
+    );
+    let lib_src = std::fs::read_to_string(manifest_dir.join("src/lib.rs")).unwrap();
+    assert!(!lib_src.contains("pub mod samples"));
     let gui_src = std::fs::read_to_string(manifest_dir.join("src/gui.rs")).unwrap();
     assert!(
         gui_src.contains("source_kind: SourceKind::Empty"),
         "LumaGlyphApp::new must boot into SourceKind::Empty by default"
+    );
+    assert!(
+        gui_src.contains("inspector_open: false"),
+        "Fresh window must start cleanly without side inspector clutter"
     );
     for forbidden in [
         "SamplePreset",
@@ -272,4 +282,51 @@ fn entire_source_tree_and_readme_contain_zero_emojis() {
             );
         }
     }
+}
+
+#[test]
+fn workstation_hygiene_no_split_wipe_no_theme_footer_and_normal_defaults() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let gui_src = std::fs::read_to_string(manifest_dir.join("src/gui.rs")).unwrap();
+    let cli_src = std::fs::read_to_string(manifest_dir.join("src/cli.rs")).unwrap();
+
+    // Split-Wipe feature completely removed
+    assert!(!gui_src.contains("Split-Wipe"));
+    assert!(!gui_src.contains("split_enabled"));
+    assert!(!gui_src.contains("split_ratio"));
+    assert!(!gui_src.contains("orig_tex"));
+    assert!(!cli_src.contains("split_wipe"));
+
+    // Theme footer on bottom right completely removed
+    assert!(!gui_src.contains("Theme: "));
+
+    // Reset to Default actions present
+    assert!(gui_src.contains("fn reset_ascii_to_default"));
+    assert!(gui_src.contains("fn reset_all_settings_to_default"));
+    assert!(gui_src.contains("Reset to Default"));
+
+    // Normal, balanced default RenderParams
+    let def = lumaglyph::engine::RenderParams::default();
+    assert_eq!(def.brightness, 0.0);
+    assert_eq!(def.contrast, 1.0);
+    assert_eq!(def.saturation, 1.0);
+    assert_eq!(def.gamma, 1.0);
+    assert_eq!(def.dither, 0.04);
+    assert_eq!(def.directional_crunch, 1.25);
+    assert!(!def.oled_black);
+    assert!(!def.transparent_bg);
+    assert!(!def.wireframe_only);
+    assert!(!def.crt_bloom);
+    assert!(!def.scanlines);
+    assert!(!def.invert);
+
+    // Self-update CLI subcommand attaches parent console on Windows
+    assert!(lumaglyph::cli::should_attach_parent_console(&[
+        "lumaglyph.exe",
+        "self-update"
+    ]));
+    assert!(lumaglyph::cli::should_attach_parent_console(&[
+        "lumaglyph.exe",
+        "update"
+    ]));
 }

@@ -8,25 +8,32 @@
 
 Unlike basic 10-character brightness ramps (`@%#*+=-:. `), **LumaGlyph** treats every printable 7-bit ASCII glyph (`0x20..=0x7E`) as 2D geometry. Each font is dynamically calibrated into 32-byte-aligned **8D shape + structure-tensor orientation vectors**, locking `/ \ | _ ( ) [ ] < > ^ ~ , ' ; ! ? $ & % W M # @` directly onto curves, diagonals, silhouettes, and tonal gradients at **500+ FPS** (`< 2 ms/frame`) and **`~7-9 MB` CLI RSS**.
 
-![LumaGlyph v0.3.2 — Clean Default Empty Workstation](docs/screenshots/v032-default-empty.png)
+![LumaGlyph v0.3.3 - Fresh Empty Workstation](docs/screenshots/v033-fresh-window.png)
 
 ---
 
-## New in `v0.3.2` — Clean Default Empty Workstation
+## New in `v0.3.3` - Fresh Empty Workstation, Normal Reset & Automatic Update-and-Relaunch
 
-- **Pure Empty Default Startup (Zero Preloaded Samples):**
-  - Launching `lumaglyph` opens directly into a clean, blank calibrated workstation (`SourceKind::Empty`) with zero synthetic demo plates, zero sample menus, zero idle CPU usage, and zero pre-allocated frame textures (`~32 MB` GPU workstation RSS at idle).
-  - Open media via **Open Image** (`Ctrl+O`), **Open Video** (`Ctrl+Shift+O`), OS **drag-and-drop** (images, videos, or `.ttf`/`.otf` fonts), or pass a path directly (`lumaglyph photo.png`). Press `Ctrl+W` (**File -> Close Media**) at any time to release buffers and return to the empty canvas, and toggle **Split-Wipe** (`W`) on demand when comparing against source media.
+- **Fresh VS Code-Style Empty Startup (Zero Samples Anywhere):**
+  - Launching `lumaglyph` opens directly into a calm, uncluttered empty window - slim top menu strip, clean neutral workbench with discrete recessed keybinding hints (`Ctrl+O`, `Ctrl+Shift+O`, `Ctrl+B`, `Ctrl+,` + OS drag-and-drop), and a quiet `Ready` status bar with zero side panels or clutter until media is opened (or `Ctrl+B` toggles the Inspector).
+  - All internal demo/sample generators have been permanently removed from the codebase.
+- **One-Click Reset to Normal Default (`Ctrl+Shift+R`):**
+  - Balanced, unboosted default ASCII parameters (`contrast = 1.0`, `saturation = 1.0`, `gamma = 1.0`, `brightness = 0.0`) render clean, faithful ASCII art out of the box.
+  - Reset everything back to normal default anytime via **Reset to Default** in the Command Strip, Inspector header, `Presets -> Reset to Default`, `View -> Reset to Default`, `Settings -> Engine & Defaults`, or `Ctrl+Shift+R`.
+- **Clean Workstation Chrome:**
+  - Removed the Split-Wipe comparison curtain and removed unsolicited theme/status footer labels on the bottom right.
+- **In-Place Release Rebuild / Install & Automatic Relaunch:**
+  - Clicking **Update & Relaunch** in `Settings -> About & Build` (or running `lumaglyph self-update`) verifies the latest GitHub release, rebuilds from the verified release tag when running inside a clean local Cargo/Git checkout (or atomically installs the 8-layer SHA-256-verified native release binary in-place via safe `.old` swap), and **automatically launches the new release** while closing the old process.
 
 ---
 
-## `v0.3.1` Highlights — Single-Window Windows Subsystem, 8-Layer Verified Updater & 1,232 Tests
+## `v0.3.1` Architecture Highlights - Single-Window Windows GUI & 8-Layer Verified Updater
 
 - **Standalone Single-App Windows GUI (`IMAGE_SUBSYSTEM_WINDOWS_GUI`):**
   - Windows `lumaglyph.exe` is compiled under `windows_subsystem = "windows"` (`PE Optional Header Subsystem == 2`, verified automatically in CI and Release builds) so launching `lumaglyph.exe` opens **only** the native GPU workstation with **zero attached console/terminal window**.
-  - Headless CLI subcommands (`image`, `video`, `bench`, `look`, `build-info`, `check-update`) remain inside the same single binary: when invoked from an existing PowerShell / `cmd.exe` / Windows Terminal session without pipe redirection, LumaGlyph attaches cleanly via `AttachConsole(ATTACH_PARENT_PROCESS)` and never calls `AllocConsole`. Background `ffmpeg` / `ffprobe` workers always spawn with `CREATE_NO_WINDOW` (`0x0800_0000`).
-- **8-Layer Cryptographically Verified Remote Release Checker & Downloader:**
-  - Opt-in release checks and binary downloads (`Settings -> About & Build -> Download Verified Binary...` or `lumaglyph check-update --download`) enforce 8 independent defense layers before writing a single byte to disk:
+  - Headless CLI subcommands (`image`, `video`, `bench`, `look`, `build-info`, `check-update`, `self-update`) remain inside the same single binary: when invoked from an existing PowerShell / `cmd.exe` / Windows Terminal session without pipe redirection, LumaGlyph attaches cleanly via `AttachConsole(ATTACH_PARENT_PROCESS)` and never calls `AllocConsole`. Background `ffmpeg` / `ffprobe` / build workers always spawn with `CREATE_NO_WINDOW` (`0x0800_0000`).
+- **8-Layer Cryptographically Verified Remote Release Checker & Installer:**
+  - Opt-in release checks and updates (`Settings -> About & Build -> Update & Relaunch` or `lumaglyph self-update`) enforce 8 independent defense layers:
     1. **Canonical Repository Pinning:** Locked by default to `goldggs/lumaglyph`.
     2. **Strict Origin & URL Parser:** HTTPS-only (`:443`), zero credentials, zero fragments, zero dot-segment/percent-encoded path traversal, pinned to official GitHub API/Release/CDN hosts.
     3. **Manual Redirect Hop Inspection (`redirects(0)`):** Every HTTP `301/302/303/307/308` hop is validated manually before following (`<= 3` hops), blocking HTTPS-to-HTTP downgrades and untrusted domains.
@@ -34,29 +41,29 @@ Unlike basic 10-character brightness ramps (`@%#*+=-:. `), **LumaGlyph** treats 
     5. **Exact Platform Asset Binding:** Selects only the exact archive compiled for the running OS + CPU (`lumaglyph-linux-x86_64.tar.gz`, `lumaglyph-macos-arm64.tar.gz`, `lumaglyph-macos-x86_64.tar.gz`, `lumaglyph-windows-x86_64.zip`).
     6. **Mandatory Constant-Time SHA-256 Verification Before Decompression:** Fetches `SHA256SUMS.txt` from the identical release tag and verifies the raw archive bytes in constant time prior to opening `tar.gz` or `zip`.
     7. **Anti-Bomb & Anti-Traversal In-Memory Extraction:** Blocks `TarSlip`/`ZipSlip` (`..`, `/`, `\`, drive prefixes), symlinks, hardlinks, device nodes, unexpected `.dll`/`.so`/`.sh`/`.bat` sidecars, duplicate-entry shadowing, and decompression bombs.
-    8. **Native CPU Executable Header + Atomic Write Verification:** Inspects magic/machine/subsystem headers (`ELF64 x86_64`, `Mach-O 64-bit arm64/x86_64`, `PE32+ AMD64 WINDOWS_GUI`) and commits via `.part` + `File::sync_all()` + atomic `fs::rename`.
-- **1,232 Automated Corner-to-Corner Tests (`cargo test --release`):**
-  - 7 integration and deterministic splitmix64 fuzz suites (`1,232` `#[test]` functions completing in `~3.2s`) covering URL/redirect/SHA-256/archive/PE-header fault injection against live loopback HTTP mock servers, empty-canvas & zero-sample GUI invariants, all 95 ASCII shape vectors across 18 atlas heights, all 9 color modes, `lg2:` Look Code fuzzing (`NaN`/`inf`/UTF-8 boundaries), all 90 theme x accent x corner WCAG contrast combinations, exporters, and streaming `ffmpeg` E2E transcoding.
+    8. **Native CPU Executable Header + Atomic In-Place Swap:** Inspects magic/machine/subsystem headers (`ELF64 x86_64`, `Mach-O 64-bit arm64/x86_64`, `PE32+ AMD64 WINDOWS_GUI`), swaps via sibling staging + `.old` backup with automatic rollback, cleans up `.old` on startup, and relaunches automatically.
+- **1,236 Automated Corner-to-Corner Tests (`cargo test --release`):**
+  - 7 integration and deterministic splitmix64 fuzz suites (`1,236` `#[test]` functions) covering URL/redirect/SHA-256/archive/PE-header fault injection and in-place self-update + relaunch against live loopback HTTP mock servers, fresh empty-window & zero-sample GUI invariants, all 95 ASCII shape vectors across 18 atlas heights, all 9 color modes, `lg2:` Look Code fuzzing, all 90 theme x accent x corner WCAG contrast combinations, exporters, and streaming `ffmpeg` E2E transcoding.
 
 ---
 
 ## Pro Grading Suite Workstation
 
 - **Calibrated Pro Grading Suite Chrome:**
-  - Neutral matte `#141416` / `#1C1C1F` surfaces, tight `2px` precision geometry, `1px` low-contrast hairline rules, top menu + command strip, segmented `All | Color | Geometry | Output` inspector, and custom two-column scrub faders with double-click-to-reset.
+  - Neutral matte `#141416` / `#1C1C1F` surfaces, tight `2px` precision geometry, `1px` low-contrast hairline rules, collapsible `All | Color | Geometry | Output` inspector (`Ctrl+B`), one-click **Reset to Default** (`Ctrl+Shift+R`), and custom two-column scrub faders with double-click-to-reset.
   - Zero emojis anywhere in the interface or binary (`eframe` stock fonts and `NotoEmoji` stripped at compile time) and zero glowing neon UI badges so canvas color grading never competes with application chrome.
 - **Embedded Studio Typography (`IBM Plex Sans` + `JetBrains Mono`):**
   - Self-contained with **IBM Plex Sans** (`Regular` + `Medium`) for UI labels and **JetBrains Mono** for aligned tabular numeric readouts, hex codes, cell coordinates, `lg2:` Look Codes, and the 95-glyph ASCII engine.
 - **Multi-Tab Workstation Settings (`Ctrl+,`):**
   - **Appearance:** 5 calibrated workstation themes (**Graphite Pro**, **OLED Reference `#000000`**, **Carbon Tungsten**, **Nordic Slate**, and **Daylight Paper**), 6 indicator accent overrides, UI density scaling, corner geometry, and alpha checkerboard contrast.
-  - **Engine & Defaults:** Persistent startup grid columns, character preset, color mode, OLED matte default, and configurable Rayon worker pool cap.
-  - **Export & Video:** PNG raster supersampling (`1x` / `2x HiDPI` / `3x Print`), H.264 MP4 `-crf` quality control (`10..=30`), and custom `ffmpeg` / `ffprobe` binary directory configuration.
+  - **Engine & Defaults:** Persistent startup grid columns, character preset, color mode, OLED matte default, font loader, **Reset ASCII Parameters to Normal Default**, and **Restore All Settings to Default**.
+  - **Export & Video:** PNG raster supersampling (`1x` / `2x HiDPI` / `3x Print`), H.264 MP4 `-crf` quality control, and custom `ffmpeg` / `ffprobe` binary directory configuration.
   - **Shortcuts:** Complete keyboard and mouse reference.
-  - **About & Build:** Live diagnostic table, one-click **Copy Build Info**, opt-in **Check GitHub Release**, and **Download Verified Binary...** with live SHA-256 digest reporting.
+  - **About & Build:** Live diagnostic table, one-click **Copy Build Info**, opt-in **Check Releases**, and **Update & Relaunch**.
 
-![LumaGlyph Workstation Settings: Appearance & Themes](docs/screenshots/v030-settings-appearance.png)
+![LumaGlyph Workstation Settings: Appearance & Themes](docs/screenshots/v033-settings-appearance.png)
 
-![LumaGlyph Workstation Settings: About & Build Diagnostics (Carbon Tungsten)](docs/screenshots/v030-settings-about.png)
+![LumaGlyph Workstation Settings: About & Build Diagnostics](docs/screenshots/v033-settings-about.png)
 
 ---
 
@@ -89,7 +96,7 @@ lumaglyph studio clip.mp4 --theme tungsten
 ```bash
 lumaglyph build-info
 lumaglyph check-update
-lumaglyph check-update --download --dest ./updates
+lumaglyph self-update
 ```
 
 ### Headless CLI — Image to Genuine ASCII

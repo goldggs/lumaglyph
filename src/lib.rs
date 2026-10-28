@@ -6,7 +6,6 @@ pub mod export;
 pub mod glyph_atlas;
 pub mod gui;
 pub mod look;
-pub mod samples;
 pub mod telemetry;
 pub mod theme;
 pub mod updater;
@@ -21,7 +20,6 @@ mod tests {
         rasterize_rgba, AsciiFrame, RenderParams,
     };
     use crate::glyph_atlas::GlyphAtlas;
-    use crate::samples::{generate_sample_rgba, SamplePreset};
     use crate::theme::{
         resolve_palette, AccentPreset, CornerStyle, StudioTheme, JETBRAINS_MONO_REGULAR,
         PLEX_SANS_MEDIUM, PLEX_SANS_REGULAR,
@@ -30,6 +28,36 @@ mod tests {
         format_build_report, is_newer_semver, AppPreferences, APP_VERSION, BUILD_GIT_SHA,
         BUILD_TARGET_TRIPLE,
     };
+
+    fn test_pattern_rgba(w: u32, h: u32) -> Vec<u8> {
+        let mut out = vec![0u8; (w * h * 4) as usize];
+        let wf = w.max(1) as f32;
+        let hf = h.max(1) as f32;
+        for y in 0..h {
+            let ny = (y as f32 / hf) * 2.0 - 1.0;
+            for x in 0..w {
+                let nx = (x as f32 / wf) * 2.0 - 1.0;
+                let r = (nx * nx + ny * ny).sqrt();
+                let angle = ny.atan2(nx);
+                let spoke = ((angle * 11.0).sin() * 4.0).clamp(-1.0, 1.0) * 0.5 + 0.5;
+                let rings = ((r * 26.0).cos() * 3.5).clamp(-1.0, 1.0) * 0.5 + 0.5;
+                let grid_x = ((nx * 19.0).sin() * 5.0).clamp(-1.0, 1.0) * 0.5 + 0.5;
+                let grid_y = ((ny * 17.0).cos() * 5.0).clamp(-1.0, 1.0) * 0.5 + 0.5;
+                let ramp = ((nx + 1.0) * 0.5) * 0.65 + ((1.0 - ny) * 0.5) * 0.35;
+                let mix =
+                    (rings * spoke * 0.55 + grid_x * grid_y * 0.30 + ramp * 0.35).clamp(0.0, 1.0);
+                let v0 = (mix * ramp + rings * 0.25).clamp(0.0, 1.0);
+                let v1 = (grid_x * spoke * 0.70 + ramp * 0.30).clamp(0.0, 1.0);
+                let v2 = ((1.0 - (r * 0.85).min(1.0)) * grid_y * 0.80 + mix * 0.20).clamp(0.0, 1.0);
+                let i = ((y * w + x) * 4) as usize;
+                out[i] = (v0 * 255.0) as u8;
+                out[i + 1] = (v1 * 255.0) as u8;
+                out[i + 2] = (v2 * 255.0) as u8;
+                out[i + 3] = 255;
+            }
+        }
+        out
+    }
 
     #[test]
     fn embedded_font_calibrates_all_95_printable_ascii_glyphs() {
@@ -80,11 +108,11 @@ mod tests {
 
     #[test]
     fn build_metadata_is_populated_and_path_free() {
-        assert_eq!(APP_VERSION, "0.3.2");
+        assert_eq!(APP_VERSION, "0.3.3");
         assert!(!BUILD_GIT_SHA.is_empty());
         assert!(!BUILD_TARGET_TRIPLE.is_empty());
         let report = format_build_report(Some("Test GPU"), Some("ffmpeg 7.1"), "8.0 MB");
-        assert!(report.contains("LumaGlyph v0.3.2"));
+        assert!(report.contains("LumaGlyph v0.3.3"));
         assert!(!report.contains("/home/"));
         assert!(!report.contains("/Users/"));
         assert!(!report.contains("C:\\Users\\"));
@@ -93,7 +121,7 @@ mod tests {
     #[test]
     fn genuine95_uses_wide_character_diversity_without_reallocating() {
         let atlas = GlyphAtlas::default_embedded(20);
-        let rgba = generate_sample_rgba(SamplePreset::CyberSculpture, 640, 400, 0.0);
+        let rgba = test_pattern_rgba(640, 400);
         let params = RenderParams {
             cols: 140,
             charset: CharsetPreset::Genuine95,
@@ -234,7 +262,7 @@ mod tests {
     #[test]
     fn audio_reactive_beat_modulates_glyph_luminance() {
         let atlas = GlyphAtlas::default_embedded(20);
-        let rgba = generate_sample_rgba(SamplePreset::SynthwaveHorizon, 320, 200, 0.0);
+        let rgba = test_pattern_rgba(320, 200);
         let params = RenderParams {
             cols: 80,
             audio_reactive: 1.25,

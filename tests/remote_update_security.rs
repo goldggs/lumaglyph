@@ -5,9 +5,11 @@
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use lumaglyph::updater::{
-    check_latest_release_with_policy, constant_time_eq_32, download_and_verify_release_with_policy,
-    extract_verified_binary_from_archive, hex_encode_32, is_newer_semver, parse_hex_32,
-    parse_sha256sums, sha256_bytes, validate_archive_member_name, validate_asset_download_url,
+    apply_verified_binary_to_path, check_latest_release_with_policy,
+    cleanup_stale_old_executables_in_dir, constant_time_eq_32, detect_local_cargo_checkout,
+    download_and_verify_release_with_policy, extract_verified_binary_from_archive, hex_encode_32,
+    install_verified_release_with_policy, is_newer_semver, parse_hex_32, parse_sha256sums,
+    relaunch_executable, sha256_bytes, validate_archive_member_name, validate_asset_download_url,
     validate_flat_filename, validate_redirect_url, validate_release_html_url, validate_release_tag,
     validate_repo_slug, verify_executable_header, EndpointPolicy, ParsedUrl, PlatformTarget,
     DEFAULT_GITHUB_REPO,
@@ -1386,6 +1388,157 @@ fn e2e_blocks_draft_prerelease_downgrade_missing_sums_and_truncated_stream() {
         let _ = server;
         assert!(err.contains("redirect hops"));
     }
+}
+
+#[test]
+fn in_place_binary_swap_old_cleanup_and_tamper_preservation() {
+    let dir = unique_temp_dir("inplace_swap");
+    std::fs::create_dir_all(&dir).unwrap();
+    let target = PlatformTarget::WindowsX86_64;
+    let exe_path = dir.join("lumaglyph.exe");
+
+    let v1_bin = make_synthetic_native_binary(target, 1500);
+    std::fs::write(&exe_path, &v1_bin).unwrap();
+
+    // Invalid binary header must fail BEFORE modifying existing v1_bin
+    let err = apply_verified_binary_to_path(&exe_path, b"corrupt_not_pe_exe_payload", target)
+        .unwrap_err();
+    assert!(err.to_ascii_lowercase().contains("binary"), "Got: {err}");
+    assert_eq!(std::fs::read(&exe_path).unwrap(), v1_bin);
+
+    // Valid new binary replaces exe_path atomically
+    let v2_bin = make_synthetic_native_binary(target, 2600);
+    let installed = apply_verified_binary_to_path(&exe_path, &v2_bin, target).unwrap();
+    assert_eq!(installed, exe_path);
+    assert_eq!(std::fs::read(&exe_path).unwrap(), v2_bin);
+
+    // Simulate lingering Windows `.old` and `.old.1234.1` files + unrelated user file
+    std::fs::write(dir.join("lumaglyph.exe.old"), b"old1").unwrap();
+    std::fs::write(dir.join("lumaglyph.exe.old.4242.1"), b"old2").unwrap();
+    std::fs::write(dir.join("notes.txt"), b"keep").unwrap();
+
+    let cleaned = cleanup_stale_old_executables_in_dir(&dir, "lumaglyph.exe");
+    assert_eq!(cleaned, 2);
+    assert!(!dir.join("lumaglyph.exe.old").exists());
+    assert!(!dir.join("lumaglyph.exe.old.4242.1").exists());
+    assert!(dir.join("notes.txt").exists());
+    assert_eq!(std::fs::read(&exe_path).unwrap(), v2_bin);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn e2e_in_place_self_update_installs_verified_release_and_blocks_tamper() {
+    let target = PlatformTarget::LinuxX86_64;
+    let v2_bin = make_synthetic_native_binary(target, 2800);
+    let archive_bytes = build_tar_gz(&[
+        ("lumaglyph", &v2_bin, tar::EntryType::Regular),
+        ("LICENSE", b"MIT", tar::EntryType::Regular),
+    ]);
+    let digest = sha256_bytes(&archive_bytes);
+    let archive_name = target.expected_archive_name();
+    let sums_body = format!("{}  {archive_name}\n", hex_encode_32(&digest)).into_bytes();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let release_json = serde_json::json!({
+        "tag_name": "v0.9.0",
+        "html_url": format!("http://127.0.0.1:{port}/goldggs/lumaglyph/releases/tag/v0.9.0"),
+        "assets": [
+            {
+                "name": archive_name,
+                "browser_download_url": format!("http://127.0.0.1:{port}/goldggs/lumaglyph/releases/download/v0.9.0/{archive_name}"),
+                "size": archive_bytes.len()
+            },
+            {
+                "name": "SHA256SUMS.txt",
+                "browser_download_url": format!("http://127.0.0.1:{port}/goldggs/lumaglyph/releases/download/v0.9.0/SHA256SUMS.txt"),
+                "size": sums_body.len()
+            }
+        ]
+    })
+    .to_string()
+    .into_bytes();
+
+    let server = std::thread::spawn(move || {
+        for _ in 0..3 {
+            let Ok((mut s, _)) = listener.accept() else {
+                break;
+            };
+            let mut b = [0u8; 4096];
+            let n = s.read(&mut b).unwrap_or(0);
+            let req = String::from_utf8_lossy(&b[..n]);
+            let p = req
+                .lines()
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("/");
+            let payload = if p.ends_with("/latest") {
+                &release_json
+            } else if p.ends_with("SHA256SUMS.txt") {
+                &sums_body
+            } else {
+                &archive_bytes
+            };
+            let h = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                payload.len()
+            );
+            let _ = s.write_all(h.as_bytes());
+            let _ = s.write_all(payload);
+        }
+    });
+
+    let dir = unique_temp_dir("e2e_self_update");
+    std::fs::create_dir_all(&dir).unwrap();
+    let exe_path = dir.join("lumaglyph");
+    let v1_bin = make_synthetic_native_binary(target, 1400);
+    std::fs::write(&exe_path, &v1_bin).unwrap();
+
+    let policy = EndpointPolicy::loopback_mock(port, true);
+    let outcome = install_verified_release_with_policy(
+        "goldggs/lumaglyph",
+        "0.3.2",
+        target,
+        &exe_path,
+        &policy,
+    )
+    .unwrap();
+    server.join().unwrap();
+
+    assert_eq!(outcome.tag, "v0.9.0");
+    assert_eq!(outcome.installed_exe, exe_path);
+    assert_eq!(std::fs::read(&exe_path).unwrap(), v2_bin);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn detect_cargo_checkout_and_relaunch_updated_binary_work_end_to_end() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let simulated_target_bin = manifest_dir.join("target/release/lumaglyph");
+    assert_eq!(
+        detect_local_cargo_checkout(&simulated_target_bin).as_deref(),
+        Some(manifest_dir)
+    );
+
+    let standalone_dir = unique_temp_dir("standalone_relaunch");
+    std::fs::create_dir_all(&standalone_dir).unwrap();
+    let standalone_bin = standalone_dir.join(if cfg!(target_os = "windows") {
+        "lumaglyph.exe"
+    } else {
+        "lumaglyph"
+    });
+    assert!(detect_local_cargo_checkout(&standalone_bin).is_none());
+
+    // Copy real compiled lumaglyph binary to standalone_bin and verify automatic relaunch!
+    let real_bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_lumaglyph"));
+    std::fs::copy(&real_bin, &standalone_bin).unwrap();
+    let pid = relaunch_executable(&standalone_bin, &["--version".to_string()]).unwrap();
+    assert!(pid > 0);
+
+    let _ = std::fs::remove_dir_all(&standalone_dir);
 }
 
 #[test]

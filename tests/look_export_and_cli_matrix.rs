@@ -246,8 +246,11 @@ clap_parse_tests! {
     clap_single_file => (&["lumaglyph", "art.png"], true),
     clap_studio_full => (&[
         "lumaglyph", "studio", "in.png", "--theme", "graphite", "--settings", "appearance",
-        "--oled-black", "--black-gate", "0.05", "--split", "0.4", "--zoom", "1.5"
+        "--oled-black", "--black-gate", "0.05", "--zoom", "1.5"
     ], true),
+    clap_reject_removed_studio_split_flag => (&["lumaglyph", "studio", "--split", "0.4"], false),
+    clap_self_update => (&["lumaglyph", "self-update"], true),
+    clap_update_alias => (&["lumaglyph", "update", "--from-source", "--no-relaunch"], true),
     clap_image_full => (&[
         "lumaglyph", "image", "input.png", "-o", "out.png", "--cols", "160",
         "--charset", "genuine95", "--color", "tritone", "--tritone", "tokyo",

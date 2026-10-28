@@ -11,7 +11,6 @@ use lumaglyph::engine::{
     AsciiFrame, RenderParams,
 };
 use lumaglyph::glyph_atlas::GlyphAtlas;
-use lumaglyph::samples::{generate_sample_rgba, SamplePreset};
 use std::sync::OnceLock;
 
 fn shared_atlas() -> &'static GlyphAtlas {
@@ -19,9 +18,40 @@ fn shared_atlas() -> &'static GlyphAtlas {
     ATLAS.get_or_init(|| GlyphAtlas::default_embedded(20))
 }
 
+fn synth_test_rgba(w: u32, h: u32, phase: f32) -> Vec<u8> {
+    let mut out = vec![0u8; (w * h * 4) as usize];
+    let wf = w.max(1) as f32;
+    let hf = h.max(1) as f32;
+    for y in 0..h {
+        let ny = (y as f32 / hf) * 2.0 - 1.0;
+        for x in 0..w {
+            let nx = (x as f32 / wf) * 2.0 - 1.0;
+            let dist = (nx * nx + ny * ny).sqrt();
+            if dist > 0.94 {
+                let idx = ((y * w + x) * 4) as usize;
+                out[idx + 3] = 255;
+                continue;
+            }
+            let angle = ny.atan2(nx) + phase;
+            let spoke = ((angle * 10.0).sin() * 4.0).clamp(-1.0, 1.0) * 0.5 + 0.5;
+            let ring = ((dist * 24.0 + phase).cos() * 3.5).clamp(-1.0, 1.0) * 0.5 + 0.5;
+            let gx = ((nx * 17.0).sin() * 4.5).clamp(-1.0, 1.0) * 0.5 + 0.5;
+            let gy = ((ny * 15.0).cos() * 4.5).clamp(-1.0, 1.0) * 0.5 + 0.5;
+            let ramp = ((nx + 1.0) * 0.5) * 0.65 + ((1.0 - ny) * 0.5) * 0.35;
+            let idx = ((y * w + x) * 4) as usize;
+            out[idx] = ((ring * spoke * 0.65 + ramp * 0.40).clamp(0.0, 1.0) * 255.0) as u8;
+            out[idx + 1] = ((gx * gy * 0.65 + ramp * 0.35).clamp(0.0, 1.0) * 255.0) as u8;
+            out[idx + 2] =
+                (((1.0 - dist) * spoke * 0.75 + gx * 0.25).clamp(0.0, 1.0) * 255.0) as u8;
+            out[idx + 3] = 255;
+        }
+    }
+    out
+}
+
 fn shared_sample_rgba() -> &'static Vec<u8> {
     static SAMPLE: OnceLock<Vec<u8>> = OnceLock::new();
-    SAMPLE.get_or_init(|| generate_sample_rgba(SamplePreset::CyberSculpture, 240, 150, 0.2))
+    SAMPLE.get_or_init(|| synth_test_rgba(240, 150, 0.2))
 }
 
 #[derive(Clone, Copy)]
@@ -408,12 +438,10 @@ fn bayer_matrix_is_zero_mean_and_bounded() {
 }
 
 #[test]
-fn all_procedural_sample_presets_generate_exact_rgba_buffers() {
-    for preset in SamplePreset::ALL {
-        for t in [0.0f32, 0.5, 2.75] {
-            let rgba = generate_sample_rgba(preset, 96, 60, t);
-            assert_eq!(rgba.len(), 96 * 60 * 4);
-            assert!(rgba.chunks_exact(4).all(|px| px[3] == 255));
-        }
+fn synthetic_test_patterns_generate_exact_rgba_buffers() {
+    for t in [0.0f32, 0.5, 2.75] {
+        let rgba = synth_test_rgba(96, 60, t);
+        assert_eq!(rgba.len(), 96 * 60 * 4);
+        assert!(rgba.chunks_exact(4).all(|px| px[3] == 255));
     }
 }

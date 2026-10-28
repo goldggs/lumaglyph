@@ -1,12 +1,11 @@
 //! Deterministic combinatorial & adversarial byte-mutation matrix (~460 individual `#[test]`s)
 //! exercising URL parsers, executable header verifiers, SHA-256 checksum parsers,
-//! archive extractors, `lg2:` Look Code fuzzing, and Charset x ColorMode x SamplePreset grids.
+//! archive extractors, `lg2:` Look Code fuzzing, and Charset x ColorMode x TestScene grids.
 
 use lumaglyph::charset::CharsetPreset;
 use lumaglyph::color::{ColorMode, TriTonePalette};
 use lumaglyph::engine::{convert_image_buffer, AsciiFrame, RenderParams};
 use lumaglyph::glyph_atlas::GlyphAtlas;
-use lumaglyph::samples::{generate_sample_rgba, SamplePreset};
 use lumaglyph::updater::{
     extract_verified_binary_from_archive, parse_sha256sums, validate_redirect_url,
     verify_executable_header, EndpointPolicy, ParsedUrl, PlatformTarget,
@@ -239,11 +238,54 @@ look_fuzz_seeds! {
 // 3. 135 FULL CARTESIAN ENGINE TESTS (5 CHARSETS x 9 COLOR MODES x 3 SCENES)
 // ============================================================================
 
+fn synth_cartesian_rgba(scene_idx: usize, w: u32, h: u32) -> Vec<u8> {
+    let mut out = vec![0u8; (w * h * 4) as usize];
+    for y in 0..h {
+        let ny = y as f32 / (h.max(1) as f32);
+        for x in 0..w {
+            let nx = x as f32 / (w.max(1) as f32);
+            let (r, g, b) = match scene_idx % 3 {
+                0 => {
+                    let dx = nx - 0.5;
+                    let dy = ny - 0.5;
+                    let d = (dx * dx + dy * dy).sqrt() * 2.0;
+                    (
+                        ((1.0 - d).max(0.0) * 250.0) as u8,
+                        (nx * 220.0) as u8,
+                        (ny * 240.0) as u8,
+                    )
+                }
+                1 => {
+                    let stripe = ((nx * 12.0 + ny * 8.0).sin() * 0.5 + 0.5) * 255.0;
+                    (stripe as u8, ((1.0 - ny) * 230.0) as u8, (nx * 255.0) as u8)
+                }
+                _ => {
+                    let checker = if ((x / 10) + (y / 10)) % 2 == 0 {
+                        235u8
+                    } else {
+                        18u8
+                    };
+                    (
+                        checker,
+                        ((nx * ny) * 250.0) as u8,
+                        (255u8).saturating_sub(checker),
+                    )
+                }
+            };
+            let i = ((y * w + x) * 4) as usize;
+            out[i] = r;
+            out[i + 1] = g;
+            out[i + 2] = b;
+            out[i + 3] = 255;
+        }
+    }
+    out
+}
+
 fn run_cartesian_render(cs_idx: usize, cm_idx: usize, scene_idx: usize) {
     let cs = CharsetPreset::ALL[cs_idx];
     let cm = ColorMode::ALL[cm_idx];
-    let scene = SamplePreset::ALL[scene_idx];
-    let rgba = generate_sample_rgba(scene, 120, 80, 0.35);
+    let rgba = synth_cartesian_rgba(scene_idx, 120, 80);
     let params = RenderParams {
         cols: 44,
         charset: cs,
