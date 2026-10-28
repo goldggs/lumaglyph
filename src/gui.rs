@@ -300,10 +300,16 @@ impl LumaGlyphApp {
 
     fn reset_ascii_to_default(&mut self) {
         self.params = RenderParams::default();
-        self.atlas = GlyphAtlas::default_embedded(self.prefs.atlas_cell_height.clamp(12, 36));
+        self.prefs.default_cols = 156;
+        self.prefs.default_charset = CharsetPreset::Genuine95;
+        self.prefs.default_color_mode = ColorMode::TrueColor;
+        self.prefs.default_oled_black = false;
+        self.prefs.atlas_cell_height = 20;
+        self.atlas = GlyphAtlas::default_embedded(20);
         self.auto_fit = true;
         self.zoom = 1.0;
         self.pan_offset = Vec2::ZERO;
+        let _ = self.prefs.save();
         self.sync_look_code();
         self.ascii_dirty = true;
         self.set_toast("Reset ASCII parameters to normal default");
@@ -2153,9 +2159,21 @@ impl LumaGlyphApp {
                                         }
                                     }
 
-                                    let rem = ui.available_height() - 42.0;
+                                    let rem = ui.available_height() - 72.0;
                                     if rem > 4.0 {
                                         ui.add_space(rem);
+                                    }
+                                    if ui
+                                        .add_sized(
+                                            [ui.available_width(), 24.0],
+                                            egui::Button::new("Reset to Default"),
+                                        )
+                                        .on_hover_text(
+                                            "Reset all ASCII parameters and startup defaults to normal (Ctrl+Shift+R)",
+                                        )
+                                        .clicked()
+                                    {
+                                        self.reset_ascii_to_default();
                                     }
                                     ui.separator();
                                     ui.label(

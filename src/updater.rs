@@ -1720,9 +1720,37 @@ fn configure_hidden_subprocess(cmd: &mut std::process::Command) {
     }
 }
 
+fn resolve_cargo_program() -> PathBuf {
+    if let Some(c) = std::env::var_os("CARGO") {
+        let p = PathBuf::from(c);
+        if p.is_file() {
+            return p;
+        }
+    }
+    let bin_name = if cfg!(target_os = "windows") {
+        "cargo.exe"
+    } else {
+        "cargo"
+    };
+    if let Some(ch) = std::env::var_os("CARGO_HOME") {
+        let p = PathBuf::from(ch).join("bin").join(bin_name);
+        if p.is_file() {
+            return p;
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        let p = home.join(".cargo").join("bin").join(bin_name);
+        if p.is_file() {
+            return p;
+        }
+    }
+    PathBuf::from(bin_name)
+}
+
 /// Fetches the verified release tag from the canonical GitHub repository inside a local Cargo checkout,
-/// rebuilds `lumaglyph` in `--release --locked` mode with zero console window popups, verifies the
-/// compiled native binary header, and updates `target_exe`.
+/// rebuilds `lumaglyph` in `--release --locked` mode with zero console window popups (moving any running
+/// Windows `lumaglyph.exe` aside to `.old` prior to linking so `link.exe` never hits `LNK1104`), verifies
+/// the compiled native binary header, and updates `target_exe`.
 pub fn rebuild_from_verified_release_tag(
     repo: &str,
     tag: &str,
@@ -1777,20 +1805,6 @@ pub fn rebuild_from_verified_release_tag(
         ));
     }
 
-    let mut cargo_cmd = std::process::Command::new("cargo");
-    configure_hidden_subprocess(&mut cargo_cmd);
-    let build_out = cargo_cmd
-        .current_dir(repo_root)
-        .args(["build", "--release", "--locked"])
-        .output()
-        .map_err(|e| format!("Failed invoking cargo build: {e}"))?;
-    if !build_out.status.success() {
-        return Err(format!(
-            "cargo build --release --locked failed: {}",
-            String::from_utf8_lossy(&build_out.stderr).trim()
-        ));
-    }
-
     let bin_name = if cfg!(target_os = "windows") {
         "lumaglyph.exe"
     } else {
@@ -1802,12 +1816,66 @@ pub fn rebuild_from_verified_release_tag(
         .join("release")
         .join(bin_name);
 
-    let built_bytes = fs::read(&built_path).map_err(|e| {
-        format!(
-            "Failed reading rebuilt release binary '{}': {e}",
-            built_path.display()
-        )
-    })?;
+    // On Windows, if the running executable IS `target\release\lumaglyph.exe`, rename it to `.old`
+    // before invoking `cargo build --release` so MSVC `link.exe` can write the new `.exe` cleanly.
+    let mut moved_running_backup: Option<PathBuf> = None;
+    if built_path == target_exe && target_exe.exists() {
+        let parent = target_exe.parent().unwrap_or_else(|| Path::new("."));
+        let nonce = TMP_NONCE.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let primary_old = parent.join(format!("{bin_name}.old"));
+        if primary_old.exists() {
+            let _ = fs::remove_file(&primary_old);
+        }
+        let backup_path = if primary_old.exists() {
+            parent.join(format!("{bin_name}.old.{pid}.{nonce}"))
+        } else {
+            primary_old
+        };
+        if fs::rename(target_exe, &backup_path).is_ok() {
+            moved_running_backup = Some(backup_path);
+        }
+    }
+
+    let mut cargo_cmd = std::process::Command::new(resolve_cargo_program());
+    configure_hidden_subprocess(&mut cargo_cmd);
+    let build_res = cargo_cmd
+        .current_dir(repo_root)
+        .args(["build", "--release", "--locked"])
+        .output();
+
+    let build_out = match build_res {
+        Ok(out) if out.status.success() => out,
+        Ok(out) => {
+            if let Some(bak) = &moved_running_backup {
+                let _ = fs::rename(bak, target_exe);
+            }
+            return Err(format!(
+                "cargo build --release --locked failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Err(e) => {
+            if let Some(bak) = &moved_running_backup {
+                let _ = fs::rename(bak, target_exe);
+            }
+            return Err(format!("Failed invoking cargo build: {e}"));
+        }
+    };
+    let _ = build_out;
+
+    let built_bytes = match fs::read(&built_path) {
+        Ok(b) => b,
+        Err(e) => {
+            if let Some(bak) = &moved_running_backup {
+                let _ = fs::rename(bak, target_exe);
+            }
+            return Err(format!(
+                "Failed reading rebuilt release binary '{}': {e}",
+                built_path.display()
+            ));
+        }
+    };
     let digest = sha256_bytes(&built_bytes);
 
     if let Some(target) = PlatformTarget::current() {
@@ -1816,6 +1884,10 @@ pub fn rebuild_from_verified_release_tag(
         } else {
             verify_executable_header(&built_bytes, target)?;
         }
+    }
+
+    if let Some(bak) = &moved_running_backup {
+        let _ = fs::remove_file(bak);
     }
 
     let final_exe = if built_path == target_exe {

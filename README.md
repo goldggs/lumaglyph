@@ -8,11 +8,11 @@
 
 Unlike basic 10-character brightness ramps (`@%#*+=-:. `), **LumaGlyph** treats every printable 7-bit ASCII glyph (`0x20..=0x7E`) as 2D geometry. Each font is dynamically calibrated into 32-byte-aligned **8D shape + structure-tensor orientation vectors**, locking `/ \ | _ ( ) [ ] < > ^ ~ , ' ; ! ? $ & % W M # @` directly onto curves, diagonals, silhouettes, and tonal gradients at **500+ FPS** (`< 2 ms/frame`) and **`~7-9 MB` CLI RSS**.
 
-![LumaGlyph v0.3.3 - Fresh Empty Workstation](docs/screenshots/v033-fresh-window.png)
+![LumaGlyph v0.3.4 - Fresh Empty Workstation](docs/screenshots/v033-fresh-window.png)
 
 ---
 
-## New in `v0.3.3` - Fresh Empty Workstation, Normal Reset & Automatic Update-and-Relaunch
+## New in `v0.3.4` - Fresh Empty Workstation, Normal Reset & Automatic Update-and-Relaunch
 
 - **Fresh VS Code-Style Empty Startup (Zero Samples Anywhere):**
   - Launching `lumaglyph` opens directly into a calm, uncluttered empty window - slim top menu strip, clean neutral workbench with discrete recessed keybinding hints (`Ctrl+O`, `Ctrl+Shift+O`, `Ctrl+B`, `Ctrl+,` + OS drag-and-drop), and a quiet `Ready` status bar with zero side panels or clutter until media is opened (or `Ctrl+B` toggles the Inspector).
