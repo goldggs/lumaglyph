@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-and-test:
+    name: Build, Test & Path-Leak Audit (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux GUI system headers
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libxcursor-dev libxi-dev libxinerama-dev libxrandr-dev \
+            libgl1-mesa-dev libegl1-mesa-dev
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        if: runner.os == 'Linux'
+        run: cargo fmt --all -- --check
+
+      - name: Build, Clippy, Test & Path-Leak Audit
+        shell: python
+        env:
+          LUMAGLYPH_GITHUB_REPO: ${{ github.repository }}
+        run: |
+          import os, pathlib, subprocess, sys
+
+          home = pathlib.Path.home()
+          workspace = os.environ.get("GITHUB_WORKSPACE", str(pathlib.Path.cwd()))
+          cargo_home = os.environ.get("CARGO_HOME", str(home / ".cargo"))
+          rustup_home = os.environ.get("RUSTUP_HOME", str(home / ".rustup"))
+
+          flags = [
+              "-C", "force-frame-pointers=no",
+              f"--remap-path-prefix={workspace}=/src",
+              f"--remap-path-prefix={cargo_home}=/cargo",
+              f"--remap-path-prefix={rustup_home}=/rustup",
+              f"--remap-path-prefix={home}=/home",
+          ]
+          if os.name == "nt":
+              # Prevent MSVC link.exe from embedding D:\a\...\lumaglyph.pdb path in PE header
+              flags.extend(["-C", "link-arg=/DEBUG:NONE"])
+
+          env = os.environ.copy()
+          env["RUSTFLAGS"] = " ".join(flags)
+
+          for cmd in [
+              ["cargo", "clippy", "--all-targets", "--", "-D", "warnings"],
+              ["cargo", "test", "--release"],
+              ["cargo", "build", "--release", "--locked"],
+          ]:
+              print("Running:", " ".join(cmd), flush=True)
+              subprocess.run(cmd, env=env, check=True)
+
+          exe = pathlib.Path("target/release/lumaglyph.exe" if os.name == "nt" else "target/release/lumaglyph")
+          data = exe.read_bytes()
+          forbidden = [
+              b"/home/runner",
+              b"/Users/runner",
+              b"runneradmin",
+              b"C:\\Users\\",
+              b"D:\\a\\",
+              workspace.encode("utf-8"),
+          ]
+          leaks = [pat.decode("utf-8", "ignore") for pat in forbidden if pat and pat in data]
+          if leaks:
+              print(f"ERROR: Found leaked build paths in binary: {leaks}", file=sys.stderr)
+              sys.exit(1)
+          print(f"Audit passed: {exe} ({len(data) / (1024*1024):.2f} MB) contains zero host/runner paths.")

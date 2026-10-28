@@ -1,0 +1,7 @@
+# Hardened build defaults:
+# For release/CI builds, GitHub Actions additionally injects --remap-path-prefix
+# for workspace, CARGO_HOME, and RUSTUP_HOME so zero host or runner paths appear in binaries.
+
+[build]
+# Encourage deterministic, compact symbol generation across platforms
+rustflags = ["-C", "force-frame-pointers=no"]
