@@ -128,6 +128,14 @@ The same guides are in the app: press **F1**, or use the **Help** menu.
 
 ## Changelog
 
+### v0.3.9
+
+- Zooming out no longer turns the canvas into a lattice. Minification now samples mipmaps, so cells
+  average together instead of dropping out; at minimum zoom 80% of the canvas was landing on or near
+  black, now it is 17%, and the picture holds together.
+- One divider everywhere. The status bar and canvas readout were drawing typed `|` characters while
+  the header drew a hairline; all three now share the same drawn separator.
+
 ### v0.3.8
 
 - Seek buttons were squeezed into tall, narrow triangles with a stretched hover box. They are wider

@@ -54,6 +54,7 @@ images, and `Settings > Export & Video` lets you point at a custom ffmpeg folder
 | :--- | :--- |
 | Zoom | Mouse wheel, or keys `1` (100%), `2` (200%), `3` (350% loupe) |
 | Zoom to fit | Key `0` |
+| Fine zoom | `Ctrl` + wheel steps the zoom more slowly |
 | Pan | Drag with the mouse (when zoomed in) |
 | Cell readout | Hover the canvas - shows character, foreground color, background |
 | Zen mode (hide all panels) | `Tab` |

@@ -835,3 +835,59 @@ fn social_preview_is_the_size_github_expects() {
     assert_eq!((width, height), (1280, 640));
     assert!(bytes.len() < 1_000_000, "GitHub rejects files over 1 MB");
 }
+
+#[test]
+fn every_readout_uses_the_same_divider() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let gui_src = std::fs::read_to_string(manifest_dir.join("src/gui.rs")).unwrap();
+
+    // One drawn hairline, used by the header strip, the status bar and the canvas tag.
+    assert!(gui_src.contains("fn hairline_divider(ui: &mut egui::Ui"));
+    assert!(gui_src.contains("hairline_divider(ui, &pal)"));
+
+    // Typed pipe characters must not come back as separators. Only string
+    // literals matter here, so match patterns such as `"a" | "b"` are ignored.
+    for literal in gui_string_literals(&gui_src) {
+        assert!(
+            !literal.contains('|'),
+            "readouts should use hairline_divider, found literal: {literal}"
+        );
+    }
+}
+
+/// Every double-quoted literal in a Rust source file, in order.
+fn gui_string_literals(src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = src.chars();
+    while let Some(c) = chars.next() {
+        if c != '"' {
+            continue;
+        }
+        let mut literal = String::new();
+        while let Some(inner) = chars.next() {
+            match inner {
+                '\\' => {
+                    if let Some(escaped) = chars.next() {
+                        literal.push(escaped);
+                    }
+                }
+                '"' => break,
+                other => literal.push(other),
+            }
+        }
+        out.push(literal);
+    }
+    out
+}
+
+#[test]
+fn canvas_minification_is_mipmapped() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let theme_src = std::fs::read_to_string(manifest_dir.join("src/theme.rs")).unwrap();
+    let gui_src = std::fs::read_to_string(manifest_dir.join("src/gui.rs")).unwrap();
+
+    assert!(theme_src.contains("mipmap_mode: Some("));
+    assert!(theme_src.contains("pub fn canvas_texture_options"));
+    assert!(gui_src.contains("canvas_texture_options("));
+    assert!(gui_src.contains("visible_rows("));
+}

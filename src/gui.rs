@@ -7,9 +7,10 @@ use crate::export::{
 use crate::glyph_atlas::GlyphAtlas;
 use crate::telemetry::format_rss_mb;
 use crate::theme::{
-    apply_theme_to_context, header_stat_rects, header_stats_width, install_studio_fonts, mono_font,
-    plex_medium, resolve_palette, AccentPreset, CheckerContrast, CornerStyle, StudioTheme,
-    ThemePalette, UiDensity, HEADER_STAT_FONT, HEADER_STAT_HEIGHT, HEADER_STAT_SEP,
+    apply_theme_to_context, canvas_texture_options, header_stat_rects, header_stats_width,
+    install_studio_fonts, mono_font, plex_medium, resolve_palette, visible_rows, AccentPreset,
+    CheckerContrast, CornerStyle, StudioTheme, ThemePalette, UiDensity, HEADER_STAT_FONT,
+    HEADER_STAT_HEIGHT, HEADER_STAT_SEP,
 };
 use crate::updater::{
     format_build_report, relaunch_executable, spawn_release_check, spawn_verified_self_update,
@@ -31,6 +32,22 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::time::Instant;
+
+/// A vertical hairline between two readouts.
+///
+/// The header strip, the status bar and the canvas readout all use this instead
+/// of a typed pipe character, so the dividers line up with each other and with
+/// the rule under the transport strip.
+fn hairline_divider(ui: &mut egui::Ui, pal: &ThemePalette) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(13.0, 10.0), Sense::hover());
+    ui.painter().line_segment(
+        [
+            Pos2::new(rect.center().x, rect.center().y - 5.0),
+            Pos2::new(rect.center().x, rect.center().y + 5.0),
+        ],
+        Stroke::new(1.0_f32, pal.border_subtle),
+    );
+}
 
 /// Draws the header telemetry strip into fixed-width columns.
 ///
@@ -820,10 +837,14 @@ impl LumaGlyphApp {
 
             if pw > 0 && ph > 0 {
                 let cimg = ColorImage::from_rgba_unmultiplied([pw, ph], &self.raster_rgba);
-                let opts = match self.prefs.texture_filter.resolve(self.zoom) {
-                    "nearest" => TextureOptions::NEAREST,
-                    _ => TextureOptions::LINEAR,
-                };
+                // Rows that actually fit on screen drive the mip choice: a picture
+                // drawn 300 tall never needs all 51 source rows sampled.
+                let drawn_h = self.ascii_px_h as f32 * self.zoom;
+                let opts = canvas_texture_options(
+                    self.prefs.texture_filter.resolve(self.zoom),
+                    self.ascii_frame.rows,
+                    visible_rows(self.ascii_frame.rows, drawn_h),
+                );
                 match &mut self.ascii_tex {
                     Some(tex) => tex.set(cimg, opts),
                     None => {
@@ -2466,28 +2487,40 @@ impl LumaGlyphApp {
                     } else {
                         "PLAYING"
                     };
-                    ui.label(
-                        RichText::new(format!(
-                            "{}x{} @ {:.1} FPS   |   {}   |   {} / {}",
-                            stream.meta.width,
-                            stream.meta.height,
-                            stream.meta.fps,
-                            state,
+                    let parts = [
+                        format!(
+                            "{}x{} @ {:.1} FPS",
+                            stream.meta.width, stream.meta.height, stream.meta.fps
+                        ),
+                        state.to_string(),
+                        format!(
+                            "{} / {}",
                             format_timecode(stream.position_secs()),
-                            format_timecode(stream.duration_secs()),
-                        ))
-                        .font(mono_font(10.6))
-                        .color(pal.text_secondary),
-                    );
+                            format_timecode(stream.duration_secs())
+                        ),
+                    ];
+                    for (idx, part) in parts.iter().enumerate() {
+                        if idx > 0 {
+                            hairline_divider(ui, &pal);
+                        }
+                        ui.label(
+                            RichText::new(part)
+                                .font(mono_font(10.6))
+                                .color(pal.text_secondary),
+                        );
+                    }
                 }
                 SourceKind::StaticImage { name } => {
                     ui.label(
-                        RichText::new(format!(
-                            "{name}   |   {}x{} px",
-                            self.source_w, self.source_h
-                        ))
-                        .font(mono_font(10.6))
-                        .color(pal.text_muted),
+                        RichText::new(name.as_str())
+                            .font(mono_font(10.6))
+                            .color(pal.text_muted),
+                    );
+                    hairline_divider(ui, &pal);
+                    ui.label(
+                        RichText::new(format!("{}x{} px", self.source_w, self.source_h))
+                            .font(mono_font(10.6))
+                            .color(pal.text_muted),
                     );
                 }
             }
@@ -2495,11 +2528,15 @@ impl LumaGlyphApp {
             if self.has_media() && self.ascii_frame.cols > 0 && self.ascii_frame.rows > 0 {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(
+                        RichText::new(format!("{:.0}%", self.zoom * 100.0))
+                            .font(mono_font(10.6))
+                            .color(pal.text_muted),
+                    );
+                    hairline_divider(ui, &pal);
+                    ui.label(
                         RichText::new(format!(
-                            "{}x{} cells   |   {:.0}%",
-                            self.ascii_frame.cols,
-                            self.ascii_frame.rows,
-                            self.zoom * 100.0
+                            "{}x{} cells",
+                            self.ascii_frame.cols, self.ascii_frame.rows
                         ))
                         .font(mono_font(10.6))
                         .color(pal.text_muted),

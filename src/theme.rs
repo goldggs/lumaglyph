@@ -1,6 +1,6 @@
 use eframe::egui::{
     self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Margin, Pos2, Rect,
-    Stroke, TextStyle, Visuals,
+    Stroke, TextStyle, TextureOptions, Visuals,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -58,6 +58,41 @@ pub fn header_stat_rects(right: f32, center_y: f32) -> [Rect; HEADER_STAT_WIDTHS
         edge -= width + HEADER_STAT_SEP;
     }
     rects
+}
+
+/// Texture sampling for the ASCII canvas.
+///
+/// Glyph cells are a few device pixels across, so straight bilinear minification
+/// aliases badly: the cell grid beats against the pixel grid, thin strokes fall
+/// between samples, and the picture breaks up into a lattice with characters
+/// missing. Mipmaps average whole cells instead, which keeps a scaled-down
+/// canvas reading as a picture.
+///
+/// `visible_rows` is how many character rows fit on screen right now. Once fewer
+/// than a quarter of them are visible there is no point blending between mip
+/// levels, so the nearest whole level is used and the image stays crisp rather
+/// than mushy.
+pub fn canvas_texture_options(filter: &str, full_rows: u32, visible_rows: u32) -> TextureOptions {
+    let base = match filter {
+        "nearest" => TextureOptions::NEAREST,
+        _ => TextureOptions::LINEAR,
+    };
+    TextureOptions {
+        magnification: base.magnification,
+        minification: egui::TextureFilter::Linear,
+        wrap_mode: base.wrap_mode,
+        mipmap_mode: Some(if full_rows >= visible_rows.saturating_mul(4) {
+            egui::TextureFilter::Nearest
+        } else {
+            egui::TextureFilter::Linear
+        }),
+    }
+}
+
+/// Character rows that fit on screen for a canvas `rows` tall drawn at `height` points.
+pub fn visible_rows(rows: u32, height: f32) -> u32 {
+    let estimate = (height / 14.0).round().max(1.0) as u32;
+    estimate.min(rows.max(1))
 }
 
 /// Calibrated desktop workstation color themes.
@@ -638,5 +673,52 @@ mod header_stats_tests {
                 HEADER_STAT_WIDTHS[idx]
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod canvas_sampling_tests {
+    use super::*;
+
+    #[test]
+    fn mipmaps_are_always_used_for_minification() {
+        for filter in ["nearest", "linear"] {
+            let opts = canvas_texture_options(filter, 44, 44);
+            assert_eq!(opts.minification, egui::TextureFilter::Linear);
+            assert!(opts.mipmap_mode.is_some());
+        }
+    }
+
+    #[test]
+    fn magnification_follows_the_user_choice() {
+        assert_eq!(
+            canvas_texture_options("nearest", 44, 44).magnification,
+            egui::TextureFilter::Nearest
+        );
+        assert_eq!(
+            canvas_texture_options("linear", 44, 44).magnification,
+            egui::TextureFilter::Linear
+        );
+    }
+
+    #[test]
+    fn deep_zoom_picks_nearest_mip_level() {
+        // 44 rows, 6 visible: no useful blending between levels.
+        let opts = canvas_texture_options("linear", 44, 6);
+        assert_eq!(opts.mipmap_mode, Some(egui::TextureFilter::Nearest));
+    }
+
+    #[test]
+    fn mild_zoom_still_blends_levels() {
+        let opts = canvas_texture_options("linear", 44, 30);
+        assert_eq!(opts.mipmap_mode, Some(egui::TextureFilter::Linear));
+    }
+
+    #[test]
+    fn visible_rows_never_exceed_the_canvas() {
+        assert_eq!(visible_rows(44, 10_000.0), 44);
+        assert_eq!(visible_rows(44, 0.0), 1);
+        assert_eq!(visible_rows(0, 500.0), 1);
+        assert!(visible_rows(51, 400.0) < 51);
     }
 }
