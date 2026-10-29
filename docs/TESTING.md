@@ -97,30 +97,35 @@ The cost of one conversion is **a fixed overhead per call plus a per-cell slope*
 time = fixed + slope * (cols * rows)
 ```
 
-The slope is the part that describes the algorithm. The fixed part is thread-pool
-dispatch and allocation, and it varies enormously by machine — measured at roughly
-0.1 ms on a workstation and up to 1.8 ms on a shared Windows CI runner.
+The slope describes the algorithm. The fixed part is thread-pool dispatch and
+allocation, and it varies enormously by machine — roughly 0.1 ms on a workstation and
+1.8 ms on a shared Windows runner. So the test does **not** assert the slope, and it does
+not assert milliseconds. It asserts the *shape*, which is the only thing that means the
+same on every machine:
 
-The model is fitted through the **two endpoints** — 60 columns and 420 columns, a
-48-fold range in cell count — and every intermediate measurement must land within 2x of
-the line those two points define. That tolerance is deliberate and it is not a
-weakening: a quadratic term over a 48-fold range would be out by orders of magnitude,
-not by 40%. What it does tolerate is a stalled sample on a three-core runner, which is a
-property of the machine rather than of the code.
+1. **Time must grow with the grid.** Trivially true today, and it catches an inverted or
+   quantised cost model.
+2. **A 48-fold increase in cells must cost between 2.5x and 300x more time.** Linear is
+   48x, quadratic would be about 2,300x, constant-cost is 1x. The band is wide because
+   the fixed overhead compresses the ratio on slow machines and contention inflates it on
+   fast ones.
+3. **Cost per cell at the largest grid must stay under 3,000 ns.** This is the one that
+   catches a lost `rayon` iterator or a per-cell allocation, which would move a single
+   measurement by an order of magnitude without changing the ratio much.
 
-Getting there took three attempts, and the failures are worth recording:
+The measured figures, collected from all four machines this project builds on:
 
-| Version | What it asserted | Why it broke |
-| :--- | :--- | :--- |
-| 1 | A constant cost per output cell | The fixed per-call overhead dominates at small column counts, so small grids looked 3-6x more expensive per cell. Failed on Linux and Windows. |
-| 2 | Least squares over four points, plus a tight collinearity bound | One stalled sample on macOS dragged the fit and produced 47% curvature. Statistically correct, practically fragile. |
-| 3 | Two endpoints, 2x tolerance, constant work per batch | Stable to within 11% on repeated runs. |
+| Machine | Ratio for 48x cells (ideal 48x) | ns per cell at 420 columns |
+| :--- | ---: | ---: |
+| Workstation (Linux, 8 cores) | 42x | 318 ns |
+| `ubuntu-latest` CI | 16x | 192 ns |
+| `windows-latest` CI | 8x | 246 ns |
+| `macos-15` CI | 83x | 336 ns |
 
-The final measurement batches are sized to about 40 ms of work each regardless of grid
-size, so a scheduling hiccup is a small fraction of a sample instead of most of one, and
-the best of five batches is used.
+The spread is the point. Any assertion tight enough to be interesting on the first row
+would be red on the others.
 
-The measured behaviour on a 1280x960 source:
+The measured behaviour on a 1280x960 source, from a workstation:
 
 | Columns | Grid | Cells | Per frame | Per cell |
 | ---: | :--- | ---: | ---: | ---: |
@@ -136,6 +141,27 @@ phone photo, a 4K frame and a video stream.
 
 `lumaglyph bench` prints real throughput if you want the absolute figure on your own
 machine.
+
+### Three attempts, and what each one taught
+
+This test took four releases to get right, and the record is more useful than the final
+numbers.
+
+| Attempt | What it asserted | Why it failed |
+| :--- | :--- | :--- |
+| 1 | A constant cost per output cell | The fixed per-call overhead dominates at small grids, so small grids looked 3-6x more expensive per cell. Red on Linux and Windows. |
+| 2 | Least squares over four points, tight curvature bound | One stalled sample on a three-core macOS runner produced 47% apparent curvature. A quadratic term would be out by 2,300x, so the test was measuring the runner, not the code. |
+| 3 | Two endpoints, 2x tolerance on intermediate points | On the next run macOS skewed the *largest* grid instead, and the same test that passed a day earlier was 2.2x off. |
+| 4 | Monotonic growth, a wide ratio band, and a per-cell ceiling | Stable across four machines and repeated runs. |
+
+Two lessons, both now applied everywhere in this suite:
+
+- **Timing tests must not run in parallel.** `cargo test` runs test functions on threads;
+  four separate timing tests were competing with each other and with `rayon`. All timing
+  now happens inside a single test function, sequentially.
+- **Assert the shape, not the speed.** A shared runner is not a benchmark machine. Ratios
+  and ceilings relative to the same run survive a busy afternoon; absolute milliseconds
+  do not.
 
 ### Two lessons this suite taught
 

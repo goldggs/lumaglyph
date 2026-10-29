@@ -214,6 +214,24 @@ repo is MIT and builds with one command.
 
 ## Changelog
 
+### v0.4.5
+
+The performance guard, fourth and final attempt. It now passes on all three CI platforms
+and on a workstation.
+
+- Asserting a constant cost per cell was wrong (fixed per-call overhead dominates small
+  grids). A least-squares fit was broken by one stalled sample. A two-endpoint fit was
+  then broken by contention skewing the other end of the curve.
+- It now asserts three things that survive any machine: time grows with the grid, a
+  48-fold increase in cells costs between 2.5x and 300x more time (linear is 48x, an
+  O(n^2) would be about 2,300x), and cost per cell at the largest grid stays under
+  3,000 ns. Measured across four machines, the ratio ranges from 8x to 83x, which is
+  exactly why the band is wide.
+- The fitted model is still printed, so a human reading the log sees the numbers; the
+  test simply refuses to fail over a stalled sample on a shared runner.
+
+All four attempts are written up in [docs/TESTING.md](docs/TESTING.md#performance-guards).
+
 ### v0.4.4
 
 The performance guard, third attempt. It is now stable.
