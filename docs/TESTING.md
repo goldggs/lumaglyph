@@ -88,37 +88,56 @@ Look at the diff before you bless. A blessed regression is a silent one.
 ## Performance guards
 
 Speed is a stated goal, and a goal that nothing measures tends to quietly disappear.
-`icon_and_perf_guard` measures the conversion cost two ways and asserts that the shape
-of the curve has not changed.
+`icon_and_perf_guard` measures the conversion cost and asserts that the shape of the
+cost curve has not changed.
 
-The measured behaviour, on a 1280x960 source:
+The cost of one conversion is **a fixed overhead per call plus a per-cell slope**:
+
+```text
+time = fixed + slope * (cols * rows)
+```
+
+The slope is the part that describes the algorithm. The fixed part is thread-pool
+dispatch and allocation, and it varies enormously by machine — measured at roughly
+0.1 ms on a workstation and 1.8 ms on a shared Windows CI runner. An earlier version of
+this suite asserted a constant cost per cell and promptly failed on both CI platforms,
+because at small column counts the fixed overhead dominates. The test now fits a line
+through four column counts and asserts the two things that are genuinely
+environment-independent:
+
+1. **The slope is in a sane band.** Measured at 300-320 ns per output cell locally and
+   180-220 ns on CI. A lost `rayon` iterator or a per-cell allocation moves it by an
+   order of magnitude, in either direction.
+2. **The points are collinear.** Four samples, so a quadratic term cannot hide: it
+   would show as curvature a straight line cannot absorb.
+
+The measured behaviour on a 1280x960 source:
 
 | Columns | Grid | Cells | Per frame | Per cell |
 | ---: | :--- | ---: | ---: | ---: |
-| 40 | 40x15 | 600 | 0.25 ms | 420 ns |
 | 60 | 60x23 | 1,380 | 0.47 ms | 341 ns |
-| 80 | 80x30 | 2,400 | 0.77 ms | 322 ns |
 | 120 | 120x45 | 5,400 | 1.73 ms | 321 ns |
 | 160 | 160x60 | 9,600 | 2.96 ms | 308 ns |
 | 240 | 240x90 | 21,600 | 6.52 ms | 302 ns |
-| 320 | 320x120 | 38,400 | 11.58 ms | 302 ns |
 | 420 | 420x158 | 66,360 | 21.00 ms | 316 ns |
 
-Two things follow from that table, and both are asserted:
-
-1. **Cost per output cell is flat** — roughly 300 ns from 600 cells to 66,360. The
-   pipeline is O(cols x rows) with no hidden quadratic term.
-2. **Source resolution is close to free** at a fixed column count: 640x480 renders in
-   1.70 ms and 2560x1920 in 1.75 ms, a 3% difference for 16x the pixels. That is why
-   the same code path handles a phone photo, a 4K frame and a video stream.
-
-Neither test asserts an absolute number of milliseconds. They assert *ratios*, with a
-3x allowance, because a shared CI runner is not a benchmark machine. The failure they
-are designed to catch is structural — an accidental O(n^2), a lost `rayon` iterator, a
-per-cell allocation — not a 15% regression on a busy afternoon.
+And source resolution is close to free at a fixed column count: 640x480 renders in
+1.71 ms and 2560x1920 in 1.77 ms, a 3% difference for 16x the pixels. Downsampling reads
+a bounded number of samples per output cell, which is why the same code path handles a
+phone photo, a 4K frame and a video stream.
 
 `lumaglyph bench` prints real throughput if you want the absolute figure on your own
 machine.
+
+### Two lessons this suite taught
+
+- **Timing tests must not run in parallel.** `cargo test` runs test functions on
+  threads, so four separate timing tests were competing with each other and with
+  `rayon` for the same cores. The measurements were inflated and unrepeatable. All
+  timing now happens inside a single test function, sequentially.
+- **Assert ratios, not milliseconds.** A shared runner is not a benchmark machine. Every
+  threshold here is relative to another measurement taken in the same run, or a
+  structural property of the curve, so a busy afternoon cannot turn CI red.
 
 ## Vulnerabilities found by these suites
 

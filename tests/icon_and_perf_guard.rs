@@ -127,33 +127,9 @@ fn noise(w: u32, h: u32) -> Vec<u8> {
     out
 }
 
-#[test]
-fn a_typical_conversion_finishes_far_inside_a_frame_budget() {
-    // 640x480 at 160 columns is a normal photo. Measured locally at a few
-    // milliseconds; the ceiling is generous on purpose.
-    let atlas = GlyphAtlas::default_embedded(12);
-    let pixels = noise(640, 480);
-    let mut params = RenderParams::default();
-    params.cols = 160;
-    let mut frame = AsciiFrame::new();
-    // Warm the allocator and the glyph atlas so the timing excludes first-touch cost.
-    convert_image_buffer(&pixels, 640, 480, 3, &atlas, &params, false, &mut frame);
-
-    let start = Instant::now();
-    for _ in 0..5 {
-        convert_image_buffer(&pixels, 640, 480, 3, &atlas, &params, false, &mut frame);
-    }
-    let per_frame = start.elapsed() / 5;
-    assert!(
-        per_frame.as_millis() < 800,
-        "one 640x480 frame took {per_frame:?}; something has become far slower"
-    );
-    eprintln!("640x480 @ 160 cols: {per_frame:?} per frame");
-}
-
-/// Times `iters` conversions of the same source and returns the best batch, in
-/// nanoseconds. Best-of-three, because interference from other processes can only
-/// make a batch slower, never faster.
+/// Times `iters` conversions of the same source and returns the best of three batches,
+/// in nanoseconds per conversion. Best-of-three because interference from other work can
+/// only make a batch slower, never faster.
 fn best_batch(
     atlas: &GlyphAtlas,
     params: &RenderParams,
@@ -174,69 +150,118 @@ fn best_batch(
     (best as f64 / iters as f64, frame.cols, frame.rows)
 }
 
+/// Every timing measurement lives in one test, on purpose.
+///
+/// `cargo test` runs test functions in parallel threads, so several timing tests in
+/// one binary contend with each other and with `rayon` for the same cores. An earlier
+/// version of this suite had four separate timing tests and measured a fixed overhead
+/// of 1 ms per conversion that did not exist when the same code ran alone. Merging
+/// them makes the measurements sequential and repeatable, and it costs nothing: the
+/// whole function still runs in about a second.
 #[test]
-fn output_cost_is_flat_per_cell_across_the_column_range() {
-    // The engine converts onto a fixed grid, so the honest cost unit is nanoseconds
-    // per output cell, not per source pixel. If that figure stays flat while the grid
-    // grows by two orders of magnitude, the pipeline is O(cols * rows) and nothing in
-    // it has picked up a hidden quadratic term.
-    //
-    // Measured ratios locally sit around 1.1x; the 3x budget absorbs a loaded runner.
+fn conversion_cost_model_and_scaling() {
     let atlas = GlyphAtlas::default_embedded(12);
     let source = noise(1280, 960);
     let mut frame = AsciiFrame::new();
 
-    let mut per_cell = Vec::new();
-    for cols in [60u32, 160, 420] {
+    // --- 1. Cost model: fixed overhead plus a slope per output cell -------------
+    //
+    //     time = fixed + slope * cells
+    //
+    // Only the slope describes the algorithm. The fixed part is thread-pool dispatch
+    // and allocation, and differs by orders of magnitude between a workstation and a
+    // shared CI runner (measured: tens of microseconds locally, roughly 0.8 ms on
+    // Linux CI and 1.8 ms on Windows CI). So the assertions are on the slope and on
+    // collinearity, which is what a quadratic term would break.
+    let mut points: Vec<(f64, f64)> = Vec::new(); // (cells, ns per conversion)
+    for cols in [60u32, 120, 240, 420] {
         let mut params = RenderParams::default();
         params.cols = cols;
         convert_image_buffer(&source, 1280, 960, 3, &atlas, &params, false, &mut frame);
         let (ns, c, r) = best_batch(&atlas, &params, &source, 1280, 960, &mut frame, 8);
-        let cell_ns = ns / ((c * r) as f64);
+        let cells = (c * r) as f64;
         eprintln!(
-            "cols={c:>3} grid={c}x{r} = {} cells: {:.0} ns/cell",
-            c * r,
-            cell_ns
+            "cols={c:>3} grid={c}x{r} = {cells:>6} cells: {:>7.2} ms ({:>4.0} ns/cell)",
+            ns / 1e6,
+            ns / cells
         );
-        per_cell.push(cell_ns);
+        points.push((cells, ns));
     }
 
-    let slowest = per_cell.iter().cloned().fold(f64::MIN, f64::max);
-    let fastest = per_cell.iter().cloned().fold(f64::MAX, f64::min);
-    let spread = slowest / fastest;
-    assert!(
-        spread < 3.0,
-        "per-cell cost varies {spread:.2}x across the column range ({per_cell:?} ns/cell) - \
-         the conversion likely has a non-linear term"
+    let n = points.len() as f64;
+    let sx: f64 = points.iter().map(|p| p.0).sum();
+    let sy: f64 = points.iter().map(|p| p.1).sum();
+    let sxx: f64 = points.iter().map(|p| p.0 * p.0).sum();
+    let sxy: f64 = points.iter().map(|p| p.0 * p.1).sum();
+    let slope = (n * sxy - sx * sy) / (n * sxx - sx * sx);
+    let fixed = (sy - slope * sx) / n;
+    eprintln!(
+        "cost model: {slope:.0} ns per output cell + {:.3} ms fixed per call",
+        fixed / 1e6
     );
-}
 
-#[test]
-fn source_resolution_barely_affects_cost_at_fixed_columns() {
+    let worst = points
+        .iter()
+        .map(|(cells, ns)| {
+            let predicted = fixed + slope * cells;
+            ((ns - predicted) / predicted).abs()
+        })
+        .fold(0.0_f64, f64::max);
+    eprintln!(
+        "worst deviation from the fitted line: {:.1}%",
+        worst * 100.0
+    );
+
+    assert!(
+        (20.0..=3_000.0).contains(&slope),
+        "cost per output cell is {slope:.0} ns, outside the expected band - the \
+         conversion has gained or lost an order of magnitude of work"
+    );
+    assert!(
+        worst < 0.35,
+        "measurements deviate from a straight line by {:.0}% - cost is no longer linear \
+         in cell count, which points at a quadratic term",
+        worst * 100.0
+    );
+
+    // --- 2. A bigger source costs little at a fixed column count ---------------
+    //
     // Downsampling reads a bounded number of samples per output cell, so a 4K source
     // should cost about the same as a 640x480 one at the same column count. This is
     // what makes the app usable on large photos and on every frame of a 4K video.
-    let atlas = GlyphAtlas::default_embedded(12);
     let mut params = RenderParams::default();
     params.cols = 120;
-    let mut frame = AsciiFrame::new();
-
     let small = noise(640, 480);
     let large = noise(2560, 1920);
     convert_image_buffer(&small, 640, 480, 3, &atlas, &params, false, &mut frame);
     convert_image_buffer(&large, 2560, 1920, 3, &atlas, &params, false, &mut frame);
-
     let (small_ns, _, _) = best_batch(&atlas, &params, &small, 640, 480, &mut frame, 8);
     let (large_ns, _, _) = best_batch(&atlas, &params, &large, 2560, 1920, &mut frame, 8);
     let ratio = large_ns / small_ns;
     eprintln!(
-        "640x480 {:.2} ms vs 2560x1920 {:.2} ms at cols=120 ({ratio:.2}x for 16x the pixels)",
+        "source size: 640x480 {:.2} ms vs 2560x1920 {:.2} ms at cols=120 ({ratio:.2}x for 16x the pixels)",
         small_ns / 1e6,
         large_ns / 1e6
     );
     assert!(
         ratio < 3.0,
         "a 16x larger source cost {ratio:.2}x the time to render at the same column count"
+    );
+
+    // --- 3. A normal photo finishes far inside a frame budget ------------------
+    //
+    // Measured locally at a few milliseconds; the ceiling is generous so that a loaded
+    // runner cannot fail it. Only a catastrophic regression reaches 800 ms.
+    let mut params = RenderParams::default();
+    params.cols = 160;
+    let photo = noise(640, 480);
+    convert_image_buffer(&photo, 640, 480, 3, &atlas, &params, false, &mut frame);
+    let (photo_ns, _, _) = best_batch(&atlas, &params, &photo, 640, 480, &mut frame, 5);
+    eprintln!("640x480 at 160 cols: {:.2} ms per frame", photo_ns / 1e6);
+    assert!(
+        photo_ns < 800e6,
+        "one 640x480 frame took {:.0} ms; something has become far slower",
+        photo_ns / 1e6
     );
 }
 

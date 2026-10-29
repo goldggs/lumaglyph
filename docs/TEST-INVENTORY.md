@@ -12,11 +12,11 @@ Counted from `cargo test -- --list`. Regenerate with `./scripts/test_inventory.s
 | `engine_stress_and_fuzz` | 22 | 22 |
 | `glyph_and_charset_matrix` | 8 | 226 |
 | `golden_render` | 10 | 10 |
-| `icon_and_perf_guard` | 9 | 9 |
+| `icon_and_perf_guard` | 7 | 7 |
 | `look_export_and_cli_matrix` | 11 | 123 |
 | `remote_update_security` | 33 | 243 |
 | `security_and_provenance_audit` | 24 | 24 |
 | `themes_prefs_and_binary_audit` | 28 | 114 |
 | `video_and_cli_e2e` | 6 | 6 |
-| **total** | **355** | **1506** |
+| **total** | **353** | **1504** |
 
