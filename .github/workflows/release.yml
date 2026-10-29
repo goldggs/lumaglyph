@@ -136,18 +136,46 @@ jobs:
               if os.name != "nt":
                   exe.chmod(exe.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
+              # Deterministic archive metadata: never leak the CI runner account/uid/gid or wall clock
+              FIXED_MTIME = 1_700_000_000
+
+              def add_clean(tf, src, arcname):
+                  info = tf.gettarinfo(str(src), arcname=arcname)
+                  info.uid = 0
+                  info.gid = 0
+                  info.uname = ""
+                  info.gname = ""
+                  info.mtime = FIXED_MTIME
+                  info.mode = 0o755 if arcname == bin_name else 0o644
+                  with open(src, "rb") as fh:
+                      tf.addfile(info, fh)
+
+              def write_zip(out_path, members):
+                  with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                      for src, arcname in members:
+                          info = zipfile.ZipInfo(arcname, date_time=(2023, 11, 14, 0, 0, 0))
+                          info.external_attr = (0o755 if arcname == bin_name else 0o644) << 16
+                          info.create_system = 3
+                          info.compress_type = zipfile.ZIP_DEFLATED
+                          with open(src, "rb") as fh:
+                              zf.writestr(info, fh.read())
+
+              def write_tar(out_path, members):
+                  with tarfile.open(out_path, "w:gz", format=tarfile.PAX_FORMAT) as tf:
+                      for src, arcname in members:
+                          add_clean(tf, src, arcname)
+                  with tarfile.open(out_path, "r:gz") as tf:
+                      for member in tf.getmembers():
+                          assert member.uname == "" and member.gname == "", "Leaked user metadata"
+                          assert member.uid == 0 and member.gid == 0, "Leaked uid/gid metadata"
+                          assert member.mtime == FIXED_MTIME, "Non-deterministic mtime"
+
               if archive_kind == "zip":
                   out_archive = out_dir / f"{artifact}.zip"
-                  with zipfile.ZipFile(out_archive, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                      zf.write(exe, arcname=bin_name)
-                      zf.write("LICENSE", arcname="LICENSE")
-                      zf.write("README.md", arcname="README.md")
+                  write_zip(out_archive, [(exe, bin_name), ("LICENSE", "LICENSE"), ("README.md", "README.md")])
               else:
                   out_archive = out_dir / f"{artifact}.tar.gz"
-                  with tarfile.open(out_archive, "w:gz") as tf:
-                      tf.add(exe, arcname=bin_name)
-                      tf.add("LICENSE", arcname="LICENSE")
-                      tf.add("README.md", arcname="README.md")
+                  write_tar(out_archive, [(exe, bin_name), ("LICENSE", "LICENSE"), ("README.md", "README.md")])
 
               digest = hashlib.sha256(out_archive.read_bytes()).hexdigest()
               (out_dir / f"{out_archive.name}.sha256").write_text(
@@ -182,12 +210,16 @@ jobs:
 
               if sys.platform.startswith("linux"):
                   desk_archive = out_dir / f"{artifact}-desktop.tar.gz"
-                  with tarfile.open(desk_archive, "w:gz") as tf:
-                      tf.add(exe, arcname=bin_name)
-                      tf.add("assets/linux/lumaglyph.desktop", arcname="lumaglyph.desktop")
-                      tf.add("assets/icons/lumaglyph-512.png", arcname="lumaglyph.png")
-                      tf.add("LICENSE", arcname="LICENSE")
-                      tf.add("README.md", arcname="README.md")
+                  write_tar(
+                      desk_archive,
+                      [
+                          (exe, bin_name),
+                          ("assets/linux/lumaglyph.desktop", "lumaglyph.desktop"),
+                          ("assets/icons/lumaglyph-512.png", "lumaglyph.png"),
+                          ("LICENSE", "LICENSE"),
+                          ("README.md", "README.md"),
+                      ],
+                  )
                   desk_digest = hashlib.sha256(desk_archive.read_bytes()).hexdigest()
                   (out_dir / f"{desk_archive.name}.sha256").write_text(
                       f"{desk_digest}  {desk_archive.name}\n", encoding="utf-8"
