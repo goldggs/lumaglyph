@@ -819,3 +819,19 @@ fn app_copy_stays_plain() {
         );
     }
 }
+
+#[test]
+fn social_preview_is_the_size_github_expects() {
+    // GitHub renders social previews at a 2:1 ratio and crops anything else,
+    // so the shipped asset has to be exactly 1280x640.
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/brand/social-preview.png");
+    let bytes = std::fs::read(&path).expect("social preview asset");
+
+    assert_eq!(&bytes[1..4], b"PNG", "social preview must be a real PNG");
+    // IHDR is always the first chunk: width and height are big-endian u32s.
+    let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+    assert_eq!((width, height), (1280, 640));
+    assert!(bytes.len() < 1_000_000, "GitHub rejects files over 1 MB");
+}
