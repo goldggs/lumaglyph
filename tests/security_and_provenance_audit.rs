@@ -83,6 +83,26 @@ fn only_the_updater_may_open_a_network_connection() {
 }
 
 #[test]
+fn text_files_are_normalised_to_lf_on_every_platform() {
+    // Several tests read this repository's own source and compare byte offsets. A CRLF
+    // working tree shifts those offsets, because `str::lines()` strips a trailing
+    // carriage return. That produced a Windows-only CI failure in this very file, so
+    // the line-ending guarantee is a repository rule rather than an assumption about a
+    // contributor's git config.
+    let body = read(".gitattributes");
+    assert!(
+        body.contains("eol=lf"),
+        ".gitattributes must force LF so source-reading tests behave the same on Windows"
+    );
+    for binary in ["*.png", "*.ico", "*.icns", "*.ttf"] {
+        assert!(
+            body.contains(binary) && body.contains("binary"),
+            "{binary} must be marked binary so the normaliser leaves it alone"
+        );
+    }
+}
+
+#[test]
 fn the_updater_only_speaks_to_github() {
     let body = read("src/updater.rs");
     let production = production_half(&body);
@@ -107,6 +127,11 @@ fn the_updater_only_speaks_to_github() {
 
     // Plaintext HTTP is allowed in exactly one place: the loopback policy used by
     // the mock-server tests. It must never reach a real endpoint.
+    //
+    // Offsets come from `match_indices`, not from summing line lengths: `str::lines()`
+    // strips a trailing carriage return, so a CRLF checkout would make reconstructed
+    // offsets drift by one byte per line, and this test failed on Windows for exactly
+    // that reason before it was written this way.
     let production = production_half(&body);
     let loopback = production
         .find("fn loopback_mock")
@@ -115,18 +140,16 @@ fn the_updater_only_speaks_to_github() {
         .find("\n    }")
         .map(|i| loopback + i)
         .unwrap_or(production.len());
-    for (idx, line) in production.lines().enumerate() {
-        if line.contains("http://") {
-            let offset = production
-                .lines()
-                .take(idx)
-                .map(|l| l.len() + 1)
-                .sum::<usize>();
-            assert!(
-                offset >= loopback && offset <= loopback_body_end,
-                "plaintext HTTP outside the loopback mock policy: {line}"
-            );
-        }
+    for (offset, _) in production.match_indices("http://") {
+        let line = production[..offset]
+            .lines()
+            .next_back()
+            .unwrap_or("")
+            .trim();
+        assert!(
+            offset >= loopback && offset <= loopback_body_end,
+            "plaintext HTTP outside the loopback mock policy: {line}"
+        );
     }
     // And nothing in production code may call it.
     for line in code_lines(production) {

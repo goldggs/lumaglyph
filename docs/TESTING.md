@@ -150,6 +150,12 @@ anything is usually a test suite that is not looking.
 | **SEC-2026-001** | `GlyphAtlas::glyph_slice()` computed `glyph_idx * stride` without bounds checking. | An out-of-range glyph byte overflowed the multiply and panicked on the slice range. Not reachable from the current renderer (which clamps first), but it is a public API and the failure was a process abort. | The index is now clamped to the last glyph, and the test asserts saturation for `usize::MAX`. |
 | **SEC-2026-002** | Scroll-to-zoom multiplied a possibly non-finite scroll delta into the zoom factor. | One `NaN` delta from a trackpad driver poisoned the canvas transform permanently: every later `Rect` was `NaN` and the picture silently stopped drawing. | Non-finite deltas are ignored, and a corrupted zoom resets to 100% instead of propagating. |
 
+A third class of problem was found in the tests themselves: they passed on Linux and
+failed on Windows, twice, for reasons that were entirely about the environment rather
+than the code. Both are described in [Performance guards](#performance-guards) and
+below, because a test suite whose portability bugs are hidden is a test suite you
+cannot trust on three platforms.
+
 Two smaller correctness issues were also found and fixed:
 
 - `--color <typo>` used to be accepted silently and fall back to the default palette,
@@ -157,6 +163,14 @@ Two smaller correctness issues were also found and fixed:
   code 0. It now fails with a message.
 - Six `unsafe` blocks were missing `SAFETY` justifications. They have them now, and
   `security_and_provenance_audit` fails if a new one appears without a note.
+
+And one test-only bug worth recording: the security audit located the single permitted
+`http://` string by reconstructing byte offsets from line lengths. Rust's `str::lines()`
+strips a trailing carriage return, so on a CRLF checkout the offsets drifted by one byte
+per line and the audit failed on Windows only. It now uses `match_indices`, which
+reports true byte positions, and `.gitattributes` forces LF in the working tree on every
+platform, so the class of bug cannot return. The whole suite was re-run against a
+deliberately CRLF-converted copy of the repository to confirm that.
 
 ---
 
