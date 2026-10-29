@@ -708,9 +708,7 @@ fn documentation_files_exist_and_are_written_for_non_developers() {
     let download_pos = readme
         .find("Download and run it")
         .expect("download section");
-    let engine_pos = readme
-        .find("Core Engine Capabilities")
-        .expect("engine section");
+    let engine_pos = readme.find("What it does").expect("engine section");
     assert!(
         download_pos < engine_pos,
         "the download guide must come before deep technical sections"
@@ -720,7 +718,7 @@ fn documentation_files_exist_and_are_written_for_non_developers() {
         "lumaglyph-windows-x86_64.zip",
         "docs/INSTALL.md",
         "docs/QUICKSTART.md",
-        "no coding needed",
+        "You do not need a GitHub account",
     ] {
         assert!(readme.contains(needle), "README must mention '{needle}'");
     }
@@ -749,7 +747,7 @@ fn gui_wires_video_transport_on_canvas_and_docs_entry_points() {
     // Documentation entry points.
     assert!(gui_src.contains("DOCS_QUICKSTART_URL"));
     assert!(gui_src.contains("Key::F1"));
-    assert!(gui_src.contains("Documentation & Support"));
+    assert!(gui_src.contains("Documentation"));
     assert!(gui_src.contains("How to Download & Install"));
 
     // New settings panels exist.
@@ -761,4 +759,63 @@ fn gui_wires_video_transport_on_canvas_and_docs_entry_points() {
     // Idle policy is consulted every frame.
     assert!(gui_src.contains("self.app_idle = (self.prefs.idle_when_unfocused && !focused)"));
     assert!(gui_src.contains("set_idle_hold"));
+}
+
+#[test]
+fn readme_opens_with_the_brand_banner() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let readme = std::fs::read_to_string(manifest_dir.join("README.md")).unwrap();
+    assert!(
+        readme.contains("assets/brand/banner.png"),
+        "README should open with the banner"
+    );
+    assert!(
+        manifest_dir.join("assets/brand/banner.png").exists(),
+        "banner asset is missing"
+    );
+    // Banner sits above the download section.
+    let banner = readme.find("assets/brand/banner.png").unwrap();
+    let download = readme.find("## Download and run it").unwrap();
+    assert!(banner < download);
+}
+
+#[test]
+fn header_telemetry_uses_fixed_columns() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let gui_src = std::fs::read_to_string(manifest_dir.join("src/gui.rs")).unwrap();
+    let theme_src = std::fs::read_to_string(manifest_dir.join("src/theme.rs")).unwrap();
+
+    // Values are drawn into pre-sized columns rather than one flowing label.
+    assert!(gui_src.contains("paint_header_stats(ui.painter(), rect, &values, &pal)"));
+    assert!(gui_src.contains("header_stats_width()"));
+    assert!(gui_src.contains("allocate_exact_size"));
+    assert!(
+        !gui_src.contains("ms ({:.0} FPS)"),
+        "old single-line telemetry is back"
+    );
+    assert!(theme_src.contains("pub const HEADER_STAT_WIDTHS"));
+}
+
+#[test]
+fn app_copy_stays_plain() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let gui_src = std::fs::read_to_string(manifest_dir.join("src/gui.rs")).unwrap();
+
+    // No parenthetical narrator lines such as the old status sentence.
+    assert!(!gui_src.contains("Current state:"));
+    assert!(gui_src.contains("Idle. The window is in the background"));
+    assert!(gui_src.contains("Running. The window has focus."));
+
+    // Marketing blurbs that read like generated copy stay out of the UI.
+    for banned in [
+        "high-throughput",
+        "ensure UI chrome",
+        "plain-language guides",
+        "workstation.",
+    ] {
+        assert!(
+            !gui_src.to_lowercase().contains(banned),
+            "UI copy should stay plain: found '{banned}'"
+        );
+    }
 }

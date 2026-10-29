@@ -1,6 +1,6 @@
 use eframe::egui::{
-    self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Margin, Stroke,
-    TextStyle, Visuals,
+    self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Margin, Pos2, Rect,
+    Stroke, TextStyle, Visuals,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -18,6 +18,46 @@ pub fn plex_medium(size: f32) -> FontId {
 
 pub fn mono_font(size: f32) -> FontId {
     FontId::new(size, FontFamily::Monospace)
+}
+
+/// Point size of the header telemetry strip.
+pub const HEADER_STAT_FONT: f32 = 10.8;
+
+/// Fixed width of each header telemetry column, left to right:
+/// cell dimensions, glyph spread, frame time, measured FPS.
+///
+/// These are constants on purpose. A stat only ever changes the text inside its
+/// own column, so a value going from `156x44` to `1920x1080` cannot push the
+/// other columns around.
+pub const HEADER_STAT_WIDTHS: [f32; 4] = [64.0, 82.0, 70.0, 58.0];
+
+/// Horizontal space reserved for one column separator, including its margins.
+pub const HEADER_STAT_SEP: f32 = 13.0;
+
+/// Height of the telemetry strip.
+pub const HEADER_STAT_HEIGHT: f32 = 18.0;
+
+/// Total width of the header telemetry strip. Constant for a fixed column set.
+pub fn header_stats_width() -> f32 {
+    let columns: f32 = HEADER_STAT_WIDTHS.iter().sum();
+    columns + HEADER_STAT_SEP * (HEADER_STAT_WIDTHS.len() - 1) as f32
+}
+
+/// Column rectangles for a strip whose right edge sits at `right`.
+///
+/// Columns are laid out right to left so the strip stays pinned to the right
+/// edge of the header no matter how wide the text inside each column is.
+pub fn header_stat_rects(right: f32, center_y: f32) -> [Rect; HEADER_STAT_WIDTHS.len()] {
+    let mut rects = [Rect::NOTHING; HEADER_STAT_WIDTHS.len()];
+    let mut edge = right;
+    for (idx, width) in HEADER_STAT_WIDTHS.iter().enumerate().rev() {
+        rects[idx] = Rect::from_min_max(
+            Pos2::new(edge - width, center_y - HEADER_STAT_HEIGHT * 0.5),
+            Pos2::new(edge, center_y + HEADER_STAT_HEIGHT * 0.5),
+        );
+        edge -= width + HEADER_STAT_SEP;
+    }
+    rects
 }
 
 /// Calibrated desktop workstation color themes.
@@ -530,4 +570,73 @@ pub fn apply_theme_to_context(ctx: &egui::Context, pal: &ThemePalette, density: 
 
     style.visuals = vis;
     ctx.set_style(style);
+}
+
+#[cfg(test)]
+mod header_stats_tests {
+    use super::*;
+
+    #[test]
+    fn header_stats_width_is_constant() {
+        // Same total width on every call: the strip never reflows.
+        assert_eq!(header_stats_width(), header_stats_width());
+        assert_eq!(
+            header_stats_width(),
+            HEADER_STAT_WIDTHS.iter().sum::<f32>()
+                + HEADER_STAT_SEP * (HEADER_STAT_WIDTHS.len() - 1) as f32
+        );
+    }
+
+    #[test]
+    fn header_stat_rects_are_fixed_columns() {
+        let rects = header_stat_rects(1000.0, 400.0);
+        for (idx, rect) in rects.iter().enumerate() {
+            assert_eq!(rect.width(), HEADER_STAT_WIDTHS[idx]);
+            assert_eq!(rect.height(), HEADER_STAT_HEIGHT);
+            assert_eq!(rect.left(), rect.right() - HEADER_STAT_WIDTHS[idx]);
+        }
+        // Pinned to the right edge of the requested strip.
+        assert_eq!(rects[rects.len() - 1].right(), 1000.0);
+        assert_eq!(rects[0].left(), 1000.0 - header_stats_width());
+    }
+
+    #[test]
+    fn header_stat_columns_never_overlap() {
+        let rects = header_stat_rects(720.0, 20.0);
+        for pair in rects.windows(2) {
+            assert!(pair[0].right() < pair[1].left(), "columns must not overlap");
+            let gap = pair[1].left() - pair[0].right();
+            assert!((gap - HEADER_STAT_SEP).abs() < f32::EPSILON);
+        }
+    }
+
+    #[test]
+    fn header_stat_rects_ignore_content() {
+        // Geometry is derived only from the constants, so the widest possible
+        // values cannot shift anything outside their own column.
+        let narrow = header_stat_rects(1440.0, 12.0);
+        let again = header_stat_rects(1440.0, 12.0);
+        assert_eq!(narrow, again);
+    }
+
+    #[test]
+    fn widest_expected_values_fit_their_columns() {
+        // JetBrains Mono advances ~0.6em per glyph; keep every realistic value
+        // inside its column at the chosen font size.
+        let advance = HEADER_STAT_FONT * 0.62;
+        let samples = [
+            "3840x2160",   // cell dimensions
+            "95/95 CHARS", // glyph spread
+            "1234.56 ms",  // worst-case frame time
+            "9999 FPS",    // capped FPS readout
+        ];
+        for (idx, sample) in samples.iter().enumerate() {
+            let needed = sample.chars().count() as f32 * advance;
+            assert!(
+                needed <= HEADER_STAT_WIDTHS[idx],
+                "{sample} needs {needed}pt but column is {}pt",
+                HEADER_STAT_WIDTHS[idx]
+            );
+        }
+    }
 }

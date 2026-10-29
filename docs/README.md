@@ -1,10 +1,9 @@
 # LumaGlyph Documentation
 
-Welcome. These guides are written for **people, not programmers** - you do not need to know
-anything about GitHub, terminals, or code to install and use LumaGlyph.
+These guides assume you don't write code. You do not need to know anything about GitHub,
+terminals, or programming to install and use LumaGlyph.
 
-If this is your first time here, read the two pages below in order. They take about 6 minutes
-total.
+If this is your first time, read these two in order. It takes about six minutes.
 
 | Start here | What it covers |
 | :--- | :--- |
@@ -21,7 +20,7 @@ Then, when you want more:
 
 ---
 
-## The 30-second version
+## Short version
 
 1. Go to **[github.com/goldggs/lumaglyph/releases/latest](https://github.com/goldggs/lumaglyph/releases/latest)**.
 2. Scroll down to the **Assets** list and click the file that matches your computer:
@@ -37,6 +36,6 @@ Done. LumaGlyph needs no installer, no account, and no internet connection to wo
 
 ## Why the downloads live on GitHub
 
-LumaGlyph is free and open source, so GitHub hosts the releases. GitHub's own page puts the
-download link far down the page, under the release notes - that is why the guides above tell you
-exactly where to look and which file to pick.
+LumaGlyph is free and open source, so the releases live on GitHub. GitHub buries the download
+links under the release notes, which is why these guides tell you exactly where to look and which
+file to pick.

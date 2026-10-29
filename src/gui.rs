@@ -7,8 +7,9 @@ use crate::export::{
 use crate::glyph_atlas::GlyphAtlas;
 use crate::telemetry::format_rss_mb;
 use crate::theme::{
-    apply_theme_to_context, install_studio_fonts, mono_font, plex_medium, resolve_palette,
-    AccentPreset, CheckerContrast, CornerStyle, StudioTheme, ThemePalette, UiDensity,
+    apply_theme_to_context, header_stat_rects, header_stats_width, install_studio_fonts, mono_font,
+    plex_medium, resolve_palette, AccentPreset, CheckerContrast, CornerStyle, StudioTheme,
+    ThemePalette, UiDensity, HEADER_STAT_FONT, HEADER_STAT_HEIGHT, HEADER_STAT_SEP,
 };
 use crate::updater::{
     format_build_report, relaunch_executable, spawn_release_check, spawn_verified_self_update,
@@ -30,6 +31,39 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::time::Instant;
+
+/// Draws the header telemetry strip into fixed-width columns.
+///
+/// Each value is right-aligned inside its own column, so a value changing length
+/// (156x44 -> 1920x1080) only moves text within that column. Nothing else on the
+/// strip shifts.
+fn paint_header_stats(
+    painter: &egui::Painter,
+    rect: Rect,
+    values: &[String; 4],
+    pal: &ThemePalette,
+) {
+    let columns = header_stat_rects(rect.right(), rect.center().y);
+    for (idx, (column, value)) in columns.iter().zip(values.iter()).enumerate() {
+        painter.text(
+            column.right_center(),
+            egui::Align2::RIGHT_CENTER,
+            value,
+            mono_font(HEADER_STAT_FONT),
+            pal.text_secondary,
+        );
+        if idx > 0 {
+            let x = column.left() - HEADER_STAT_SEP * 0.5;
+            painter.line_segment(
+                [
+                    Pos2::new(x, rect.center().y - 5.0),
+                    Pos2::new(x, rect.center().y + 5.0),
+                ],
+                Stroke::new(1.0_f32, pal.border_subtle),
+            );
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SettingsTab {
@@ -348,7 +382,7 @@ impl LumaGlyphApp {
         let _ = self.prefs.save();
         self.sync_look_code();
         self.ascii_dirty = true;
-        self.set_toast("Reset ASCII parameters to normal default");
+        self.set_toast("Reset every ASCII parameter");
     }
 
     fn reset_all_settings_to_default(&mut self) {
@@ -361,7 +395,7 @@ impl LumaGlyphApp {
         self.pan_offset = Vec2::ZERO;
         self.sync_look_code();
         self.ascii_dirty = true;
-        self.set_toast("Restored all settings and ASCII parameters to default");
+        self.set_toast("Settings and ASCII parameters are back to defaults");
     }
 
     fn set_toast(&mut self, msg: impl Into<String>) {
@@ -1079,7 +1113,7 @@ impl LumaGlyphApp {
                     "Settings"
                 };
                 if workstation_toggle(ui, &pal, self.show_settings_window, settings_lbl)
-                    .on_hover_text("Workstation Settings, Themes & Build Info (Ctrl+,)")
+                    .on_hover_text("Settings, themes and build info (Ctrl+,)")
                     .clicked()
                 {
                     self.show_settings_window = !self.show_settings_window;
@@ -1092,19 +1126,17 @@ impl LumaGlyphApp {
                     } else {
                         9999.0
                     };
-                    let metrics = format!(
-                        "{}x{}   |   {:02}/95 CHARS   |   {:.2} ms ({:.0} FPS)",
-                        self.ascii_frame.cols,
-                        self.ascii_frame.rows,
-                        self.ascii_frame.unique_glyphs,
-                        self.ascii_frame.render_ms,
-                        fps_est,
+                    let values = [
+                        format!("{}x{}", self.ascii_frame.cols, self.ascii_frame.rows),
+                        format!("{:02}/95 CHARS", self.ascii_frame.unique_glyphs),
+                        format!("{:.2} ms", self.ascii_frame.render_ms),
+                        format!("{:.0} FPS", fps_est),
+                    ];
+                    let (rect, _) = ui.allocate_exact_size(
+                        Vec2::new(header_stats_width(), HEADER_STAT_HEIGHT),
+                        Sense::hover(),
                     );
-                    ui.label(
-                        RichText::new(metrics)
-                            .font(mono_font(10.8))
-                            .color(pal.text_secondary),
-                    );
+                    paint_header_stats(ui.painter(), rect, &values, &pal);
                 }
             });
         });
@@ -1133,7 +1165,7 @@ impl LumaGlyphApp {
             ui.separator();
 
             if workstation_toggle(ui, &pal, self.params.oled_black, "OLED #000000")
-                .on_hover_text("True #000000 pitch-black canvas (Key: B)")
+                .on_hover_text("True #000000 black canvas (B)")
                 .clicked()
             {
                 self.params.oled_black = !self.params.oled_black;
@@ -1144,7 +1176,7 @@ impl LumaGlyphApp {
             }
 
             if workstation_toggle(ui, &pal, self.params.transparent_bg, "Alpha RGBA")
-                .on_hover_text("Transparent RGBA [0,0,0,0] background cutout")
+                .on_hover_text("Transparent background")
                 .clicked()
             {
                 self.params.transparent_bg = !self.params.transparent_bg;
@@ -1155,7 +1187,7 @@ impl LumaGlyphApp {
             }
 
             if workstation_toggle(ui, &pal, self.params.wireframe_only, "Wireframe")
-                .on_hover_text("Contour-only edge extraction (Key: N)")
+                .on_hover_text("Contours only, no fill (N)")
                 .clicked()
             {
                 self.params.wireframe_only = !self.params.wireframe_only;
@@ -1171,7 +1203,7 @@ impl LumaGlyphApp {
 
             if ui
                 .button("Reset to Default")
-                .on_hover_text("Reset all ASCII parameters to normal default (Ctrl+Shift+R)")
+                .on_hover_text("Reset every ASCII parameter (Ctrl+Shift+R)")
                 .clicked()
             {
                 self.reset_ascii_to_default();
@@ -1180,7 +1212,7 @@ impl LumaGlyphApp {
             // Right side: viewport zoom presets + Zen mode
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if workstation_toggle(ui, &pal, self.zen_mode, "Zen")
-                    .on_hover_text("Hide inspector and status bars (Key: Tab)")
+                    .on_hover_text("Hide the inspector and status bars (Tab)")
                     .clicked()
                 {
                     self.zen_mode = !self.zen_mode;
@@ -1276,7 +1308,7 @@ impl LumaGlyphApp {
                 pal.text_secondary,
             );
             if r_resp
-                .on_hover_text("Reset all ASCII parameters to normal default (Ctrl+Shift+R)")
+                .on_hover_text("Reset every ASCII parameter (Ctrl+Shift+R)")
                 .clicked()
             {
                 self.reset_ascii_to_default();
@@ -2224,13 +2256,15 @@ impl LumaGlyphApp {
         // ---- Jump back / forward 5 seconds ----
         // Two clean, non-overlapping chevrons per button, mirrored around the button centre.
         let mut jump: Option<f64> = None;
-        let tri_w = 4.0_f32;
-        let tri_h = 5.5_f32;
+        // Chevrons read as two strokes, not tall spikes: keep them wider than tall
+        // and size the hit box to match the play button.
+        let tri_w = 5.0_f32;
+        let tri_h = 4.2_f32;
         for (idx, delta) in [-5.0f64, 5.0].into_iter().enumerate() {
             let is_back = delta < 0.0;
             let btn = Rect::from_center_size(
-                Pos2::new(bar.left() + 48.0 + idx as f32 * 24.0, cy),
-                Vec2::new(22.0, 26.0),
+                Pos2::new(bar.left() + 49.0 + idx as f32 * 26.0, cy),
+                Vec2::splat(24.0),
             );
             let resp = ui
                 .interact(btn, ui.id().with(("video_jump", idx)), Sense::click())
@@ -2245,7 +2279,7 @@ impl LumaGlyphApp {
             }
             // Two chevrons, each `tri_w` wide with `gap` between them, mirrored so the pair is
             // optically centred in the button and never overlaps itself.
-            let gap = 1.0_f32;
+            let gap = 1.6_f32;
             let span = 2.0 * tri_w + gap;
             for i in 0..2 {
                 let shift = i as f32 * (tri_w + gap);
@@ -2570,7 +2604,7 @@ impl LumaGlyphApp {
                                             egui::Button::new("Reset to Default"),
                                         )
                                         .on_hover_text(
-                                            "Reset all ASCII parameters and startup defaults to normal (Ctrl+Shift+R)",
+                                            "Reset every ASCII parameter and startup default (Ctrl+Shift+R)",
                                         )
                                         .clicked()
                                     {
@@ -2638,7 +2672,7 @@ impl LumaGlyphApp {
                 .color(pal.text_primary),
         );
         ui.label(
-            RichText::new("Neutral calibrated surfaces ensure UI chrome never competes with canvas color grading.")
+            RichText::new("Muted greys, so the interface stays out of the way of the picture.")
                 .size(11.3)
                 .color(pal.text_muted),
         );
@@ -2779,19 +2813,19 @@ impl LumaGlyphApp {
         changed |= ui
             .checkbox(
                 &mut self.prefs.show_cell_hud,
-                "Show hover cell inspector readout on canvas",
+                "Show the cell inspector on hover",
             )
             .changed();
         changed |= ui
             .checkbox(
                 &mut self.prefs.show_canvas_border,
-                "Draw 1 px frame hairline around active canvas",
+                "Draw a hairline around the canvas",
             )
             .changed();
         changed |= ui
             .checkbox(
                 &mut self.prefs.show_status_bar,
-                "Show bottom media transport & status strip",
+                "Show the transport strip and status bar",
             )
             .changed();
 
@@ -2805,7 +2839,7 @@ impl LumaGlyphApp {
         let mut changed = false;
 
         ui.label(
-            RichText::new("Engine Calibration & Startup Defaults")
+            RichText::new("Startup defaults")
                 .font(plex_medium(13.0))
                 .color(pal.text_primary),
         );
@@ -2860,7 +2894,7 @@ impl LumaGlyphApp {
 
         ui.separator();
         ui.label(
-            RichText::new("8D Glyph Atlas Raster Resolution")
+            RichText::new("Glyph raster resolution")
                 .font(plex_medium(12.2))
                 .color(pal.text_primary),
         );
@@ -2901,14 +2935,16 @@ impl LumaGlyphApp {
         ui.horizontal(|ui| {
             if ui
                 .button("Reset ASCII Parameters to Normal Default")
-                .on_hover_text("Resets all color, contrast, edge, and effect controls back to normal default")
+                .on_hover_text(
+                    "Puts every color, contrast, edge and effect control back to default",
+                )
                 .clicked()
             {
                 self.reset_ascii_to_default();
             }
             if ui
                 .button("Restore All Settings to Default")
-                .on_hover_text("Resets both workstation preferences and all ASCII parameters to factory default")
+                .on_hover_text("Puts the preferences and every ASCII parameter back to default")
                 .clicked()
             {
                 self.reset_all_settings_to_default();
@@ -2926,13 +2962,13 @@ impl LumaGlyphApp {
         let mut needs_restart = false;
 
         ui.label(
-            RichText::new("Frame Rate & Presentation")
+            RichText::new("Frame rate")
                 .font(plex_medium(13.0))
                 .color(pal.text_primary),
         );
         ui.label(
             RichText::new(
-                "Caps how often the workstation redraws. Video decode stays source-timed.",
+                "Caps how often the window redraws. Video still decodes at its own rate.",
             )
             .size(11.4)
             .color(pal.text_secondary),
@@ -2987,7 +3023,7 @@ impl LumaGlyphApp {
         });
 
         ui.label(
-            RichText::new("Canvas Raster Supersampling")
+            RichText::new("Supersampling")
                 .size(11.5)
                 .color(pal.text_secondary),
         );
@@ -3041,7 +3077,7 @@ impl LumaGlyphApp {
 
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new("Multisample Anti-Aliasing")
+                RichText::new("Anti-aliasing (MSAA)")
                     .size(11.5)
                     .color(pal.text_secondary),
             );
@@ -3089,22 +3125,20 @@ impl LumaGlyphApp {
         let mut reopen_video = false;
 
         ui.label(
-            RichText::new("Background & Focus Idling")
+            RichText::new("Background and focus")
                 .font(plex_medium(13.0))
                 .color(pal.text_primary),
         );
         ui.label(
-            RichText::new(
-                "When LumaGlyph is not the active window it can stop drawing and decoding entirely.",
-            )
-            .size(11.4)
-            .color(pal.text_secondary),
+            RichText::new("In the background LumaGlyph can stop drawing and decoding altogether.")
+                .size(11.4)
+                .color(pal.text_secondary),
         );
 
         if ui
             .checkbox(
                 &mut self.prefs.idle_when_unfocused,
-                "Go idle when the window loses focus (zero repaints while you work elsewhere)",
+                "Stop drawing when the window loses focus",
             )
             .changed()
         {
@@ -3140,9 +3174,9 @@ impl LumaGlyphApp {
 
         ui.label(
             RichText::new(if self.app_idle {
-                "Current state: IDLE (backgrounded - repaints paused)"
+                "Idle. The window is in the background, so redraws are paused."
             } else {
-                "Current state: ACTIVE (focused - full frame rate)"
+                "Running. The window has focus."
             })
             .font(mono_font(10.6))
             .color(if self.app_idle {
@@ -3155,13 +3189,13 @@ impl LumaGlyphApp {
         ui.separator();
 
         ui.label(
-            RichText::new("Compute & Threading")
+            RichText::new("Threads")
                 .font(plex_medium(12.4))
                 .color(pal.text_primary),
         );
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new("ASCII Engine Worker Threads")
+                RichText::new("Worker threads")
                     .size(11.5)
                     .color(pal.text_secondary),
             );
@@ -3203,7 +3237,7 @@ impl LumaGlyphApp {
         ui.separator();
 
         ui.label(
-            RichText::new("Video Decode Budget")
+            RichText::new("Video decode")
                 .font(plex_medium(12.4))
                 .color(pal.text_primary),
         );
@@ -3229,10 +3263,7 @@ impl LumaGlyphApp {
             }
         });
         if ui
-            .checkbox(
-                &mut self.prefs.audio_envelope_enabled,
-                "Analyze audio beat envelope (audio-reactive grading)",
-            )
+            .checkbox(&mut self.prefs.audio_envelope_enabled, "React to the audio")
             .changed()
         {
             changed = true;
@@ -3256,13 +3287,13 @@ impl LumaGlyphApp {
         let mut changed = false;
 
         ui.label(
-            RichText::new("Raster & Streaming Video Pipeline")
+            RichText::new("Video pipeline")
                 .font(plex_medium(13.0))
                 .color(pal.text_primary),
         );
 
         ui.label(
-            RichText::new("PNG Export Scale")
+            RichText::new("PNG export scale")
                 .size(11.5)
                 .color(pal.text_secondary),
         );
@@ -3287,19 +3318,19 @@ impl LumaGlyphApp {
             changed = true;
         }
         ui.label(
-            RichText::new("Lower CRF preserves sharper character edges in MP4 exports (14 = studio master, 18 = high quality, 24 = compact).")
+            RichText::new("Lower CRF keeps character edges sharper. 14 is master quality, 18 is high, 24 is small.")
                 .size(11.0)
                 .color(pal.text_muted),
         );
 
         ui.separator();
         ui.label(
-            RichText::new("FFmpeg / FFprobe Binary Directory (Optional)")
+            RichText::new("ffmpeg / ffprobe folder (optional)")
                 .font(plex_medium(12.2))
                 .color(pal.text_primary),
         );
         ui.label(
-            RichText::new("Leave blank to auto-detect alongside executable or system PATH.")
+            RichText::new("Leave empty to look next to the app, then on PATH.")
                 .size(11.0)
                 .color(pal.text_muted),
         );
@@ -3344,7 +3375,7 @@ impl LumaGlyphApp {
     fn draw_settings_shortcuts(&mut self, ui: &mut egui::Ui) {
         let pal = self.palette;
         ui.label(
-            RichText::new("Keyboard & Viewport Controls")
+            RichText::new("Shortcuts")
                 .font(plex_medium(13.0))
                 .color(pal.text_primary),
         );
@@ -3358,31 +3389,22 @@ impl LumaGlyphApp {
                 "Ctrl + Shift + R",
                 "Reset all ASCII parameters to normal default",
             ),
-            ("Ctrl + S", "Quick export PNG at configured DPI scale"),
-            (
-                "Ctrl + Shift + C",
-                "Copy one-line lg2: Look Code to clipboard",
-            ),
+            ("Ctrl + S", "Export a PNG at the configured scale"),
+            ("Ctrl + Shift + C", "Copy the one-line lg2: Look Code"),
             ("Ctrl + ,", "Open or close Workstation Settings"),
             ("F1", "Open the LumaGlyph documentation"),
             (
                 "Left / Right Arrow",
                 "Seek the loaded video back / forward 5 seconds",
             ),
-            (
-                "Tab",
-                "Toggle Zen Canvas Mode (hide side dock & status bar)",
-            ),
+            ("Tab", "Zen mode: hide the side dock and status bar"),
             ("Space", "Play / pause loaded video file"),
             ("B", "Toggle True OLED #000000 pitch-black canvas"),
             ("N", "Toggle Neon Wireframe contour-only mode"),
-            ("[  /  ]", "Decrease / increase grid columns by 8"),
-            ("0 / 1 / 2 / 3", "Zoom to Fit / 100% / 200% / 350% Loupe"),
+            ("[  /  ]", "Change grid columns by 8"),
+            ("0 / 1 / 2 / 3", "Zoom to fit, 100%, 200%, 350%"),
             ("Mouse Wheel", "Smooth zoom around viewport"),
-            (
-                "Double-Click Label",
-                "Reset individual grading fader to default",
-            ),
+            ("Double-Click Label", "Reset this slider"),
         ];
 
         Frame::new()
@@ -3443,9 +3465,11 @@ impl LumaGlyphApp {
             });
         });
         ui.label(
-            RichText::new("High-throughput 95-character 8D shape-vector ASCII imaging and streaming video workstation.")
-                .size(11.4)
-                .color(pal.text_secondary),
+            RichText::new(
+                "Turns images and video into ASCII art with 95 characters. Runs offline.",
+            )
+            .size(11.4)
+            .color(pal.text_secondary),
         );
 
         Frame::new()
@@ -3498,12 +3522,12 @@ impl LumaGlyphApp {
 
         ui.separator();
         ui.label(
-            RichText::new("Documentation & Support")
+            RichText::new("Documentation")
                 .font(plex_medium(12.2))
                 .color(pal.text_primary),
         );
         ui.label(
-            RichText::new("Plain-language guides written for people who have never used GitHub.")
+            RichText::new("Guides for people who have never used GitHub.")
                 .size(11.4)
                 .color(pal.text_secondary),
         );
@@ -3531,7 +3555,7 @@ impl LumaGlyphApp {
 
         ui.separator();
         ui.label(
-            RichText::new("Network Policy & GitHub Release Checks")
+            RichText::new("Network")
                 .font(plex_medium(12.2))
                 .color(pal.text_primary),
         );

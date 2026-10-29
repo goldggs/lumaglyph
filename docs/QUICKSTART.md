@@ -1,4 +1,4 @@
-# Quick Start - your first 5 minutes
+# Quick start
 
 This page assumes LumaGlyph is already installed. If it is not, see
 **[How to Download & Install](INSTALL.md)** first.
@@ -24,10 +24,9 @@ You can also **drag and drop** an image, a video, or a `.ttf` font file anywhere
 
 ## 2. Watch your image turn into ASCII art
 
-As soon as the file loads, LumaGlyph calibrates the font, breaks your image into a grid of
-characters, and picks the character whose actual shape best matches each patch of the picture. You
-are not looking at a 10-character brightness ramp - every printable ASCII character from `!` to `~`
-is used as geometry, so curves, edges, and diagonals get characters that genuinely point the right
+As soon as the file loads, LumaGlyph splits the picture into a grid and picks the character whose
+shape best matches each patch. It is not a ten-character brightness ramp: every printable character
+from `!` to `~` is treated as a shape, so curves and diagonals get characters that point the right
 way.
 
 Things to try right away:
@@ -46,8 +45,8 @@ Things to try right away:
 The **Inspector** panel on the left holds the grading controls: brightness, contrast, saturation,
 gamma, edge weight, dithering, character set, color mode, and the effects toggles.
 
-If you ever push things too far and want the clean, normal look back, press **Ctrl + Shift + R**
-(or click **Reset to Default** in the Settings window). That restores every ASCII parameter at once.
+If you push things too far, press **Ctrl + Shift + R** (or click **Reset to Default** in Settings)
+to put every ASCII parameter back at once.
 
 ---
 
@@ -89,8 +88,8 @@ Open **Settings** (`Ctrl + ,`) and look at the tabs:
 - **Appearance** - theme, accent color, interface density, corner rounding.
 - **Engine & Defaults** - what a new file starts with: columns, charset, color mode, glyph size.
 - **Rendering & Quality** - frame rate cap, VSync, anti-aliasing, texture filtering, supersampling.
-- **Optimisations** - idle when unfocused so it costs nothing in the background, worker threads,
-  preview decode resolution, audio analysis.
+- **Optimisations** - idle when unfocused, worker threads, preview decode resolution, audio
+  analysis.
 - **Export & Video** - PNG scale, video quality, custom ffmpeg location.
 - **Shortcuts** - the full key map.
 - **About & Build** - version, build info, update check, documentation links.

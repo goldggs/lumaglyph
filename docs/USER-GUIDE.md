@@ -1,8 +1,8 @@
 # LumaGlyph User Guide
 
-Everything in the app, one page at a time. No prior knowledge assumed.
+Every panel, tab and shortcut, one page at a time.
 
-- [1. The window at a glance](#1-the-window-at-a-glance)
+- [1. The window](#1-the-window)
 - [2. Opening files](#2-opening-files)
 - [3. The canvas](#3-the-canvas)
 - [4. The Inspector](#4-the-inspector)
@@ -15,11 +15,10 @@ Everything in the app, one page at a time. No prior knowledge assumed.
 
 ---
 
-## 1. The window at a glance
+## 1. The window
 
-LumaGlyph opens **empty** on purpose: a slim menu bar, a calm dark canvas, a few recessed key
-hints, and a status strip at the bottom. Nothing is loaded, nothing is rendered, nothing is
-downloaded.
+LumaGlyph opens empty on purpose: a slim menu bar, a dark canvas, a few dimmed key hints, and a
+status strip along the bottom. Nothing is loaded until you open a file.
 
 As soon as you open media, the **Command Strip** (a toolbar) and the **Inspector** (grading panel)
 appear. You can hide the Inspector again with `Ctrl + B`, and hide all the chrome with `Tab`
@@ -62,8 +61,8 @@ images, and `Settings > Export & Video` lets you point at a custom ffmpeg folder
 | Neon wireframe (edges only) | `N` |
 | More / fewer columns | `[` and `]` |
 
-The canvas draws only when something changes, so a still image costs essentially nothing while you
-look at it.
+The canvas only redraws when something changes, so a still image costs nothing while you look at
+it.
 
 ---
 
@@ -102,7 +101,7 @@ default you can return to by double-clicking its label.
 
 **Effects**
 
-- **CRT Bloom**, **Scanlines**, **Invert**, **Audio Reactive** - stylistic finishing options.
+- **CRT Bloom**, **Scanlines**, **Invert**, **Audio Reactive**: finishing options.
 
 **Look Code**
 
@@ -113,8 +112,7 @@ A single text field that encodes every setting above into one short `lg2:` line.
 
 ## 5. Video playback and frame export
 
-Video controls live in a **docked strip directly beneath the video**, so they never cover the
-picture:
+Video controls sit in a strip under the video, not on top of it:
 
 | Control | What it does |
 | :--- | :--- |
@@ -134,8 +132,8 @@ picture:
 Frame export always targets the frame on the timeline, so you can pause anywhere - or scrub while
 paused - and grab exactly that frame.
 
-Scrubbing is instant even in long files because LumaGlyph re-seeks the decoder instead of decoding
-from the beginning.
+Scrubbing stays instant in long files because the decoder re-seeks instead of decoding from the
+start.
 
 ![Video transport strip beneath the video](screenshots/v037-video-transport.png)
 
