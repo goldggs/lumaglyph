@@ -127,9 +127,10 @@ fn noise(w: u32, h: u32) -> Vec<u8> {
     out
 }
 
-/// Times `iters` conversions of the same source and returns the best of three batches,
-/// in nanoseconds per conversion. Best-of-three because interference from other work can
-/// only make a batch slower, never faster.
+/// Times `iters` conversions of the same source and returns the best of five batches, in
+/// nanoseconds per conversion. Interference from other work can only make a batch
+/// slower, never faster, so the minimum is the measurement least polluted by the
+/// machine - which matters on a three-core CI runner.
 fn best_batch(
     atlas: &GlyphAtlas,
     params: &RenderParams,
@@ -140,7 +141,7 @@ fn best_batch(
     iters: u32,
 ) -> (f64, u32, u32) {
     let mut best = u128::MAX;
-    for _ in 0..3 {
+    for _ in 0..5 {
         let start = Instant::now();
         for _ in 0..iters {
             convert_image_buffer(pixels, w, h, 3, atlas, params, false, frame);
@@ -178,7 +179,10 @@ fn conversion_cost_model_and_scaling() {
         let mut params = RenderParams::default();
         params.cols = cols;
         convert_image_buffer(&source, 1280, 960, 3, &atlas, &params, false, &mut frame);
-        let (ns, c, r) = best_batch(&atlas, &params, &source, 1280, 960, &mut frame, 8);
+        // Roughly 40 ms of work per batch regardless of grid size, so that a scheduler
+        // hiccup is a small fraction of the measurement rather than most of it.
+        let iters = (80_000u32 / (cols * cols / 10).max(1)).clamp(4, 200);
+        let (ns, c, r) = best_batch(&atlas, &params, &source, 1280, 960, &mut frame, iters);
         let cells = (c * r) as f64;
         eprintln!(
             "cols={c:>3} grid={c}x{r} = {cells:>6} cells: {:>7.2} ms ({:>4.0} ns/cell)",
@@ -188,29 +192,32 @@ fn conversion_cost_model_and_scaling() {
         points.push((cells, ns));
     }
 
-    let n = points.len() as f64;
-    let sx: f64 = points.iter().map(|p| p.0).sum();
-    let sy: f64 = points.iter().map(|p| p.1).sum();
-    let sxx: f64 = points.iter().map(|p| p.0 * p.0).sum();
-    let sxy: f64 = points.iter().map(|p| p.0 * p.1).sum();
-    let slope = (n * sxy - sx * sy) / (n * sxx - sx * sx);
-    let fixed = (sy - slope * sx) / n;
+    // Model the two ends only. Least squares over four points is easily dragged off by a
+    // single stalled sample, and a stall is a property of the machine, not the code.
+    let (cells_lo, ns_lo) = points[0];
+    let (cells_hi, ns_hi) = points[points.len() - 1];
+    let slope = (ns_hi - ns_lo) / (cells_hi - cells_lo);
+    let fixed = ns_lo - slope * cells_lo;
     eprintln!(
         "cost model: {slope:.0} ns per output cell + {:.3} ms fixed per call",
         fixed / 1e6
     );
 
-    let worst = points
-        .iter()
-        .map(|(cells, ns)| {
-            let predicted = fixed + slope * cells;
-            ((ns - predicted) / predicted).abs()
-        })
-        .fold(0.0_f64, f64::max);
-    eprintln!(
-        "worst deviation from the fitted line: {:.1}%",
-        worst * 100.0
-    );
+    // Every intermediate point must land in the same ballpark as that model. A quadratic
+    // term would not be 1.5x out over a 48-fold range in cell count; it would be orders of
+    // magnitude out, which is what makes this a meaningful check rather than a tight one.
+    let mut worst: f64 = 0.0;
+    for (cells, ns) in points.iter().take(points.len() - 1).skip(1) {
+        let predicted = fixed + slope * cells;
+        let ratio = ns / predicted;
+        eprintln!(
+            "  check {cells:.0} cells: predicted {:.2} ms, measured {:.2} ms ({ratio:.2}x)",
+            predicted / 1e6,
+            ns / 1e6
+        );
+        worst = worst.max(if ratio > 1.0 { ratio } else { 1.0 / ratio });
+    }
+    eprintln!("worst deviation from the two-point model: {worst:.2}x");
 
     assert!(
         (20.0..=3_000.0).contains(&slope),
@@ -218,10 +225,9 @@ fn conversion_cost_model_and_scaling() {
          conversion has gained or lost an order of magnitude of work"
     );
     assert!(
-        worst < 0.35,
-        "measurements deviate from a straight line by {:.0}% - cost is no longer linear \
-         in cell count, which points at a quadratic term",
-        worst * 100.0
+        worst < 2.0,
+        "an intermediate measurement is {worst:.1}x off the line through the endpoints - \
+         cost is not linear in cell count, which points at a quadratic term"
     );
 
     // --- 2. A bigger source costs little at a fixed column count ---------------

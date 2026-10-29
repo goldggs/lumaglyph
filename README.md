@@ -214,6 +214,24 @@ repo is MIT and builds with one command.
 
 ## Changelog
 
+### v0.4.4
+
+The performance guard, third attempt. It is now stable.
+
+- The first version asserted a constant cost per output cell, which is untrue: a fixed
+  per-call overhead dominates at small column counts. The second fitted a least-squares
+  line through four points with a tight curvature bound, which one stalled sample on a
+  three-core macOS runner was enough to break.
+- It now fits the line through the two endpoints - a 48-fold range in cell count - and
+  requires every intermediate measurement to land within 2x of it. That still catches a
+  quadratic term (which would be out by orders of magnitude over that range) while
+  tolerating a stall. Repeated local runs agree to within 11%.
+- Batches are sized to about 40 ms of work each regardless of grid size, and the best of
+  five is used, so a hiccup is diluted instead of amplified.
+
+The measured curve and all three attempts are written up in
+[docs/TESTING.md](docs/TESTING.md#performance-guards).
+
 ### v0.4.3
 
 Writing the CLI tests found a real usability bug, and the CI run that exposed it found

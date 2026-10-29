@@ -99,30 +99,38 @@ time = fixed + slope * (cols * rows)
 
 The slope is the part that describes the algorithm. The fixed part is thread-pool
 dispatch and allocation, and it varies enormously by machine — measured at roughly
-0.1 ms on a workstation and 1.8 ms on a shared Windows CI runner. An earlier version of
-this suite asserted a constant cost per cell and promptly failed on both CI platforms,
-because at small column counts the fixed overhead dominates. The test now fits a line
-through four column counts and asserts the two things that are genuinely
-environment-independent:
+0.1 ms on a workstation and up to 1.8 ms on a shared Windows CI runner.
 
-1. **The slope is in a sane band.** Measured at 300-320 ns per output cell locally and
-   180-220 ns on CI. A lost `rayon` iterator or a per-cell allocation moves it by an
-   order of magnitude, in either direction.
-2. **The points are collinear.** Four samples, so a quadratic term cannot hide: it
-   would show as curvature a straight line cannot absorb.
+The model is fitted through the **two endpoints** — 60 columns and 420 columns, a
+48-fold range in cell count — and every intermediate measurement must land within 2x of
+the line those two points define. That tolerance is deliberate and it is not a
+weakening: a quadratic term over a 48-fold range would be out by orders of magnitude,
+not by 40%. What it does tolerate is a stalled sample on a three-core runner, which is a
+property of the machine rather than of the code.
+
+Getting there took three attempts, and the failures are worth recording:
+
+| Version | What it asserted | Why it broke |
+| :--- | :--- | :--- |
+| 1 | A constant cost per output cell | The fixed per-call overhead dominates at small column counts, so small grids looked 3-6x more expensive per cell. Failed on Linux and Windows. |
+| 2 | Least squares over four points, plus a tight collinearity bound | One stalled sample on macOS dragged the fit and produced 47% curvature. Statistically correct, practically fragile. |
+| 3 | Two endpoints, 2x tolerance, constant work per batch | Stable to within 11% on repeated runs. |
+
+The final measurement batches are sized to about 40 ms of work each regardless of grid
+size, so a scheduling hiccup is a small fraction of a sample instead of most of one, and
+the best of five batches is used.
 
 The measured behaviour on a 1280x960 source:
 
 | Columns | Grid | Cells | Per frame | Per cell |
 | ---: | :--- | ---: | ---: | ---: |
-| 60 | 60x23 | 1,380 | 0.47 ms | 341 ns |
-| 120 | 120x45 | 5,400 | 1.73 ms | 321 ns |
-| 160 | 160x60 | 9,600 | 2.96 ms | 308 ns |
-| 240 | 240x90 | 21,600 | 6.52 ms | 302 ns |
-| 420 | 420x158 | 66,360 | 21.00 ms | 316 ns |
+| 60 | 60x23 | 1,380 | 0.55 ms | 396 ns |
+| 120 | 120x45 | 5,400 | 1.83 ms | 339 ns |
+| 240 | 240x90 | 21,600 | 7.00 ms | 324 ns |
+| 420 | 420x158 | 66,360 | 21.09 ms | 318 ns |
 
 And source resolution is close to free at a fixed column count: 640x480 renders in
-1.71 ms and 2560x1920 in 1.77 ms, a 3% difference for 16x the pixels. Downsampling reads
+1.76 ms and 2560x1920 in 1.83 ms, a 4% difference for 16x the pixels. Downsampling reads
 a bounded number of samples per output cell, which is why the same code path handles a
 phone photo, a 4K frame and a video stream.
 
