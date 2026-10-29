@@ -780,6 +780,47 @@ fn readme_opens_with_the_brand_banner() {
 }
 
 #[test]
+fn readme_discloses_ai_authorship_at_the_very_top() {
+    // The project is built with AI and says so before anything else. This test exists so
+    // the disclosure cannot drift down the page or quietly disappear as the README grows,
+    // which is exactly what happens to an honest note that nothing enforces.
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let readme = std::fs::read_to_string(manifest_dir.join("README.md")).unwrap();
+
+    let disclosure = readme
+        .find("built with AI")
+        .expect("README must state that the project is built with AI");
+    assert!(
+        disclosure < 400,
+        "the AI disclosure is {disclosure} bytes into the README; it belongs at the top"
+    );
+
+    // It must come before the banner and before any marketing.
+    let banner = readme.find("assets/brand/banner.png").unwrap();
+    assert!(
+        disclosure < banner,
+        "the AI disclosure must precede the banner"
+    );
+
+    // And it must not soften the claim into something an AI merely assisted with.
+    let opening = &readme[..600];
+    assert!(
+        opening.contains("all of it"),
+        "the disclosure reads as partial involvement; the project states plainly that it is all AI"
+    );
+    assert!(
+        opening.contains("written by an AI assistant"),
+        "the disclosure should say who wrote the code"
+    );
+    // A disclosure is not useful if it reads as a disclaimer with no way to verify
+    // anything, so it points at what can be checked.
+    assert!(
+        opening.contains("test suite") || opening.contains("source is here"),
+        "the disclosure should say how the project can be judged"
+    );
+}
+
+#[test]
 fn header_telemetry_uses_fixed_columns() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let gui_src = std::fs::read_to_string(manifest_dir.join("src/gui.rs")).unwrap();

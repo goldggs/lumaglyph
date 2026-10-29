@@ -17,7 +17,7 @@ Counted from `cargo test -- --list`. Regenerate with `./scripts/test_inventory.s
 | `look_export_and_cli_matrix` | 11 | 123 |
 | `remote_update_security` | 33 | 243 |
 | `security_and_provenance_audit` | 25 | 25 |
-| `themes_prefs_and_binary_audit` | 28 | 114 |
+| `themes_prefs_and_binary_audit` | 29 | 115 |
 | `video_and_cli_e2e` | 6 | 6 |
-| **total** | **365** | **1516** |
+| **total** | **366** | **1517** |
 
