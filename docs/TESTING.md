@@ -156,6 +156,14 @@ than the code. Both are described in [Performance guards](#performance-guards) a
 below, because a test suite whose portability bugs are hidden is a test suite you
 cannot trust on three platforms.
 
+Two usability bugs were found by running the CLI as a subprocess rather than as a
+library, which is the whole reason that suite exists:
+
+| Symptom | Cause | Fix |
+| :--- | :--- | :--- |
+| `lumaglyph myphoto.pgn` (typo) opened a window on a file that did not exist; an unknown command did the same | The optional positional file argument swallowed any unrecognised word | The path is checked before the window is created, and a missing file exits with a message |
+| A test hung for an hour on a headless macOS runner | Once the above was fixed, a *test harness* bug: the child's output was read only after it exited, so a large ANSI dump filled the pipe buffer and blocked it | Both pipes are drained on their own threads, and every invocation has a 60-second deadline |
+
 Two smaller correctness issues were also found and fixed:
 
 - `--color <typo>` used to be accepted silently and fall back to the default palette,

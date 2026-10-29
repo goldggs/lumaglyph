@@ -274,12 +274,30 @@ pub fn parse_tritone_arg(spec: &str) -> Result<TriTonePalette, String> {
     }
 }
 
+/// Rejects a positional file argument that does not exist.
+///
+/// Without this, `lumaglyph some-typo` is parsed as a *file path* rather than an
+/// unknown subcommand, and the app dutifully opens the workstation on a file that is
+/// not there. That is a bad enough experience on a desktop (a window appears and does
+/// nothing); in a headless environment it hangs forever, because there is no window
+/// server to fail against. Failing before the window is created fixes both.
+fn reject_missing_media(path: Option<PathBuf>) -> Result<Option<PathBuf>, String> {
+    match path {
+        Some(path) if !path.exists() => Err(format!(
+            "no such file: {}\n\
+             If you meant a different file, check the path. Run `lumaglyph --help` for the list of commands.",
+            path.display()
+        )),
+        other => Ok(other),
+    }
+}
+
 pub fn run_entry() -> Result<(), String> {
     let cli = Cli::parse();
 
     match cli.command {
         None => launch_gui(GuiBootOptions {
-            initial_media: cli.file,
+            initial_media: reject_missing_media(cli.file)?,
             ..GuiBootOptions::default()
         }),
         Some(Commands::Studio {
@@ -357,7 +375,7 @@ pub fn run_entry() -> Result<(), String> {
                 .and_then(|s| SettingsTab::from_cli(s).or(Some(SettingsTab::Appearance)));
 
             launch_gui(GuiBootOptions {
-                initial_media: file,
+                initial_media: reject_missing_media(file)?,
                 initial_params: Some(params),
                 theme_override,
                 open_settings_tab,

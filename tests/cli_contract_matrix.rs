@@ -28,11 +28,65 @@ fn binary() -> PathBuf {
     })
 }
 
+/// Runs the binary and fails the test if it does not exit within `CLI_TIMEOUT`.
+///
+/// `Command::output()` waits forever, which is how a CLI test that accidentally
+/// launched the workstation window hung a CI job for an hour. Every invocation now has
+/// a hard deadline.
+///
+/// Both pipes are drained on their own threads rather than after the process exits: an
+/// ANSI dump to stdout is several hundred kilobytes and would fill the pipe buffer,
+/// blocking the child forever while the test waits for it to exit. That deadlock is
+/// another way to hang CI, and it is not hypothetical - it happened while writing this
+/// helper.
 fn run(args: &[&str]) -> Output {
-    Command::new(binary())
+    use std::io::Read;
+
+    const CLI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+    let mut child = Command::new(binary())
         .args(args)
-        .output()
-        .unwrap_or_else(|e| panic!("failed to run {}: {e}", binary().display()))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to run {}: {e}", binary().display()));
+
+    let mut stdout_pipe = child.stdout.take().expect("piped stdout");
+    let mut stderr_pipe = child.stderr.take().expect("piped stderr");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        stdout_pipe.read_to_end(&mut buf).ok();
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        stderr_pipe.read_to_end(&mut buf).ok();
+        buf
+    });
+
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait().expect("poll the child process") {
+            Some(status) => break status,
+            None if start.elapsed() > CLI_TIMEOUT => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "`lumaglyph {}` did not exit within {}s. It almost certainly opened \
+                     the GUI window, which must never happen for a CLI invocation.",
+                    args.join(" "),
+                    CLI_TIMEOUT.as_secs()
+                );
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(25)),
+        }
+    };
+
+    Output {
+        status,
+        stdout: stdout_reader.join().expect("stdout reader"),
+        stderr: stderr_reader.join().expect("stderr reader"),
+    }
 }
 
 fn stdout_of(out: &Output) -> String {
@@ -161,6 +215,29 @@ fn unknown_subcommand_fails_with_a_message() {
     assert!(
         !err.contains("panicked"),
         "unknown command panicked instead of erroring"
+    );
+}
+
+#[test]
+fn a_missing_file_argument_never_opens_the_window() {
+    // `lumaglyph some-typo` used to be parsed as a *file path*, not an unknown
+    // subcommand, so the app opened the workstation on a file that did not exist. On a
+    // headless runner it never returned. It must now fail immediately instead.
+    let started = std::time::Instant::now();
+    let out = run(&["definitely-not-a-command"]);
+    let elapsed = started.elapsed();
+    assert!(
+        !out.status.success(),
+        "a nonexistent file argument should exit non-zero"
+    );
+    let err = stderr_of(&out);
+    assert!(
+        err.to_lowercase().contains("no such file"),
+        "unhelpful message for a nonexistent file: {err}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "took {elapsed:?} to reject a nonexistent file; it may have tried to open the window"
     );
 }
 

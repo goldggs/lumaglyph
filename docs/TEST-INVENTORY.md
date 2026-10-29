@@ -6,7 +6,7 @@ Counted from `cargo test -- --list`. Regenerate with `./scripts/test_inventory.s
 | Suite | Test functions | Cases run |
 | :--- | ---: | ---: |
 | `lib` | 167 | 167 |
-| `cli_contract_matrix` | 23 | 23 |
+| `cli_contract_matrix` | 24 | 24 |
 | `combinatorial_fuzz_matrix` | 4 | 391 |
 | `engine_and_color_matrix` | 10 | 148 |
 | `engine_stress_and_fuzz` | 22 | 22 |
@@ -18,5 +18,5 @@ Counted from `cargo test -- --list`. Regenerate with `./scripts/test_inventory.s
 | `security_and_provenance_audit` | 25 | 25 |
 | `themes_prefs_and_binary_audit` | 28 | 114 |
 | `video_and_cli_e2e` | 6 | 6 |
-| **total** | **354** | **1505** |
+| **total** | **355** | **1506** |
 

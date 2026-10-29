@@ -13,6 +13,9 @@ env:
 
 jobs:
   check-and-test:
+    # A test that blocks must fail the job rather than occupy a runner for hours.
+    # (A CLI test once launched the GUI on a headless macOS runner and hung.)
+    timeout-minutes: 45
     name: Build, Test & Path-Leak Audit (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
