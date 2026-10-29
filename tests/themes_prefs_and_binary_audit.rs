@@ -493,3 +493,266 @@ fn runtime_eframe_icon_and_desktop_bundle_manifests_are_valid() {
     assert!(build_rs.contains("assets/icons/lumaglyph.ico"));
     assert!(build_rs.contains("compile_for(\"lumaglyph\")"));
 }
+
+#[test]
+fn optimisations_and_rendering_preference_defaults_are_fast_and_safe() {
+    let prefs = lumaglyph::updater::AppPreferences::default();
+
+    // Background idling is on by default so an unfocused window costs nothing.
+    assert!(prefs.idle_when_unfocused);
+    assert!(prefs.pause_decode_when_unfocused);
+    assert!(prefs.idle_when_minimized);
+    assert!(prefs.trim_memory_on_idle);
+
+    // Rendering defaults: 60 FPS cap, vsync, 4x MSAA, auto filtering, standard raster.
+    assert_eq!(prefs.fps_cap, 60);
+    assert!(prefs.vsync);
+    assert_eq!(prefs.msaa_samples, 4);
+    assert_eq!(
+        prefs.texture_filter,
+        lumaglyph::updater::TextureFilterMode::Auto
+    );
+    assert_eq!(prefs.preview_supersample, 1);
+    assert_eq!(prefs.video_preview_max_dim, 640);
+    assert!(prefs.audio_envelope_enabled);
+    assert!(prefs.frame_dedup_enabled);
+    assert_eq!(prefs.worker_threads, 0);
+}
+
+#[test]
+fn fps_cap_maps_to_reparent_intervals_and_thread_budget() {
+    use lumaglyph::updater::{AppPreferences, FPS_CAP_OPTIONS};
+
+    assert_eq!(FPS_CAP_OPTIONS, [0, 15, 24, 30, 60, 144]);
+
+    let mut prefs = AppPreferences::default();
+    assert!(prefs.repaint_interval().is_some());
+
+    prefs.fps_cap = 0;
+    assert!(
+        prefs.repaint_interval().is_none(),
+        "0 FPS cap means uncapped/event driven"
+    );
+
+    for cap in [15u32, 24, 30, 60, 144] {
+        prefs.fps_cap = cap;
+        let d = prefs
+            .repaint_interval()
+            .expect("cap must map to an interval");
+        let expected = 1.0 / f64::from(cap);
+        assert!(
+            (d.as_secs_f64() - expected).abs() < 1e-6,
+            "cap {cap} produced {:?}",
+            d
+        );
+    }
+
+    prefs.fps_cap = 100_000;
+    assert!(prefs.repaint_interval().unwrap().as_secs_f64() > 0.0);
+
+    // Worker threads: 0 = auto, explicit values clamp into a sane range.
+    prefs.worker_threads = 0;
+    assert!(prefs.effective_worker_threads() >= 1);
+    prefs.worker_threads = 6;
+    assert_eq!(prefs.effective_worker_threads(), 6);
+    prefs.worker_threads = 10_000;
+    assert_eq!(prefs.effective_worker_threads(), 64);
+}
+
+#[test]
+fn texture_filter_mode_resolves_for_every_zoom() {
+    use lumaglyph::updater::TextureFilterMode;
+
+    for mode in TextureFilterMode::ALL {
+        assert!(!mode.label().is_empty());
+        for zoom in [0.2f32, 0.5, 1.0, 1.79, 1.8, 3.5, 6.0] {
+            let resolved = mode.resolve(zoom);
+            assert!(resolved == "nearest" || resolved == "linear");
+            match mode {
+                TextureFilterMode::Nearest => assert_eq!(resolved, "nearest"),
+                TextureFilterMode::Linear => assert_eq!(resolved, "linear"),
+                TextureFilterMode::Auto => {
+                    if zoom >= 1.8 {
+                        assert_eq!(resolved, "nearest")
+                    } else {
+                        assert_eq!(resolved, "linear")
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn new_settings_tabs_exist_and_are_reachable_from_cli() {
+    use lumaglyph::gui::SettingsTab;
+
+    assert_eq!(SettingsTab::ALL.len(), 7);
+    assert!(SettingsTab::ALL.contains(&SettingsTab::Rendering));
+    assert!(SettingsTab::ALL.contains(&SettingsTab::Optimisations));
+    assert_eq!(SettingsTab::Rendering.label(), "Rendering & Quality");
+    assert_eq!(SettingsTab::Optimisations.label(), "Optimisations");
+
+    for alias in ["rendering", "quality", "graphics", "gfx"] {
+        assert_eq!(SettingsTab::from_cli(alias), Some(SettingsTab::Rendering));
+    }
+    for alias in [
+        "optimisations",
+        "optimizations",
+        "optimise",
+        "optimize",
+        "performance",
+        "perf",
+        "power",
+    ] {
+        assert_eq!(
+            SettingsTab::from_cli(alias),
+            Some(SettingsTab::Optimisations)
+        );
+    }
+    assert_eq!(SettingsTab::from_cli("nonsense"), None);
+}
+
+#[test]
+fn old_preferences_json_still_loads_with_new_optimisation_fields() {
+    // A v0.3.5-era config must deserialize into v0.3.6 with sane defaults.
+    let legacy = r#"{
+        "theme": "GraphitePro",
+        "default_cols": 156,
+        "video_crf": 18,
+        "fps_cap": 60,
+        "check_updates_on_startup": false
+    }"#;
+    let prefs: lumaglyph::updater::AppPreferences = serde_json::from_str(legacy).unwrap();
+    assert_eq!(prefs.default_cols, 156);
+    assert!(prefs.idle_when_unfocused);
+    assert_eq!(prefs.msaa_samples, 4);
+    assert_eq!(prefs.video_preview_max_dim, 640);
+}
+
+#[test]
+fn documentation_links_are_https_github_and_match_repository() {
+    use lumaglyph::updater::{
+        ALL_DOC_LINKS, DOCS_DEVELOPING_URL, DOCS_INDEX_URL, DOCS_INSTALL_URL, DOCS_QUICKSTART_URL,
+        DOCS_TROUBLESHOOTING_URL, DOCS_USER_GUIDE_URL, LATEST_RELEASE_URL, REPO_URL,
+    };
+
+    let all = [
+        REPO_URL,
+        LATEST_RELEASE_URL,
+        DOCS_INDEX_URL,
+        DOCS_INSTALL_URL,
+        DOCS_QUICKSTART_URL,
+        DOCS_USER_GUIDE_URL,
+        DOCS_TROUBLESHOOTING_URL,
+        DOCS_DEVELOPING_URL,
+    ];
+    for url in all {
+        assert!(
+            url.starts_with("https://github.com/goldggs/lumaglyph"),
+            "{url}"
+        );
+        assert!(!url.contains(' '));
+        assert!(!url.contains("../"));
+    }
+    assert_eq!(ALL_DOC_LINKS.len(), 7);
+    for (label, url) in ALL_DOC_LINKS {
+        assert!(!label.is_empty());
+        assert!(url.starts_with("https://"));
+    }
+}
+
+#[test]
+fn documentation_files_exist_and_are_written_for_non_developers() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let required = [
+        "docs/README.md",
+        "docs/INSTALL.md",
+        "docs/QUICKSTART.md",
+        "docs/USER-GUIDE.md",
+        "docs/TROUBLESHOOTING.md",
+        "docs/DEVELOPING.md",
+    ];
+    for rel in required {
+        let path = manifest_dir.join(rel);
+        assert!(path.exists(), "missing documentation file: {rel}");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.len() > 1_500, "{rel} is suspiciously short");
+        // Plain-language, no emoji, no smart punctuation hazards.
+        assert!(!text.contains('\u{1F600}'));
+        assert!(
+            text.is_ascii(),
+            "{rel} must stay 7-bit ASCII for clean rendering everywhere"
+        );
+    }
+
+    // The install guide must tell a Windows user exactly which asset to grab.
+    let install = std::fs::read_to_string(manifest_dir.join("docs/INSTALL.md")).unwrap();
+    for needle in [
+        "lumaglyph-windows-x86_64.zip",
+        "LumaGlyph-macos-arm64-app.zip",
+        "LumaGlyph-macos-x86_64-app.zip",
+        "lumaglyph-linux-x86_64.tar.gz",
+        "releases/latest",
+        "Assets",
+        "More info",
+    ] {
+        assert!(
+            install.contains(needle),
+            "docs/INSTALL.md must mention '{needle}'"
+        );
+    }
+
+    // README must put the download story above the technical sections.
+    let readme = std::fs::read_to_string(manifest_dir.join("README.md")).unwrap();
+    let download_pos = readme
+        .find("Download and run it")
+        .expect("download section");
+    let engine_pos = readme
+        .find("Core Engine Capabilities")
+        .expect("engine section");
+    assert!(
+        download_pos < engine_pos,
+        "the download guide must come before deep technical sections"
+    );
+    for needle in [
+        "releases/latest",
+        "lumaglyph-windows-x86_64.zip",
+        "docs/INSTALL.md",
+        "docs/QUICKSTART.md",
+        "no coding needed",
+    ] {
+        assert!(readme.contains(needle), "README must mention '{needle}'");
+    }
+}
+
+#[test]
+fn gui_wires_video_transport_on_canvas_and_docs_entry_points() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let gui_src = std::fs::read_to_string(manifest_dir.join("src/gui.rs")).unwrap();
+
+    // The transport must be drawn over the canvas, not in the side/status toolbars.
+    assert!(gui_src.contains("fn draw_video_transport"));
+    assert!(gui_src.contains("draw_video_transport(ui, &painter, dest_rect, avail)"));
+    assert!(gui_src.contains("video_timeline"));
+    assert!(gui_src.contains("fn export_source_frame_dialog"));
+    assert!(gui_src.contains("Source Video Frame (PNG)"));
+    assert!(!gui_src.contains("button(if is_paused { \"Play\" } else { \"Pause\" })"));
+    assert!(!gui_src.contains("small_button(if is_paused { \"Play\" } else { \"Pause\" })"));
+
+    // Documentation entry points.
+    assert!(gui_src.contains("DOCS_QUICKSTART_URL"));
+    assert!(gui_src.contains("Key::F1"));
+    assert!(gui_src.contains("Documentation & Support"));
+    assert!(gui_src.contains("How to Download & Install"));
+
+    // New settings panels exist.
+    assert!(gui_src.contains("fn draw_settings_rendering"));
+    assert!(gui_src.contains("fn draw_settings_optimisations"));
+    assert!(gui_src.contains("SettingsTab::Optimisations =>"));
+    assert!(gui_src.contains("SettingsTab::Rendering =>"));
+
+    // Idle policy is consulted every frame.
+    assert!(gui_src.contains("self.app_idle = (self.prefs.idle_when_unfocused && !focused)"));
+    assert!(gui_src.contains("set_idle_hold"));
+}

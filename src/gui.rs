@@ -12,12 +12,14 @@ use crate::theme::{
 };
 use crate::updater::{
     format_build_report, relaunch_executable, spawn_release_check, spawn_verified_self_update,
-    AppPreferences, ReleaseCheckOutcome, VerifiedInstallOutcome, APP_VERSION, BUILD_GIT_SHA,
-    BUILD_PROFILE, BUILD_RUSTC_VERSION, BUILD_TARGET_TRIPLE, DEFAULT_GITHUB_REPO,
+    AppPreferences, ReleaseCheckOutcome, TextureFilterMode, VerifiedInstallOutcome, APP_VERSION,
+    BUILD_GIT_SHA, BUILD_PROFILE, BUILD_RUSTC_VERSION, BUILD_TARGET_TRIPLE, DEFAULT_GITHUB_REPO,
+    DOCS_INSTALL_URL, DOCS_QUICKSTART_URL, DOCS_TROUBLESHOOTING_URL, DOCS_USER_GUIDE_URL,
+    FPS_CAP_OPTIONS, LATEST_RELEASE_URL, REPO_URL,
 };
 use crate::video::{
-    detect_ffmpeg_version, set_video_pipeline_prefs, transcode_video_streaming, LiveVideoStream,
-    TranscodeProgress, TranscodeSummary,
+    detect_ffmpeg_version, extract_source_frame, format_timecode, set_video_pipeline_prefs,
+    transcode_video_streaming, LiveVideoStream, TranscodeProgress, TranscodeSummary,
 };
 use eframe::egui::{
     self, Align, Color32, ColorImage, CornerRadius, DragValue, Frame, Key, Layout, Margin, Pos2,
@@ -34,15 +36,19 @@ pub enum SettingsTab {
     #[default]
     Appearance,
     EngineDefaults,
+    Rendering,
+    Optimisations,
     ExportVideo,
     Shortcuts,
     AboutBuild,
 }
 
 impl SettingsTab {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 7] = [
         Self::Appearance,
         Self::EngineDefaults,
+        Self::Rendering,
+        Self::Optimisations,
         Self::ExportVideo,
         Self::Shortcuts,
         Self::AboutBuild,
@@ -52,6 +58,8 @@ impl SettingsTab {
         match self {
             Self::Appearance => "Appearance",
             Self::EngineDefaults => "Engine & Defaults",
+            Self::Rendering => "Rendering & Quality",
+            Self::Optimisations => "Optimisations",
             Self::ExportVideo => "Export & Video",
             Self::Shortcuts => "Shortcuts",
             Self::AboutBuild => "About & Build",
@@ -62,6 +70,9 @@ impl SettingsTab {
         match s.trim().to_ascii_lowercase().as_str() {
             "appearance" | "theme" | "themes" => Some(Self::Appearance),
             "engine" | "defaults" => Some(Self::EngineDefaults),
+            "rendering" | "quality" | "graphics" | "gfx" => Some(Self::Rendering),
+            "optimisations" | "optimizations" | "optimise" | "optimize" | "performance"
+            | "perf" | "power" => Some(Self::Optimisations),
             "export" | "video" => Some(Self::ExportVideo),
             "shortcuts" | "keys" => Some(Self::Shortcuts),
             "about" | "build" | "version" | "updates" => Some(Self::AboutBuild),
@@ -168,6 +179,16 @@ pub struct LumaGlyphApp {
     self_update_rx: Option<Receiver<Result<VerifiedInstallOutcome, String>>>,
     self_update_status: Option<Result<VerifiedInstallOutcome, String>>,
 
+    // Performance, quality & background-idle runtime state
+    app_idle: bool,
+    idle_since: Option<Instant>,
+    hires_atlas: Option<(usize, GlyphAtlas)>,
+    frame_fingerprint: u64,
+    fps_frames: u32,
+    fps_window_start: Instant,
+    measured_fps: f32,
+    timeline_drag: bool,
+
     // Automated frame capture exit
     frames_drawn: u32,
     auto_exit_after_frames: Option<u32>,
@@ -270,6 +291,14 @@ impl LumaGlyphApp {
             update_status: None,
             self_update_rx: None,
             self_update_status: None,
+            app_idle: false,
+            idle_since: None,
+            hires_atlas: None,
+            frame_fingerprint: 0,
+            fps_frames: 0,
+            fps_window_start: Instant::now(),
+            measured_fps: 0.0,
+            timeline_drag: false,
             frames_drawn: 0,
             auto_exit_after_frames: boot.auto_exit_after_frames,
         };
@@ -425,7 +454,9 @@ impl LumaGlyphApp {
         let is_video = matches!(ext.as_str(), "mp4" | "mkv" | "mov" | "webm" | "avi" | "m4v");
 
         if is_video {
-            match LiveVideoStream::open(&path) {
+            let max_dim = self.prefs.video_preview_max_dim;
+            let analyze_audio = self.prefs.audio_envelope_enabled;
+            match LiveVideoStream::open_with_options(&path, max_dim, analyze_audio) {
                 Ok(stream) => {
                     let fname = path
                         .file_name()
@@ -521,6 +552,19 @@ impl LumaGlyphApp {
             }
             if i.modifiers.command && !i.modifiers.shift && i.key_pressed(Key::S) {
                 self.save_png_dialog();
+            }
+            if i.key_pressed(Key::F1) {
+                ctx.open_url(egui::OpenUrl::new_tab(DOCS_QUICKSTART_URL));
+            }
+            if i.key_pressed(Key::ArrowLeft) || i.key_pressed(Key::ArrowRight) {
+                let step = if i.key_pressed(Key::ArrowLeft) {
+                    -5.0
+                } else {
+                    5.0
+                };
+                if let SourceKind::VideoFile(st) = &self.source_kind {
+                    st.seek_by(step);
+                }
             }
             if i.modifiers.command && i.modifiers.shift && i.key_pressed(Key::R) {
                 self.reset_ascii_to_default();
@@ -656,16 +700,33 @@ impl LumaGlyphApp {
             self.style_dirty = false;
         }
 
+        let repaint_interval = self.prefs.repaint_interval();
+
         if let SourceKind::VideoFile(stream) = &mut self.source_kind {
+            // Background idle: park the decoder thread so an unfocused window costs nothing.
+            let hold = self.app_idle && self.prefs.pause_decode_when_unfocused;
+            stream.set_idle_hold(hold);
+
             if let Some((rgb, audio_e)) = stream.poll_latest_frame() {
+                let fingerprint = frame_fingerprint(&rgb);
+                let duplicate = self.prefs.frame_dedup_enabled
+                    && fingerprint == self.frame_fingerprint
+                    && self.ascii_tex.is_some();
+                self.frame_fingerprint = fingerprint;
+
                 self.source_rgba = rgb;
                 self.source_channels = 3;
                 self.live_audio_energy = audio_e;
                 self.video_frames_seen += 1;
-                self.ascii_dirty = true;
+                if !duplicate {
+                    self.ascii_dirty = true;
+                }
             }
-            if !stream.paused.load(Ordering::Relaxed) {
-                ctx.request_repaint_after(std::time::Duration::from_millis(14));
+            let playing = !stream.paused.load(Ordering::Relaxed) && !hold;
+            if playing {
+                ctx.request_repaint_after(
+                    repaint_interval.unwrap_or(std::time::Duration::from_millis(14)),
+                );
             }
         } else {
             self.live_audio_energy = 0.0;
@@ -691,9 +752,31 @@ impl LumaGlyphApp {
                 &mut self.ascii_frame,
             );
             let bloom_boost = self.live_audio_energy * self.params.audio_reactive * 0.65;
+
+            // Optional 2x supersampled canvas raster for crisp glyph edges when zoomed.
+            let supersample = if self.prefs.preview_supersample >= 2 {
+                2usize
+            } else {
+                1usize
+            };
+            let target_cell_h = self.atlas.cell_h.saturating_mul(supersample);
+            if supersample > 1 && self.hires_atlas.as_ref().map(|(h, _)| *h) != Some(target_cell_h)
+            {
+                self.hires_atlas =
+                    Some((target_cell_h, self.atlas.with_cell_height(target_cell_h)));
+            }
+            let raster_atlas = if supersample > 1 {
+                self.hires_atlas
+                    .as_ref()
+                    .map(|(_, a)| a)
+                    .unwrap_or(&self.atlas)
+            } else {
+                &self.atlas
+            };
+
             let (pw, ph) = rasterize_rgba(
                 &self.ascii_frame,
-                &self.atlas,
+                raster_atlas,
                 &self.params,
                 bloom_boost,
                 &mut self.raster_rgba,
@@ -703,10 +786,9 @@ impl LumaGlyphApp {
 
             if pw > 0 && ph > 0 {
                 let cimg = ColorImage::from_rgba_unmultiplied([pw, ph], &self.raster_rgba);
-                let opts = if self.zoom >= 1.8 {
-                    TextureOptions::NEAREST
-                } else {
-                    TextureOptions::LINEAR
+                let opts = match self.prefs.texture_filter.resolve(self.zoom) {
+                    "nearest" => TextureOptions::NEAREST,
+                    _ => TextureOptions::LINEAR,
                 };
                 match &mut self.ascii_tex {
                     Some(tex) => tex.set(cimg, opts),
@@ -925,6 +1007,35 @@ impl LumaGlyphApp {
                 });
 
                 ui.menu_button("Help", |ui| {
+                    if ui.button("Getting Started (Quick Start)   F1").clicked() {
+                        ui.close_menu();
+                        ui.ctx()
+                            .open_url(egui::OpenUrl::new_tab(DOCS_QUICKSTART_URL));
+                    }
+                    if ui.button("How to Download & Install").clicked() {
+                        ui.close_menu();
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(DOCS_INSTALL_URL));
+                    }
+                    if ui.button("User Guide (every panel & setting)").clicked() {
+                        ui.close_menu();
+                        ui.ctx()
+                            .open_url(egui::OpenUrl::new_tab(DOCS_USER_GUIDE_URL));
+                    }
+                    if ui.button("Troubleshooting & FAQ").clicked() {
+                        ui.close_menu();
+                        ui.ctx()
+                            .open_url(egui::OpenUrl::new_tab(DOCS_TROUBLESHOOTING_URL));
+                    }
+                    if ui.button("Latest Downloads on GitHub").clicked() {
+                        ui.close_menu();
+                        ui.ctx()
+                            .open_url(egui::OpenUrl::new_tab(LATEST_RELEASE_URL));
+                    }
+                    if ui.button("LumaGlyph Repository").clicked() {
+                        ui.close_menu();
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(REPO_URL));
+                    }
+                    ui.separator();
                     if ui.button("Settings & Preferences...").clicked() {
                         self.settings_tab = SettingsTab::Appearance;
                         self.show_settings_window = true;
@@ -1009,15 +1120,6 @@ impl LumaGlyphApp {
             }
             if ui.button("Open Video").clicked() {
                 self.open_video_dialog();
-            }
-            if let SourceKind::VideoFile(stream) = &mut self.source_kind {
-                let is_paused = stream.paused.load(Ordering::Relaxed);
-                if ui
-                    .button(if is_paused { "Play" } else { "Pause" })
-                    .clicked()
-                {
-                    stream.paused.store(!is_paused, Ordering::Relaxed);
-                }
             }
             if self.has_media()
                 && ui
@@ -1783,15 +1885,16 @@ impl LumaGlyphApp {
         );
 
         // 2. VS Code-style two-column shortcut rows
-        let rows: [(&str, &[&str], u8); 4] = [
+        let rows: [(&str, &[&str], u8); 5] = [
             ("Open Image", &["Ctrl", "O"], 1),
             ("Open Video", &["Ctrl", "Shift", "O"], 2),
             ("Toggle Inspector", &["Ctrl", "B"], 3),
             ("Settings", &["Ctrl", ","], 4),
+            ("Documentation", &["F1"], 5),
         ];
 
         let spine_x = center.x - 6.0;
-        let start_y = center.y - 6.0;
+        let start_y = center.y - 20.0;
         let row_h = 28.0_f32;
 
         for (idx, (label, keys, action_id)) in rows.iter().enumerate() {
@@ -1857,6 +1960,10 @@ impl LumaGlyphApp {
                     4 => {
                         self.settings_tab = SettingsTab::Appearance;
                         self.show_settings_window = true;
+                    }
+                    5 => {
+                        ui.ctx()
+                            .open_url(egui::OpenUrl::new_tab(DOCS_QUICKSTART_URL));
                     }
                     _ => {}
                 }
@@ -1943,7 +2050,7 @@ impl LumaGlyphApp {
         let center = avail.center() + self.pan_offset;
         let dest_rect = Rect::from_center_size(center, draw_size);
 
-        if response.dragged() && !self.auto_fit {
+        if response.dragged() && !self.auto_fit && !self.timeline_drag {
             self.pan_offset += response.drag_delta();
         }
 
@@ -1972,6 +2079,9 @@ impl LumaGlyphApp {
                 .with_clip_rect(avail)
                 .image(ascii_tex.id(), dest_rect, uv_full, Color32::WHITE);
         }
+
+        // Video transport lives directly on the video surface, not in a separate toolbar.
+        self.draw_video_transport(ui, &painter, dest_rect, avail);
 
         if self.prefs.show_cell_hud {
             if let Some(hover) = response.hover_pos() {
@@ -2017,6 +2127,280 @@ impl LumaGlyphApp {
         }
     }
 
+    /// On-canvas video transport: play/pause directly on the video, a scrubbable timeline,
+    /// and one-click frame export for the exact frame on screen.
+    fn draw_video_transport(
+        &mut self,
+        ui: &mut egui::Ui,
+        painter: &egui::Painter,
+        canvas_rect: Rect,
+        avail: Rect,
+    ) {
+        if !matches!(self.source_kind, SourceKind::VideoFile(_)) {
+            return;
+        }
+        let pal = self.palette;
+
+        let bar_w = canvas_rect.width().clamp(360.0, 700.0);
+        let bar_h = 40.0;
+        let x0 = canvas_rect.center().x - bar_w * 0.5;
+        let y0 = (canvas_rect.bottom() - bar_h - 14.0)
+            .min(avail.bottom() - bar_h - 10.0)
+            .max(avail.top() + 10.0);
+        let bar = Rect::from_min_size(Pos2::new(x0, y0), Vec2::new(bar_w, bar_h));
+
+        painter.rect_filled(
+            bar,
+            CornerRadius::same(3),
+            Color32::from_rgba_unmultiplied(17, 17, 20, 238),
+        );
+        painter.rect_stroke(
+            bar,
+            CornerRadius::same(3),
+            Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(74, 74, 82, 225)),
+            StrokeKind::Inside,
+        );
+        painter.rect_filled(
+            Rect::from_min_size(bar.left_top(), Vec2::new(bar.width(), 2.0)),
+            0.0,
+            Color32::from_rgba_unmultiplied(96, 96, 106, 90),
+        );
+
+        let icon_col = Color32::from_rgb(226, 228, 234);
+        let dim_col = Color32::from_rgb(196, 200, 210);
+        let cy = bar.center().y;
+
+        // Play / pause control drawn as flat geometry (no glyphs, no emoji).
+        let play_rect = Rect::from_center_size(Pos2::new(bar.left() + 22.0, cy), Vec2::splat(26.0));
+        let play_resp = ui
+            .interact(play_rect, ui.id().with("video_play_btn"), Sense::click())
+            .on_hover_text("Play / Pause (Space)");
+        if play_resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            painter.rect_filled(
+                play_rect,
+                CornerRadius::same(3),
+                Color32::from_rgba_unmultiplied(48, 48, 54, 220),
+            );
+        }
+        let paused = match &self.source_kind {
+            SourceKind::VideoFile(st) => {
+                st.paused.load(Ordering::Relaxed)
+                    || (self.app_idle && self.prefs.pause_decode_when_unfocused)
+            }
+            _ => true,
+        };
+        if paused {
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    Pos2::new(play_rect.center().x - 4.5, play_rect.center().y - 7.0),
+                    Pos2::new(play_rect.center().x - 4.5, play_rect.center().y + 7.0),
+                    Pos2::new(play_rect.center().x + 7.0, play_rect.center().y),
+                ],
+                icon_col,
+                Stroke::NONE,
+            ));
+        } else {
+            for dx in [-5.0f32, 2.0] {
+                painter.rect_filled(
+                    Rect::from_min_size(
+                        Pos2::new(play_rect.center().x + dx, play_rect.center().y - 7.0),
+                        Vec2::new(3.5, 14.0),
+                    ),
+                    0.5,
+                    icon_col,
+                );
+            }
+        }
+        if play_resp.clicked() {
+            if let SourceKind::VideoFile(st) = &self.source_kind {
+                st.toggle_pause();
+            }
+        }
+
+        // Jump back / forward five seconds.
+        let mut jump: Option<f64> = None;
+        for delta in [-5.0f64, 5.0] {
+            let cx = bar.left() + 46.0 + if delta < 0.0 { 0.0 } else { 26.0 };
+            let r = Rect::from_center_size(Pos2::new(cx, cy), Vec2::splat(22.0));
+            let resp = ui.interact(
+                r,
+                ui.id().with(("video_jump", delta as i32)),
+                Sense::click(),
+            );
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                painter.rect_filled(
+                    r,
+                    CornerRadius::same(3),
+                    Color32::from_rgba_unmultiplied(48, 48, 54, 200),
+                );
+            }
+            let dir = if delta < 0.0 { -1.0f32 } else { 1.0 };
+            for k in [0.0f32, 5.0] {
+                let bx = r.center().x - 5.0 + dir * k;
+                painter.add(egui::Shape::convex_polygon(
+                    vec![
+                        Pos2::new(bx - dir * 3.5, r.center().y - 5.5),
+                        Pos2::new(bx - dir * 3.5, r.center().y + 5.5),
+                        Pos2::new(bx + dir * 2.5, r.center().y),
+                    ],
+                    dim_col,
+                    Stroke::NONE,
+                ));
+            }
+            if resp.clicked() {
+                jump = Some(delta);
+            }
+        }
+
+        // Export-frame dropdown pinned to the right edge.
+        let export_rect = Rect::from_min_size(
+            Pos2::new(bar.right() - 96.0, bar.center().y - 11.0),
+            Vec2::new(86.0, 22.0),
+        );
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(export_rect)
+                .layout(Layout::left_to_right(Align::Center)),
+        );
+        egui::menu::menu_button(&mut child, "Export Frame", |ui| {
+            if ui.button("ASCII Frame (PNG)...").clicked() {
+                ui.close_menu();
+                self.save_png_dialog();
+            }
+            if ui.button("Source Video Frame (PNG)...").clicked() {
+                ui.close_menu();
+                self.export_source_frame_dialog();
+            }
+            if ui.button("Copy ASCII Frame as Text").clicked() {
+                ui.close_menu();
+                let txt = frame_to_ansi_string(&self.ascii_frame, &self.params);
+                ui.ctx().copy_text(txt);
+                self.set_toast("Copied current frame as ANSI text");
+            }
+        });
+
+        // Timecode readout.
+        let (position, duration, is_paused) = match &self.source_kind {
+            SourceKind::VideoFile(st) => (
+                st.position_secs(),
+                st.duration_secs(),
+                st.paused.load(Ordering::Relaxed),
+            ),
+            _ => (0.0, 0.0, true),
+        };
+        let _ = is_paused;
+        let tc = format!(
+            "{} / {}",
+            format_timecode(position),
+            format_timecode(duration)
+        );
+        painter.text(
+            Pos2::new(export_rect.left() - 12.0, cy),
+            egui::Align2::RIGHT_CENTER,
+            &tc,
+            mono_font(10.6),
+            dim_col,
+        );
+
+        // Scrubbable timeline track.
+        let track_left = bar.left() + 100.0;
+        let track_right = export_rect.left() - 118.0;
+        if track_right > track_left + 40.0 {
+            let track = Rect::from_min_max(
+                Pos2::new(track_left, cy - 1.5),
+                Pos2::new(track_right, cy + 1.5),
+            );
+            let hit = Rect::from_min_max(
+                Pos2::new(track_left - 4.0, cy - 11.0),
+                Pos2::new(track_right + 4.0, cy + 11.0),
+            );
+            let resp = ui
+                .interact(hit, ui.id().with("video_timeline"), Sense::click_and_drag())
+                .on_hover_text("Drag to scrub through the timeline");
+            self.timeline_drag = resp.dragged();
+
+            painter.rect_filled(track, 1.0, Color32::from_rgba_unmultiplied(70, 70, 78, 255));
+            let ratio = if duration > 0.0 {
+                (position / duration).clamp(0.0, 1.0) as f32
+            } else {
+                0.0
+            };
+            let filled = Rect::from_min_max(
+                track.left_top(),
+                Pos2::new(track.left() + track.width() * ratio, track.bottom()),
+            );
+            painter.rect_filled(filled, 1.0, pal.accent);
+            let knob_x = track.left() + track.width() * ratio;
+            painter.circle_filled(Pos2::new(knob_x, cy), 4.0, icon_col);
+            painter.circle_stroke(
+                Pos2::new(knob_x, cy),
+                4.0,
+                Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(20, 20, 24, 200)),
+            );
+
+            if (resp.dragged() || resp.clicked()) && duration > 0.0 {
+                if let Some(p) = resp.interact_pointer_pos() {
+                    let r = ((p.x - track_left) / track.width()).clamp(0.0, 1.0) as f64;
+                    if let SourceKind::VideoFile(st) = &self.source_kind {
+                        st.seek_to(r * duration);
+                    }
+                }
+            }
+        } else {
+            self.timeline_drag = false;
+        }
+
+        if let Some(delta) = jump {
+            if let SourceKind::VideoFile(st) = &self.source_kind {
+                st.seek_by(delta);
+            }
+        }
+    }
+
+    /// Saves the untouched, full-resolution video frame currently on the timeline.
+    fn export_source_frame_dialog(&mut self) {
+        let SourceKind::VideoFile(stream) = &self.source_kind else {
+            return;
+        };
+        let path = stream.path.clone();
+        let secs = stream.position_secs();
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("frame")
+            .to_string();
+        let stamp = format_timecode(secs).replace(':', "-").replace('.', "_");
+        let default_name = format!("{stem}-frame-{stamp}.png");
+
+        let Some(target) = rfd::FileDialog::new()
+            .set_file_name(&default_name)
+            .add_filter("PNG", &["png"])
+            .save_file()
+        else {
+            return;
+        };
+
+        match extract_source_frame(&path, secs) {
+            Ok((rgb, w, h)) => {
+                let Some(img) = image::ImageBuffer::<image::Rgb<u8>, Vec<u8>>::from_raw(w, h, rgb)
+                else {
+                    self.set_toast("Failed to build source frame image buffer");
+                    return;
+                };
+                match img.save(&target) {
+                    Ok(()) => self.set_toast(format!(
+                        "Saved source frame at {} ({w}x{h} px)",
+                        format_timecode(secs)
+                    )),
+                    Err(e) => self.set_toast(format!("Frame save failed: {e}")),
+                }
+            }
+            Err(e) => self.set_toast(format!("Frame export failed: {e}")),
+        }
+    }
+
     fn draw_status_strip(&mut self, ui: &mut egui::Ui) {
         let pal = self.palette;
         ui.horizontal(|ui| {
@@ -2029,20 +2413,22 @@ impl LumaGlyphApp {
                     );
                 }
                 SourceKind::VideoFile(stream) => {
-                    let is_paused = stream.paused.load(Ordering::Relaxed);
-                    if ui
-                        .small_button(if is_paused { "Play" } else { "Pause" })
-                        .clicked()
-                    {
-                        stream.paused.store(!is_paused, Ordering::Relaxed);
-                    }
+                    let state = if stream.paused.load(Ordering::Relaxed) {
+                        "PAUSED"
+                    } else if self.app_idle && self.prefs.pause_decode_when_unfocused {
+                        "IDLE"
+                    } else {
+                        "PLAYING"
+                    };
                     ui.label(
                         RichText::new(format!(
-                            "{}x{} @ {:.1} FPS   |   Frame #{}",
+                            "{}x{} @ {:.1} FPS   |   {}   |   {} / {}",
                             stream.meta.width,
                             stream.meta.height,
                             stream.meta.fps,
-                            self.video_frames_seen,
+                            state,
+                            format_timecode(stream.position_secs()),
+                            format_timecode(stream.duration_secs()),
                         ))
                         .font(mono_font(10.6))
                         .color(pal.text_secondary),
@@ -2210,6 +2596,12 @@ impl LumaGlyphApp {
                                         }
                                         SettingsTab::EngineDefaults => {
                                             self.draw_settings_engine(ui)
+                                        }
+                                        SettingsTab::Rendering => {
+                                            self.draw_settings_rendering(ui)
+                                        }
+                                        SettingsTab::Optimisations => {
+                                            self.draw_settings_optimisations(ui)
                                         }
                                         SettingsTab::ExportVideo => self.draw_settings_export(ui),
                                         SettingsTab::Shortcuts => self.draw_settings_shortcuts(ui),
@@ -2516,6 +2908,337 @@ impl LumaGlyphApp {
         }
     }
 
+    fn draw_settings_rendering(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
+        let mut changed = false;
+        let mut needs_restart = false;
+
+        ui.label(
+            RichText::new("Frame Rate & Presentation")
+                .font(plex_medium(13.0))
+                .color(pal.text_primary),
+        );
+        ui.label(
+            RichText::new(
+                "Caps how often the workstation redraws. Video decode stays source-timed.",
+            )
+            .size(11.4)
+            .color(pal.text_secondary),
+        );
+
+        ui.label(
+            RichText::new("Frame Rate Cap")
+                .size(11.5)
+                .color(pal.text_secondary),
+        );
+        ui.horizontal(|ui| {
+            for opt in FPS_CAP_OPTIONS {
+                let lbl = if opt == 0 {
+                    "Uncapped".to_string()
+                } else {
+                    format!("{opt} FPS")
+                };
+                if ui.radio_value(&mut self.prefs.fps_cap, opt, lbl).changed() {
+                    changed = true;
+                }
+            }
+        });
+        ui.label(
+            RichText::new(format!("Active repaint budget: {}", {
+                if self.prefs.fps_cap == 0 {
+                    "uncapped (event driven)".to_string()
+                } else {
+                    format!("{:.2} ms/frame", 1000.0 / f64::from(self.prefs.fps_cap))
+                }
+            }))
+            .font(mono_font(10.6))
+            .color(pal.text_muted),
+        );
+
+        ui.separator();
+
+        ui.label(
+            RichText::new("Texture Sampling")
+                .size(11.5)
+                .color(pal.text_secondary),
+        );
+        ui.horizontal(|ui| {
+            for mode in TextureFilterMode::ALL {
+                if ui
+                    .radio_value(&mut self.prefs.texture_filter, mode, mode.label())
+                    .changed()
+                {
+                    changed = true;
+                    self.ascii_dirty = true;
+                }
+            }
+        });
+
+        ui.label(
+            RichText::new("Canvas Raster Supersampling")
+                .size(11.5)
+                .color(pal.text_secondary),
+        );
+        ui.horizontal(|ui| {
+            for (v, lbl) in [
+                (1u8, "1x (Standard)"),
+                (2u8, "2x Supersampled (Crisp when zoomed)"),
+            ] {
+                if ui
+                    .radio_value(&mut self.prefs.preview_supersample, v, lbl)
+                    .changed()
+                {
+                    changed = true;
+                    self.ascii_dirty = true;
+                }
+            }
+        });
+
+        ui.separator();
+
+        ui.label(
+            RichText::new("GPU Presentation")
+                .font(plex_medium(12.4))
+                .color(pal.text_primary),
+        );
+        if ui
+            .checkbox(&mut self.prefs.vsync, "VSync (wait for vertical blank)")
+            .changed()
+        {
+            changed = true;
+            needs_restart = true;
+        }
+        if ui
+            .checkbox(
+                &mut self.prefs.animation_smoothing,
+                "Smoothed zoom & scrolling",
+            )
+            .changed()
+        {
+            changed = true;
+        }
+        if ui
+            .checkbox(
+                &mut self.prefs.show_fps_readout,
+                "Show live measured FPS in the status strip",
+            )
+            .changed()
+        {
+            changed = true;
+        }
+
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Multisample Anti-Aliasing")
+                    .size(11.5)
+                    .color(pal.text_secondary),
+            );
+            egui::ComboBox::from_id_salt("msaa_combo")
+                .selected_text(match self.prefs.msaa_samples {
+                    1 => "Off (1x)".to_string(),
+                    2 => "2x MSAA".to_string(),
+                    4 => "4x MSAA (Default)".to_string(),
+                    _ => "8x MSAA".to_string(),
+                })
+                .show_ui(ui, |ui| {
+                    for (v, lbl) in [
+                        (1u16, "Off (1x)"),
+                        (2u16, "2x MSAA"),
+                        (4u16, "4x MSAA (Default)"),
+                        (8u16, "8x MSAA"),
+                    ] {
+                        if ui
+                            .selectable_value(&mut self.prefs.msaa_samples, v, lbl)
+                            .changed()
+                        {
+                            changed = true;
+                            needs_restart = true;
+                        }
+                    }
+                });
+        });
+
+        if needs_restart {
+            ui.label(
+                RichText::new("VSync and MSAA changes apply the next time LumaGlyph launches.")
+                    .font(mono_font(10.4))
+                    .color(pal.accent),
+            );
+        }
+
+        if changed {
+            self.persist_prefs();
+        }
+    }
+
+    fn draw_settings_optimisations(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
+        let mut changed = false;
+        let mut reopen_video = false;
+
+        ui.label(
+            RichText::new("Background & Focus Idling")
+                .font(plex_medium(13.0))
+                .color(pal.text_primary),
+        );
+        ui.label(
+            RichText::new(
+                "When LumaGlyph is not the active window it can stop drawing and decoding entirely.",
+            )
+            .size(11.4)
+            .color(pal.text_secondary),
+        );
+
+        if ui
+            .checkbox(
+                &mut self.prefs.idle_when_unfocused,
+                "Go idle when the window loses focus (zero repaints while you work elsewhere)",
+            )
+            .changed()
+        {
+            changed = true;
+        }
+        if ui
+            .checkbox(
+                &mut self.prefs.pause_decode_when_unfocused,
+                "Pause video decoding while unfocused",
+            )
+            .changed()
+        {
+            changed = true;
+        }
+        if ui
+            .checkbox(
+                &mut self.prefs.idle_when_minimized,
+                "Stay fully idle while minimized",
+            )
+            .changed()
+        {
+            changed = true;
+        }
+        if ui
+            .checkbox(
+                &mut self.prefs.trim_memory_on_idle,
+                "Release scratch buffers after 10 seconds of idle",
+            )
+            .changed()
+        {
+            changed = true;
+        }
+
+        ui.label(
+            RichText::new(if self.app_idle {
+                "Current state: IDLE (backgrounded - repaints paused)"
+            } else {
+                "Current state: ACTIVE (focused - full frame rate)"
+            })
+            .font(mono_font(10.6))
+            .color(if self.app_idle {
+                pal.accent
+            } else {
+                pal.text_muted
+            }),
+        );
+
+        ui.separator();
+
+        ui.label(
+            RichText::new("Compute & Threading")
+                .font(plex_medium(12.4))
+                .color(pal.text_primary),
+        );
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("ASCII Engine Worker Threads")
+                    .size(11.5)
+                    .color(pal.text_secondary),
+            );
+            if ui
+                .add(
+                    DragValue::new(&mut self.prefs.worker_threads)
+                        .range(0..=64)
+                        .speed(0.2),
+                )
+                .on_hover_text("0 = automatic (all available cores)")
+                .changed()
+            {
+                changed = true;
+            }
+            ui.label(
+                RichText::new(format!(
+                    "(0 = auto, currently {})",
+                    self.prefs.effective_worker_threads()
+                ))
+                .font(mono_font(10.4))
+                .color(pal.text_muted),
+            );
+        });
+        ui.label(
+            RichText::new("Thread count is applied on the next launch.")
+                .font(mono_font(10.2))
+                .color(pal.text_muted),
+        );
+        if ui
+            .checkbox(
+                &mut self.prefs.frame_dedup_enabled,
+                "Skip re-rendering identical consecutive video frames",
+            )
+            .changed()
+        {
+            changed = true;
+        }
+
+        ui.separator();
+
+        ui.label(
+            RichText::new("Video Decode Budget")
+                .font(plex_medium(12.4))
+                .color(pal.text_primary),
+        );
+        ui.label(
+            RichText::new("Live Preview Decode Height Cap")
+                .size(11.5)
+                .color(pal.text_secondary),
+        );
+        ui.horizontal(|ui| {
+            for (v, lbl) in [
+                (480u32, "480p (Fastest)"),
+                (640u32, "640p (Balanced)"),
+                (854u32, "854p"),
+                (1080u32, "1080p (Sharpest)"),
+            ] {
+                if ui
+                    .radio_value(&mut self.prefs.video_preview_max_dim, v, lbl)
+                    .changed()
+                {
+                    changed = true;
+                    reopen_video = true;
+                }
+            }
+        });
+        if ui
+            .checkbox(
+                &mut self.prefs.audio_envelope_enabled,
+                "Analyze audio beat envelope (audio-reactive grading)",
+            )
+            .changed()
+        {
+            changed = true;
+            reopen_video = true;
+        }
+        if reopen_video {
+            ui.label(
+                RichText::new("Re-open the video for decode changes to take effect.")
+                    .font(mono_font(10.4))
+                    .color(pal.accent),
+            );
+        }
+
+        if changed {
+            self.persist_prefs();
+        }
+    }
+
     fn draw_settings_export(&mut self, ui: &mut egui::Ui) {
         let pal = self.palette;
         let mut changed = false;
@@ -2629,6 +3352,11 @@ impl LumaGlyphApp {
                 "Copy one-line lg2: Look Code to clipboard",
             ),
             ("Ctrl + ,", "Open or close Workstation Settings"),
+            ("F1", "Open the LumaGlyph documentation"),
+            (
+                "Left / Right Arrow",
+                "Seek the loaded video back / forward 5 seconds",
+            ),
             (
                 "Tab",
                 "Toggle Zen Canvas Mode (hide side dock & status bar)",
@@ -2758,6 +3486,39 @@ impl LumaGlyphApp {
 
         ui.separator();
         ui.label(
+            RichText::new("Documentation & Support")
+                .font(plex_medium(12.2))
+                .color(pal.text_primary),
+        );
+        ui.label(
+            RichText::new("Plain-language guides written for people who have never used GitHub.")
+                .size(11.4)
+                .color(pal.text_secondary),
+        );
+        ui.horizontal(|ui| {
+            if ui.small_button("Quick Start").clicked() {
+                ui.ctx()
+                    .open_url(egui::OpenUrl::new_tab(DOCS_QUICKSTART_URL));
+            }
+            if ui.small_button("Download & Install").clicked() {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(DOCS_INSTALL_URL));
+            }
+            if ui.small_button("User Guide").clicked() {
+                ui.ctx()
+                    .open_url(egui::OpenUrl::new_tab(DOCS_USER_GUIDE_URL));
+            }
+            if ui.small_button("Troubleshooting").clicked() {
+                ui.ctx()
+                    .open_url(egui::OpenUrl::new_tab(DOCS_TROUBLESHOOTING_URL));
+            }
+            if ui.small_button("Latest Downloads").clicked() {
+                ui.ctx()
+                    .open_url(egui::OpenUrl::new_tab(LATEST_RELEASE_URL));
+            }
+        });
+
+        ui.separator();
+        ui.label(
             RichText::new("Network Policy & GitHub Release Checks")
                 .font(plex_medium(12.2))
                 .color(pal.text_primary),
@@ -2879,6 +3640,12 @@ impl LumaGlyphApp {
 
 impl eframe::App for LumaGlyphApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Background-idle policy: an unfocused or minimized window can drop to zero work per second.
+        let focused = ctx.input(|i| i.focused);
+        let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+        self.app_idle = (self.prefs.idle_when_unfocused && !focused)
+            || (self.prefs.idle_when_minimized && minimized);
+
         self.handle_dropped_files(ctx);
         self.handle_shortcuts(ctx);
         self.refresh_pipelines(ctx);
@@ -2947,15 +3714,61 @@ impl eframe::App for LumaGlyphApp {
 
         self.draw_settings_window(ctx);
 
+        // Measured render rate for the optional status-strip readout.
+        self.fps_frames = self.fps_frames.saturating_add(1);
+        let window_secs = self.fps_window_start.elapsed().as_secs_f32();
+        if window_secs >= 0.5 {
+            self.measured_fps = self.fps_frames as f32 / window_secs;
+            self.fps_frames = 0;
+            self.fps_window_start = Instant::now();
+        }
+
+        if self.app_idle {
+            let since = *self.idle_since.get_or_insert_with(Instant::now);
+            if self.prefs.trim_memory_on_idle && since.elapsed().as_secs() >= 10 {
+                // Hand scratch memory back to the OS once the window has been idle a while.
+                self.raster_rgba = Vec::new();
+                self.ascii_frame.cells.shrink_to_fit();
+                self.hires_atlas = None;
+            }
+            if self.prefs.trim_memory_on_idle {
+                ctx.request_repaint_after(std::time::Duration::from_secs(2));
+            }
+        } else {
+            self.idle_since = None;
+        }
+
         self.frames_drawn = self.frames_drawn.saturating_add(1);
         if let Some(limit) = self.auto_exit_after_frames {
             if self.frames_drawn < limit {
-                ctx.request_repaint();
+                ctx.request_repaint_after(
+                    self.prefs
+                        .repaint_interval()
+                        .unwrap_or(std::time::Duration::from_millis(16)),
+                );
             } else {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
     }
+}
+
+/// Cheap 64-bit content fingerprint over a decimated sample of a frame buffer,
+/// used to skip redundant re-renders of unchanged video frames.
+fn frame_fingerprint(buf: &[u8]) -> u64 {
+    if buf.is_empty() {
+        return 0;
+    }
+    let mut hash: u64 = 0xCBF2_9CE4_8422_2325;
+    let stride = (buf.len() / 4096).max(1);
+    let mut i = 0usize;
+    while i < buf.len() {
+        hash ^= u64::from(buf[i]);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+        i += stride;
+    }
+    hash ^= buf.len() as u64;
+    hash
 }
 
 /// Architectural flat section block with hairline border and muted medium header.
@@ -3296,20 +4109,57 @@ fn draw_viewport_tag(painter: &egui::Painter, pos: Pos2, text: &str) {
 }
 
 pub fn launch_gui(boot: GuiBootOptions) -> Result<(), String> {
-    let native_options = eframe::NativeOptions {
+    // Apply the persisted rendering & optimisation preferences before the GPU context exists.
+    let prefs = AppPreferences::load();
+    if prefs.worker_threads > 0 {
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(prefs.effective_worker_threads())
+            .thread_name(|i| format!("lumaglyph-worker-{i}"))
+            .build_global();
+    }
+
+    let base_options = |multisampling: u16| eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("LumaGlyph")
             .with_icon(crate::icon::eframe_icon_data())
             .with_inner_size([1520.0, 900.0])
             .with_min_inner_size([1024.0, 640.0])
             .with_drag_and_drop(true),
+        vsync: prefs.vsync,
+        multisampling,
         ..Default::default()
     };
 
-    eframe::run_native(
+    // eframe uses `0` to mean "no multisampling"; glutin rejects an explicit 1-sample request.
+    let requested_msaa = if prefs.msaa_samples <= 1 {
+        0
+    } else {
+        prefs.msaa_samples
+    };
+    let first_boot = boot.clone();
+    let first = eframe::run_native(
         "LumaGlyph",
-        native_options,
-        Box::new(move |cc| Ok(Box::new(LumaGlyphApp::new(cc, boot)))),
-    )
-    .map_err(|e| format!("Failed launching native GPU window: {e}"))
+        base_options(requested_msaa),
+        Box::new(move |cc| Ok(Box::new(LumaGlyphApp::new(cc, first_boot)))),
+    );
+
+    match first {
+        Ok(()) => Ok(()),
+        // Some drivers (software rasterizers, older GPUs, remote desktops) publish no
+        // multisampled framebuffer config. Never fail to boot over a quality preference:
+        // fall back to 1x MSAA and remember that the GPU cannot honour the request.
+        Err(primary_err) if requested_msaa > 0 => {
+            let fallback = eframe::run_native(
+                "LumaGlyph",
+                base_options(0),
+                Box::new(move |cc| Ok(Box::new(LumaGlyphApp::new(cc, boot)))),
+            );
+            fallback.map_err(|fallback_err| {
+                format!(
+                    "Failed launching native GPU window: {primary_err} (retried without MSAA: {fallback_err})"
+                )
+            })
+        }
+        Err(err) => Err(format!("Failed launching native GPU window: {err}")),
+    }
 }

@@ -19,6 +19,32 @@ pub const DEFAULT_GITHUB_REPO: &str = match option_env!("LUMAGLYPH_GITHUB_REPO")
     None => "goldggs/lumaglyph",
 };
 
+/// Canonical documentation & download entry points surfaced in the app's Help menu.
+/// Every link is HTTPS, is on `github.com`, and points at the same canonical repository.
+pub const REPO_URL: &str = "https://github.com/goldggs/lumaglyph";
+pub const LATEST_RELEASE_URL: &str = "https://github.com/goldggs/lumaglyph/releases/latest";
+pub const DOCS_INDEX_URL: &str = "https://github.com/goldggs/lumaglyph/blob/main/docs/README.md";
+pub const DOCS_INSTALL_URL: &str = "https://github.com/goldggs/lumaglyph/blob/main/docs/INSTALL.md";
+pub const DOCS_QUICKSTART_URL: &str =
+    "https://github.com/goldggs/lumaglyph/blob/main/docs/QUICKSTART.md";
+pub const DOCS_USER_GUIDE_URL: &str =
+    "https://github.com/goldggs/lumaglyph/blob/main/docs/USER-GUIDE.md";
+pub const DOCS_TROUBLESHOOTING_URL: &str =
+    "https://github.com/goldggs/lumaglyph/blob/main/docs/TROUBLESHOOTING.md";
+pub const DOCS_DEVELOPING_URL: &str =
+    "https://github.com/goldggs/lumaglyph/blob/main/docs/DEVELOPING.md";
+
+/// Every documentation link the app can open, for audit tests.
+pub const ALL_DOC_LINKS: [(&str, &str); 7] = [
+    ("Repository", REPO_URL),
+    ("Latest Downloads", LATEST_RELEASE_URL),
+    ("Documentation Index", DOCS_INDEX_URL),
+    ("Installation Guide", DOCS_INSTALL_URL),
+    ("Quick Start", DOCS_QUICKSTART_URL),
+    ("User Guide", DOCS_USER_GUIDE_URL),
+    ("Troubleshooting", DOCS_TROUBLESHOOTING_URL),
+];
+
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const BUILD_GIT_SHA: &str = env!("LUMAGLYPH_GIT_SHA");
 pub const BUILD_TARGET_TRIPLE: &str = env!("LUMAGLYPH_TARGET_TRIPLE");
@@ -93,6 +119,25 @@ pub struct AppPreferences {
     pub video_crf: u8,
     pub ffmpeg_custom_dir: String,
 
+    // Optimisations (background idle, decoder budget, threading)
+    pub idle_when_unfocused: bool,
+    pub pause_decode_when_unfocused: bool,
+    pub idle_when_minimized: bool,
+    pub trim_memory_on_idle: bool,
+    pub worker_threads: usize,
+    pub video_preview_max_dim: u32,
+    pub audio_envelope_enabled: bool,
+    pub frame_dedup_enabled: bool,
+
+    // Rendering & Quality
+    pub fps_cap: u32,
+    pub vsync: bool,
+    pub msaa_samples: u16,
+    pub texture_filter: TextureFilterMode,
+    pub preview_supersample: u8,
+    pub show_fps_readout: bool,
+    pub animation_smoothing: bool,
+
     // Privacy & Release Checks
     pub check_updates_on_startup: bool,
     pub github_repo: String,
@@ -117,13 +162,91 @@ impl Default for AppPreferences {
             png_scale_preset: 2,
             video_crf: 18,
             ffmpeg_custom_dir: String::new(),
+            idle_when_unfocused: true,
+            pause_decode_when_unfocused: true,
+            idle_when_minimized: true,
+            trim_memory_on_idle: true,
+            worker_threads: 0,
+            video_preview_max_dim: 640,
+            audio_envelope_enabled: true,
+            frame_dedup_enabled: true,
+            fps_cap: 60,
+            vsync: true,
+            msaa_samples: 4,
+            texture_filter: TextureFilterMode::Auto,
+            preview_supersample: 1,
+            show_fps_readout: false,
+            animation_smoothing: true,
             check_updates_on_startup: false,
             github_repo: DEFAULT_GITHUB_REPO.to_string(),
         }
     }
 }
 
+/// Texture sampling policy for the rendered ASCII canvas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum TextureFilterMode {
+    /// Nearest above 180% zoom, linear below (crisp glyph edges at all scales).
+    #[default]
+    Auto,
+    /// Always nearest-neighbour (sharpest single-pixel glyph cell edges).
+    Nearest,
+    /// Always bilinear (smoothest motion when zoomed).
+    Linear,
+}
+
+impl TextureFilterMode {
+    pub const ALL: [Self; 3] = [Self::Auto, Self::Nearest, Self::Linear];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto (Nearest when zoomed)",
+            Self::Nearest => "Nearest Neighbor (Crisp)",
+            Self::Linear => "Bilinear (Smooth)",
+        }
+    }
+
+    /// Resolves the concrete sampling mode for the current canvas zoom factor.
+    pub fn resolve(self, zoom: f32) -> &'static str {
+        match self {
+            Self::Auto => {
+                if zoom >= 1.8 {
+                    "nearest"
+                } else {
+                    "linear"
+                }
+            }
+            Self::Nearest => "nearest",
+            Self::Linear => "linear",
+        }
+    }
+}
+
+/// Candidate frame-rate caps offered in `Settings -> Rendering & Quality` (`0` = uncapped).
+pub const FPS_CAP_OPTIONS: [u32; 6] = [0, 15, 24, 30, 60, 144];
+
 impl AppPreferences {
+    /// Effective repaint interval for the current FPS cap (`None` = uncapped/vsync-driven).
+    pub fn repaint_interval(&self) -> Option<std::time::Duration> {
+        match self.fps_cap {
+            0 => None,
+            cap => Some(std::time::Duration::from_secs_f64(
+                1.0 / f64::from(cap.clamp(1, 480)),
+            )),
+        }
+    }
+
+    /// Effective worker-thread count for the parallel ASCII engine (`0` = automatic).
+    pub fn effective_worker_threads(&self) -> usize {
+        if self.worker_threads == 0 {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        } else {
+            self.worker_threads.clamp(1, 64)
+        }
+    }
+
     pub fn config_path() -> Option<PathBuf> {
         dirs::config_dir().map(|d| d.join("lumaglyph").join("preferences.json"))
     }

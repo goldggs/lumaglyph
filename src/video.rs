@@ -656,6 +656,10 @@ fn read_exact_or_eof(r: &mut impl Read, buf: &mut [u8]) -> Result<bool, String> 
 
 /// Bounded 2-frame live preview video streamer for smooth GUI playback with flat RAM
 /// and synchronized per-frame audio-reactive beat envelope.
+///
+/// Supports arbitrary timeline seeking (`seek_to`), continuous position reporting
+/// (`position_secs`) for the on-canvas scrub bar, and a cooperative `idle_hold`
+/// flag so the decoder thread parks itself when the workstation window is unfocused.
 pub struct LiveVideoStream {
     pub path: PathBuf,
     pub meta: VideoMetadata,
@@ -666,23 +670,52 @@ pub struct LiveVideoStream {
     rx: Receiver<(usize, Vec<u8>)>,
     stop_flag: Arc<AtomicBool>,
     pub paused: Arc<AtomicBool>,
+    /// Cooperative background-idle gate (set when the OS window loses focus).
+    pub idle_hold: Arc<AtomicBool>,
+    /// Pending seek target in seconds (`None` = no seek requested).
+    seek_target: Arc<Mutex<Option<f64>>>,
+    /// Current playback position in seconds, stored as raw `f64` bits.
+    position_bits: Arc<AtomicU64>,
 }
 
 impl LiveVideoStream {
+    /// Opens a streaming preview at the workstation's configured decode resolution cap.
     pub fn open(path: &Path) -> Result<Self, String> {
+        Self::open_with_options(path, 640, true)
+    }
+
+    /// Opens a streaming preview with an explicit maximum decode dimension and optional
+    /// audio-envelope analysis (disabled saves a full pre-pass over the file).
+    pub fn open_with_options(
+        path: &Path,
+        max_dim: u32,
+        analyze_audio: bool,
+    ) -> Result<Self, String> {
         let meta = probe_video(path)?;
-        let scale = (640.0 / (meta.width.max(meta.height) as f64)).min(1.0);
+        let cap = f64::from(max_dim.clamp(160, 4096));
+        let scale = (cap / (meta.width.max(meta.height) as f64)).min(1.0);
         let dec_w = (((meta.width as f64 * scale).round() as u32).max(64) + 1) & !1;
         let dec_h = (((meta.height as f64 * scale).round() as u32).max(64) + 1) & !1;
         let fps = meta.fps.clamp(5.0, 60.0);
-        let audio_envelope = extract_audio_envelope(path, fps);
+        let audio_envelope = if analyze_audio {
+            extract_audio_envelope(path, fps)
+        } else {
+            Vec::new()
+        };
+        let duration = meta.duration_secs.unwrap_or(0.0).max(0.0);
 
         let (tx, rx) = mpsc::sync_channel::<(usize, Vec<u8>)>(2);
         let stop_flag = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(false));
+        let idle_hold = Arc::new(AtomicBool::new(false));
+        let seek_target: Arc<Mutex<Option<f64>>> = Arc::new(Mutex::new(None));
+        let position_bits = Arc::new(AtomicU64::new(0.0f64.to_bits()));
 
         let thread_stop = Arc::clone(&stop_flag);
         let thread_paused = Arc::clone(&paused);
+        let thread_idle = Arc::clone(&idle_hold);
+        let thread_seek = Arc::clone(&seek_target);
+        let thread_pos = Arc::clone(&position_bits);
         let pbuf = path.to_path_buf();
 
         std::thread::Builder::new()
@@ -690,10 +723,22 @@ impl LiveVideoStream {
             .spawn(move || {
                 let frame_dur = Duration::from_secs_f64(1.0 / fps);
                 let frame_bytes = (dec_w as usize) * (dec_h as usize) * 3;
-
                 while !thread_stop.load(Ordering::Relaxed) {
+                    // Pick up any pending timeline seek before (re)spawning the decoder.
+                    let seek_from = thread_seek.lock().ok().and_then(|mut g| g.take());
+                    let start_at = seek_from.map_or(0.0, |t| t.clamp(0.0, duration.max(0.0)));
+                    // Align the restart to a frame boundary so audio energy stays in sync.
+                    let start_frame = (start_at * fps).round().max(0.0) as usize;
+                    let start_secs = start_frame as f64 / fps;
+                    // Monotonic index across seeks so the audio envelope lookup stays aligned.
+                    let mut global_idx: usize = start_frame;
+
                     let mut cmd = Command::new(resolve_tool_binary("ffmpeg"));
-                    cmd.args(["-v", "error", "-i"])
+                    cmd.args(["-v", "error"]);
+                    if start_secs > 0.001 {
+                        cmd.args(["-ss", &format!("{start_secs:.3}"), "-noaccurate_seek"]);
+                    }
+                    cmd.arg("-i")
                         .arg(&pbuf)
                         .args([
                             "-vf",
@@ -717,28 +762,36 @@ impl LiveVideoStream {
                         break;
                     };
 
-                    let mut frame_idx = 0usize;
                     let mut next_tick = Instant::now();
+                    let mut restart = false;
                     loop {
                         if thread_stop.load(Ordering::Relaxed) {
                             break;
                         }
-                        while thread_paused.load(Ordering::Relaxed)
+                        // A new seek request always abandons the current decoder pipe.
+                        if thread_seek.lock().map(|g| g.is_some()).unwrap_or(false) {
+                            restart = true;
+                            break;
+                        }
+                        while (thread_paused.load(Ordering::Relaxed)
+                            || thread_idle.load(Ordering::Relaxed))
                             && !thread_stop.load(Ordering::Relaxed)
                         {
-                            std::thread::sleep(Duration::from_millis(25));
+                            std::thread::sleep(Duration::from_millis(20));
                             next_tick = Instant::now();
                         }
 
                         let mut buf = vec![0u8; frame_bytes];
                         match read_exact_or_eof(&mut stdout, &mut buf) {
                             Ok(true) => {
-                                if tx.send((frame_idx, buf)).is_err() {
+                                let pos = global_idx as f64 / fps;
+                                thread_pos.store(pos.to_bits(), Ordering::Relaxed);
+                                if tx.send((global_idx, buf)).is_err() {
                                     let _ = child.kill();
                                     let _ = child.wait();
                                     return;
                                 }
-                                frame_idx += 1;
+                                global_idx += 1;
                                 next_tick += frame_dur;
                                 let now = Instant::now();
                                 if next_tick > now {
@@ -747,11 +800,17 @@ impl LiveVideoStream {
                                     next_tick = now;
                                 }
                             }
-                            _ => break, // Loop back to start seamlessly
+                            _ => break, // End of stream: loop back to the beginning seamlessly
                         }
                     }
                     let _ = child.kill();
                     let _ = child.wait();
+                    if !restart {
+                        // Natural end of file: rewind to the start on the next pass.
+                        if let Ok(mut g) = thread_seek.lock() {
+                            *g = Some(0.0);
+                        }
+                    }
                 }
             })
             .map_err(|e| format!("Failed spawning video preview thread: {e}"))?;
@@ -766,7 +825,47 @@ impl LiveVideoStream {
             rx,
             stop_flag,
             paused,
+            idle_hold,
+            seek_target,
+            position_bits,
         })
+    }
+
+    /// Total timeline duration in seconds (0.0 when unknown).
+    pub fn duration_secs(&self) -> f64 {
+        self.meta.duration_secs.unwrap_or(0.0).max(0.0)
+    }
+
+    /// Current playback position in seconds.
+    pub fn position_secs(&self) -> f64 {
+        f64::from_bits(self.position_bits.load(Ordering::Relaxed))
+    }
+
+    /// Requests a timeline seek to `secs`, clamped to the media duration.
+    pub fn seek_to(&self, secs: f64) {
+        let clamped = secs.clamp(0.0, self.duration_secs());
+        if let Ok(mut g) = self.seek_target.lock() {
+            *g = Some(clamped);
+        }
+        self.position_bits
+            .store(clamped.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Relative seek helper used by the on-canvas jump buttons and arrow keys.
+    pub fn seek_by(&self, delta_secs: f64) {
+        self.seek_to(self.position_secs() + delta_secs);
+    }
+
+    /// Flips play/pause and returns the new paused state.
+    pub fn toggle_pause(&self) -> bool {
+        let next = !self.paused.load(Ordering::Relaxed);
+        self.paused.store(next, Ordering::Relaxed);
+        next
+    }
+
+    /// Parks the decoder thread while the OS window is unfocused/minimized.
+    pub fn set_idle_hold(&self, idle: bool) {
+        self.idle_hold.store(idle, Ordering::Relaxed);
     }
 
     /// Non-blocking drain to latest decoded frame and its synchronized audio beat energy.
@@ -783,6 +882,103 @@ impl LiveVideoStream {
             None
         }
     }
+}
+
+/// Formats a timeline position as a professional `MM:SS.d` (or `H:MM:SS.d`) timecode.
+pub fn format_timecode(secs: f64) -> String {
+    let clamped = if secs.is_finite() { secs.max(0.0) } else { 0.0 };
+    let total_tenths = (clamped * 10.0).round() as u64;
+    let tenths = total_tenths % 10;
+    let total_secs = total_tenths / 10;
+    let s = total_secs % 60;
+    let m = (total_secs / 60) % 60;
+    let h = total_secs / 3600;
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}.{tenths}")
+    } else {
+        format!("{m:02}:{s:02}.{tenths}")
+    }
+}
+
+/// Decodes exactly one full-resolution RGB24 frame at `secs` for on-demand frame export.
+/// Uses input seeking plus `-frames:v 1`, so cost is bounded regardless of file length.
+///
+/// Robust against end-of-stream edges: if the requested timestamp lands past the final frame
+/// (or on a seek point the decoder cannot satisfy), progressively earlier candidates are tried,
+/// ending at the very first frame, so an export never fails just because of rounding.
+pub fn extract_source_frame(path: &Path, secs: f64) -> Result<(Vec<u8>, u32, u32), String> {
+    let meta = probe_video(path)?;
+    if meta.width == 0 || meta.height == 0 {
+        return Err("Could not determine video frame dimensions".to_string());
+    }
+    let duration = meta.duration_secs.unwrap_or(0.0).max(0.0);
+    let frame_dur = if meta.fps > 0.5 { 1.0 / meta.fps } else { 0.04 };
+    let requested = if secs.is_finite() { secs.max(0.0) } else { 0.0 };
+
+    let mut candidates: Vec<f64> = Vec::with_capacity(5);
+    let upper = if duration > 0.0 {
+        (duration - frame_dur * 1.5).max(0.0)
+    } else {
+        requested
+    };
+    candidates.push(requested.min(upper));
+    candidates.push((requested - frame_dur * 2.0).max(0.0).min(upper));
+    candidates.push(upper);
+    candidates.push(0.0);
+    candidates.dedup_by(|a, b| (*a - *b).abs() < 1e-4);
+
+    let expected = (meta.width as usize) * (meta.height as usize) * 3;
+    let mut last_err = String::from("no candidate timestamp produced a frame");
+
+    for seek in candidates {
+        let mut cmd = Command::new(resolve_tool_binary("ffmpeg"));
+        cmd.args(["-v", "error"]);
+        if seek > 0.001 {
+            cmd.args(["-ss", &format!("{seek:.3}")]);
+        }
+        cmd.arg("-i")
+            .arg(path)
+            .args([
+                "-frames:v",
+                "1",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "pipe:1",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        configure_no_window(&mut cmd);
+
+        let out = match cmd.output() {
+            Ok(o) => o,
+            Err(e) => {
+                last_err = format!("Failed launching ffmpeg for frame export: {e}");
+                continue;
+            }
+        };
+        if !out.status.success() {
+            last_err = format!(
+                "ffmpeg could not decode the frame at {seek:.2}s (exit code {:?})",
+                out.status.code()
+            );
+            continue;
+        }
+        if out.stdout.len() < expected {
+            last_err = format!(
+                "Decoded frame at {seek:.2}s is truncated ({} of {expected} bytes)",
+                out.stdout.len()
+            );
+            continue;
+        }
+        let mut rgb = out.stdout;
+        rgb.truncate(expected);
+        return Ok((rgb, meta.width, meta.height));
+    }
+
+    Err(last_err)
 }
 
 impl Drop for LiveVideoStream {

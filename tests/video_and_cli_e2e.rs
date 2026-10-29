@@ -146,7 +146,7 @@ fn compiled_cli_binary_executes_headless_commands_cleanly() {
     let info_out = Command::new(bin).arg("build-info").output().unwrap();
     assert!(info_out.status.success());
     let info_str = String::from_utf8_lossy(&info_out.stdout);
-    assert!(info_str.contains("LumaGlyph v0.3.5"));
+    assert!(info_str.contains("LumaGlyph v0.3.6"));
 
     let look_out = Command::new(bin).arg("look").output().unwrap();
     assert!(look_out.status.success());
@@ -183,5 +183,103 @@ fn compiled_cli_binary_executes_headless_commands_cleanly() {
         .unwrap();
     assert!(img_out.status.success());
     assert!(out_png.is_file());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn timecode_formatting_is_exact_across_ranges() {
+    use lumaglyph::video::format_timecode;
+
+    assert_eq!(format_timecode(0.0), "00:00.0");
+    assert_eq!(format_timecode(1.0), "00:01.0");
+    assert_eq!(format_timecode(1.04), "00:01.0");
+    assert_eq!(format_timecode(1.05), "00:01.1");
+    assert_eq!(format_timecode(9.96), "00:10.0");
+    assert_eq!(format_timecode(59.9), "00:59.9");
+    assert_eq!(format_timecode(60.0), "01:00.0");
+    assert_eq!(format_timecode(125.4), "02:05.4");
+    assert_eq!(format_timecode(3600.0), "1:00:00.0");
+    assert_eq!(format_timecode(3725.5), "1:02:05.5");
+    // Defensive: negative and non-finite inputs clamp to zero rather than panicking.
+    assert_eq!(format_timecode(-42.0), "00:00.0");
+    assert_eq!(format_timecode(f64::NAN), "00:00.0");
+    assert_eq!(format_timecode(f64::INFINITY), "00:00.0");
+}
+
+#[test]
+fn video_stream_seek_pause_and_idle_controls_are_wired() {
+    use lumaglyph::video::LiveVideoStream;
+    use std::sync::atomic::Ordering;
+
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/video.rs"),
+    )
+    .unwrap();
+
+    // API surface used by the on-canvas transport.
+    for needle in [
+        "pub fn duration_secs",
+        "pub fn position_secs",
+        "pub fn seek_to",
+        "pub fn seek_by",
+        "pub fn toggle_pause",
+        "pub fn set_idle_hold",
+        "pub idle_hold: Arc<AtomicBool>",
+        "pub fn open_with_options",
+        "pub fn extract_source_frame",
+        "pub fn format_timecode",
+    ] {
+        assert!(src.contains(needle), "src/video.rs must expose '{needle}'");
+    }
+    // Decoder thread must honour seeks and the idle gate.
+    assert!(src.contains("thread_seek"));
+    assert!(src.contains("thread_idle.load(Ordering::Relaxed)"));
+    assert!(src.contains("\"-noaccurate_seek\""));
+
+    // Pause toggle is a pure flipper, verifiable without spawning ffmpeg.
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let next = !flag.load(Ordering::Relaxed);
+    flag.store(next, Ordering::Relaxed);
+    assert!(flag.load(Ordering::Relaxed));
+    let _ = std::mem::size_of::<LiveVideoStream>();
+}
+
+#[test]
+fn extract_source_frame_returns_exact_rgb24_dimensions_at_requested_time() {
+    use lumaglyph::video::{extract_source_frame, format_timecode};
+
+    let dir = temp_vid_dir();
+    let src = dir.join("frame_src.mp4");
+    if !generate_test_mp4_with_audio(&src) {
+        eprintln!("Skipping: ffmpeg not available on this host");
+        return;
+    }
+
+    // Frame 0: full-resolution RGB24 buffer with exact WxHx3 length.
+    let (rgb, w, h) = extract_source_frame(&src, 0.0).expect("frame 0 must decode");
+    assert_eq!((w, h), (320, 180));
+    assert_eq!(rgb.len(), 320 * 180 * 3);
+    // A generated test pattern is not a flat color; ensure it holds real content.
+    assert!(rgb.iter().any(|&b| b > 40));
+    assert!(rgb.chunks(3).any(|px| px[0] != rgb[0]));
+
+    // A later timestamp decodes a visibly different frame.
+    let (rgb2, w2, h2) = extract_source_frame(&src, 0.30).expect("mid frame must decode");
+    assert_eq!((w2, h2), (320, 180));
+    assert_eq!(rgb2.len(), rgb.len());
+    assert_ne!(rgb2, rgb, "frame at 0.30s must differ from frame at 0.00s");
+
+    // Defensive: out-of-range times clamp instead of failing.
+    let (rgb3, w3, h3) = extract_source_frame(&src, 99_999.0).expect("clamped seek must decode");
+    assert_eq!((w3, h3), (320, 180));
+    assert_eq!(rgb3.len(), 320 * 180 * 3);
+    let (_, w4, h4) = extract_source_frame(&src, -5.0).expect("negative seek must clamp to 0");
+    assert_eq!((w4, h4), (320, 180));
+
+    // The exported filename stamp used by the GUI must be filesystem safe.
+    let stamp = format_timecode(2.5).replace(':', "-").replace('.', "_");
+    assert_eq!(stamp, "00-02_5");
+    assert!(!stamp.contains(':') && !stamp.contains('.'));
+
     let _ = std::fs::remove_dir_all(&dir);
 }

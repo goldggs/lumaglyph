@@ -2,74 +2,178 @@
   <img src="assets/icons/lumaglyph-256.png" width="112" height="112" alt="LumaGlyph Logo" />
 </p>
 
-# LumaGlyph
+<h1 align="center">LumaGlyph</h1>
 
-[![CI](https://github.com/goldggs/lumaglyph/actions/workflows/ci.yml/badge.svg)](https://github.com/goldggs/lumaglyph/actions/workflows/ci.yml)
-[![Release](https://github.com/goldggs/lumaglyph/actions/workflows/release.yml/badge.svg)](https://github.com/goldggs/lumaglyph/releases)
-[![License: MIT](https://img.shields.io/badge/License-MIT-7189A6.svg)](LICENSE)
+<p align="center">
+  Turn any image or video into genuine, colorful ASCII art.<br />
+  A single app. No installer, no account, no internet required.
+</p>
 
-**High-throughput, ultra-low-memory 95-character color ASCII imaging and streaming video workstation in native Rust.**
-
-Unlike basic 10-character brightness ramps (`@%#*+=-:. `), **LumaGlyph** treats every printable 7-bit ASCII glyph (`0x20..=0x7E`) as 2D geometry. Each font is dynamically calibrated into 32-byte-aligned **8D shape + structure-tensor orientation vectors**, locking `/ \ | _ ( ) [ ] < > ^ ~ , ' ; ! ? $ & % W M # @` directly onto curves, diagonals, silhouettes, and tonal gradients at **500+ FPS** (`< 2 ms/frame`) and **`~7-9 MB` CLI RSS**.
-
-![LumaGlyph v0.3.5 - Fresh Empty Workstation](docs/screenshots/v033-fresh-window.png)
+<p align="center">
+  <a href="https://github.com/goldggs/lumaglyph/releases/latest"><b>Download LumaGlyph</b></a>
+  &nbsp;|&nbsp;
+  <a href="docs/INSTALL.md">How to install</a>
+  &nbsp;|&nbsp;
+  <a href="docs/QUICKSTART.md">Quick start</a>
+  &nbsp;|&nbsp;
+  <a href="docs/USER-GUIDE.md">User guide</a>
+</p>
 
 ---
 
-## New in `v0.3.5` - Native Cross-Platform Brand Identity & Multi-OS App Packaging
+## Download and run it (no coding needed)
+
+**Step 1.** Open the releases page: **<https://github.com/goldggs/lumaglyph/releases/latest>**
+
+**Step 2.** Scroll down to the heading called **Assets** on that page, and click the file for your
+computer:
+
+| Your computer | Click this file |
+| :--- | :--- |
+| **Windows 10 / 11** | [`lumaglyph-windows-x86_64.zip`](https://github.com/goldggs/lumaglyph/releases/latest/download/lumaglyph-windows-x86_64.zip) |
+| **Mac, Apple Silicon** (M1 / M2 / M3 / M4) | [`LumaGlyph-macos-arm64-app.zip`](https://github.com/goldggs/lumaglyph/releases/latest/download/LumaGlyph-macos-arm64-app.zip) |
+| **Mac, Intel** | [`LumaGlyph-macos-x86_64-app.zip`](https://github.com/goldggs/lumaglyph/releases/latest/download/LumaGlyph-macos-x86_64-app.zip) |
+| **Linux** | [`lumaglyph-linux-x86_64.tar.gz`](https://github.com/goldggs/lumaglyph/releases/latest/download/lumaglyph-linux-x86_64.tar.gz) |
+
+**Step 3.** Unzip it and open the app:
+
+- **Windows:** extract the zip, then double-click `lumaglyph.exe`. If Windows shows "Windows
+  protected your PC", click **More info > Run anyway** - that is normal for any app outside the
+  Microsoft Store.
+- **macOS:** double-click the zip to get `LumaGlyph.app`, drag it to Applications, then
+  **right-click > Open** the first time.
+- **Linux:** extract, then `chmod +x lumaglyph && ./lumaglyph`.
+
+That is the whole installation. The app opens into a calm empty window - press `Ctrl + O`
+(`Cmd + O` on macOS) or drag an image onto it.
+
+> **New to GitHub?** You are not alone, and this page is written for you. The full walkthrough with
+> screenshots of where to click is in **[docs/INSTALL.md](docs/INSTALL.md)**. You never need a
+> GitHub account, a terminal, or any developer tools to use LumaGlyph.
+
+![LumaGlyph v0.3.6 - Fresh Empty Workstation](docs/screenshots/v036-fresh-window.png)
+
+---
+
+## Documentation
+
+| Guide | Read it when you want to... |
+| :--- | :--- |
+| **[1. Download & Install](docs/INSTALL.md)** | Know exactly which file to pick and how to open it, per OS. |
+| **[2. Quick Start](docs/QUICKSTART.md)** | Open your first image or video, tweak it, and save the result. |
+| **[3. User Guide](docs/USER-GUIDE.md)** | Understand every panel, slider, settings tab, and shortcut. |
+| **[4. Troubleshooting & FAQ](docs/TROUBLESHOOTING.md)** | Fix "it will not open", stutter, no audio reaction, and more. |
+| **[5. Building From Source](docs/DEVELOPING.md)** | Compile it, run the tests, or work on the code. |
+
+The same guides are built into the app: press **F1** anywhere, or use the **Help** menu.
+
+---
+
+## New in `v0.3.6` - Optimisation & Rendering Tabs, In-App Documentation, On-Video Transport
+
+- **On-Video Playback Controls & Timeline:**
+  - Play/pause now sits **directly on the video**, not in a separate toolbar, alongside jump-back and
+    jump-forward-5-seconds buttons and a draggable timeline scrub bar showing `current / total`
+    timecode.
+  - Scrubbing re-seeks the decoder to the exact timestamp, so it is instant even in hour-long files,
+    and playback continues from wherever you release the handle.
+  - **Export Frame** menu on the same bar: save the **ASCII frame** as you see it, save the
+    **original full-resolution source frame** as PNG, or copy the frame as ANSI text.
+- **`Settings -> Rendering & Quality` Tab:**
+  - Frame-rate cap (Uncapped / 15 / 24 / 30 / 60 / 144 FPS), VSync, 2x/4x/8x MSAA, texture sampling
+    policy (Auto / Nearest / Bilinear), 2x supersampled canvas raster, smoothed zoom, and an optional
+    live measured-FPS readout.
+- **`Settings -> Optimisations` Tab:**
+  - **Idle when unfocused** (zero repaints while you work in another window), **pause video decode
+    while unfocused**, **stay idle while minimized**, and **release scratch buffers after 10 seconds
+    of idle**.
+  - Worker-thread control for the ASCII engine, redundant-frame skipping for static shots, a live
+    preview decode-height cap (480p -> 1080p), and an optional audio-envelope analysis switch.
+- **Documentation Written For Non-Developers:**
+  - New `docs/` set: **Install**, **Quick Start**, **User Guide**, **Troubleshooting & FAQ**, and
+    **Developing**, all plain-language.
+  - The app links to them everywhere: **Help** menu (Getting Started, How to Download & Install, User
+    Guide, Troubleshooting, Latest Downloads, Repository), a **Documentation** row on the empty
+    startup window, an `F1` shortcut, and a **Documentation & Support** block in
+    `Settings -> About & Build`.
+
+![LumaGlyph settings optimisations tab](docs/screenshots/v036-settings-optimisations.png)
+
+![LumaGlyph on-video transport with timeline and frame export](docs/screenshots/v036-video-transport.png)
+
+---
+
+## `v0.3.5` - Native Cross-Platform Brand Identity & Multi-OS App Packaging
 
 - **Native Application Icons Across Windows, macOS, and Linux:**
-  - **Windows (`.ico` compiled into `lumaglyph.exe`):** Multi-resolution `lumaglyph.ico` (`16, 24, 32, 48, 64, 128, 256` px 32-bit RGBA) and `VERSIONINFO` metadata (`LumaGlyph`) are embedded directly into `lumaglyph.exe`'s PE `.rsrc` resource section via `build.rs` (verified automatically in CI).
-  - **macOS (`.icns` + `LumaGlyph.app` bundle):** Ships native Apple Icon Image `lumaglyph.icns` (`16` up to `1024` px Retina) inside ready-to-launch `LumaGlyph-macos-{arm64,x86_64}-app.zip` bundles alongside standalone CLI tarballs.
-  - **Linux (`.png` + `.desktop`):** Ships `lumaglyph.desktop` + `512x512` `lumaglyph.png` in `lumaglyph-linux-x86_64-desktop.tar.gz`, while `ViewportBuilder::with_icon` sets the live X11/Wayland/Windows/macOS window, taskbar, and Dock icon at runtime from embedded `256x256` RGBA bytes.
-- **Fresh VS Code-Style Empty Startup, Normal Reset & Automatic Update-and-Relaunch:**
+  - **Windows (`.ico` compiled into `lumaglyph.exe`):** Multi-resolution `lumaglyph.ico`
+    (`16, 24, 32, 48, 64, 128, 256` px 32-bit RGBA) and `VERSIONINFO` metadata are embedded directly
+    into `lumaglyph.exe`'s PE `.rsrc` resource section via `build.rs` (verified automatically in CI).
+  - **macOS (`.icns` + `LumaGlyph.app` bundle):** Ships native Apple Icon Image `lumaglyph.icns`
+    (`16` up to `1024` px Retina) inside ready-to-launch `LumaGlyph-macos-{arm64,x86_64}-app.zip`
+    bundles alongside standalone CLI tarballs.
+  - **Linux (`.png` + `.desktop`):** Ships `lumaglyph.desktop` + `512x512` `lumaglyph.png`, while
+    `ViewportBuilder::with_icon` sets the live X11/Wayland/Windows/macOS window, taskbar, and Dock
+    icon at runtime from embedded `256x256` RGBA bytes.
 
-- **Fresh VS Code-Style Empty Startup (Zero Samples Anywhere):**
-  - Launching `lumaglyph` opens directly into a calm, uncluttered empty window - slim top menu strip, clean neutral workbench with discrete recessed keybinding hints (`Ctrl+O`, `Ctrl+Shift+O`, `Ctrl+B`, `Ctrl+,` + OS drag-and-drop), and a quiet `Ready` status bar with zero side panels or clutter until media is opened (or `Ctrl+B` toggles the Inspector).
-  - All internal demo/sample generators have been permanently removed from the codebase.
-- **One-Click Reset to Normal Default (`Ctrl+Shift+R`):**
-  - Balanced, unboosted default ASCII parameters (`contrast = 1.0`, `saturation = 1.0`, `gamma = 1.0`, `brightness = 0.0`) render clean, faithful ASCII art out of the box.
-  - Reset everything back to normal default anytime via **Reset to Default** in the Command Strip, Inspector header, `Presets -> Reset to Default`, `View -> Reset to Default`, `Settings -> Engine & Defaults`, or `Ctrl+Shift+R`.
-- **Clean Workstation Chrome:**
-  - Removed the Split-Wipe comparison curtain and removed unsolicited theme/status footer labels on the bottom right.
-- **In-Place Release Rebuild / Install & Automatic Relaunch:**
-  - Clicking **Update & Relaunch** in `Settings -> About & Build` (or running `lumaglyph self-update`) verifies the latest GitHub release, rebuilds from the verified release tag when running inside a clean local Cargo/Git checkout (or atomically installs the 8-layer SHA-256-verified native release binary in-place via safe `.old` swap), and **automatically launches the new release** while closing the old process.
+![LumaGlyph icon across sizes](docs/screenshots/v035-icon-sizes.png)
 
 ---
 
-## `v0.3.1` Architecture Highlights - Single-Window Windows GUI & 8-Layer Verified Updater
+## `v0.3.4` - Fresh Empty Workstation, Normal Reset & Automatic Update-and-Relaunch
 
-- **Standalone Single-App Windows GUI (`IMAGE_SUBSYSTEM_WINDOWS_GUI`):**
-  - Windows `lumaglyph.exe` is compiled under `windows_subsystem = "windows"` (`PE Optional Header Subsystem == 2`, verified automatically in CI and Release builds) so launching `lumaglyph.exe` opens **only** the native GPU workstation with **zero attached console/terminal window**.
-  - Headless CLI subcommands (`image`, `video`, `bench`, `look`, `build-info`, `check-update`, `self-update`) remain inside the same single binary: when invoked from an existing PowerShell / `cmd.exe` / Windows Terminal session without pipe redirection, LumaGlyph attaches cleanly via `AttachConsole(ATTACH_PARENT_PROCESS)` and never calls `AllocConsole`. Background `ffmpeg` / `ffprobe` / build workers always spawn with `CREATE_NO_WINDOW` (`0x0800_0000`).
-- **8-Layer Cryptographically Verified Remote Release Checker & Installer:**
-  - Opt-in release checks and updates (`Settings -> About & Build -> Update & Relaunch` or `lumaglyph self-update`) enforce 8 independent defense layers:
-    1. **Canonical Repository Pinning:** Locked by default to `goldggs/lumaglyph`.
-    2. **Strict Origin & URL Parser:** HTTPS-only (`:443`), zero credentials, zero fragments, zero dot-segment/percent-encoded path traversal, pinned to official GitHub API/Release/CDN hosts.
-    3. **Manual Redirect Hop Inspection (`redirects(0)`):** Every HTTP `301/302/303/307/308` hop is validated manually before following (`<= 3` hops), blocking HTTPS-to-HTTP downgrades and untrusted domains.
-    4. **Release Integrity & Downgrade Guard:** Rejects drafts, prereleases, malformed SemVer tags, and replay/downgrade versions (`<= APP_VERSION`) before downloading.
-    5. **Exact Platform Asset Binding:** Selects only the exact archive compiled for the running OS + CPU (`lumaglyph-linux-x86_64.tar.gz`, `lumaglyph-macos-arm64.tar.gz`, `lumaglyph-macos-x86_64.tar.gz`, `lumaglyph-windows-x86_64.zip`).
-    6. **Mandatory Constant-Time SHA-256 Verification Before Decompression:** Fetches `SHA256SUMS.txt` from the identical release tag and verifies the raw archive bytes in constant time prior to opening `tar.gz` or `zip`.
-    7. **Anti-Bomb & Anti-Traversal In-Memory Extraction:** Blocks `TarSlip`/`ZipSlip` (`..`, `/`, `\`, drive prefixes), symlinks, hardlinks, device nodes, unexpected `.dll`/`.so`/`.sh`/`.bat` sidecars, duplicate-entry shadowing, and decompression bombs.
-    8. **Native CPU Executable Header + Atomic In-Place Swap:** Inspects magic/machine/subsystem headers (`ELF64 x86_64`, `Mach-O 64-bit arm64/x86_64`, `PE32+ AMD64 WINDOWS_GUI`), swaps via sibling staging + `.old` backup with automatic rollback, cleans up `.old` on startup, and relaunches automatically.
-- **1,236 Automated Corner-to-Corner Tests (`cargo test --release`):**
-  - 7 integration and deterministic splitmix64 fuzz suites (`1,236` `#[test]` functions) covering URL/redirect/SHA-256/archive/PE-header fault injection and in-place self-update + relaunch against live loopback HTTP mock servers, fresh empty-window & zero-sample GUI invariants, all 95 ASCII shape vectors across 18 atlas heights, all 9 color modes, `lg2:` Look Code fuzzing, all 90 theme x accent x corner WCAG contrast combinations, exporters, and streaming `ffmpeg` E2E transcoding.
+- **Fresh VS Code-Style Empty Startup (Zero Samples Anywhere):** launching opens a calm, uncluttered
+  empty window - slim menu strip, recessed keybinding hints, and a quiet status bar with no side
+  panels until media is opened (or `Ctrl+B` toggles the Inspector).
+- **One-Click Reset to Normal Default (`Ctrl+Shift+R`):** balanced, unboosted default parameters
+  (`contrast = 1.0`, `saturation = 1.0`, `gamma = 1.0`, `brightness = 0.0`) render clean, faithful
+  ASCII art out of the box, and can be restored from anywhere.
+- **Clean Workstation Chrome:** Split-Wipe comparison curtain removed, unsolicited theme/status
+  footer labels removed.
+- **In-Place Release Rebuild / Install & Automatic Relaunch:** **Update & Relaunch** verifies the
+  latest release, rebuilds from the verified tag inside a local Cargo checkout (with safe Windows
+  `.old` swap), or atomically installs the 8-layer SHA-256-verified release binary, then relaunches.
+
+---
+
+## `v0.3.1` - Single-Window Windows GUI & 8-Layer Verified Updater
+
+- **Standalone Single-App Windows GUI (`IMAGE_SUBSYSTEM_WINDOWS_GUI`):** Windows `lumaglyph.exe` is
+  compiled under `windows_subsystem = "windows"` (`PE Optional Header Subsystem == 2`, verified in CI
+  and release builds) so launching it opens **only** the native GPU workstation with **zero attached
+  console/terminal window**. Headless CLI subcommands attach to an existing shell via
+  `AttachConsole(ATTACH_PARENT_PROCESS)` and never call `AllocConsole`; background `ffmpeg` /
+  `ffprobe` / build workers always spawn with `CREATE_NO_WINDOW`.
+- **8-Layer Cryptographically Verified Remote Release Checker & Installer** (opt-in only):
+  1. **Canonical Repository Pinning** - locked to `goldggs/lumaglyph`.
+  2. **Strict Origin & URL Parser** - HTTPS-only, no credentials, no fragments, no dot-segment or
+     percent-encoded traversal, pinned to official GitHub API/Release/CDN hosts.
+  3. **Manual Redirect Hop Inspection** - every `301/302/303/307/308` hop validated before
+     following (`<= 3` hops), blocking HTTPS-to-HTTP downgrades and untrusted domains.
+  4. **Release Integrity & Downgrade Guard** - rejects drafts, prereleases, malformed SemVer, and
+     replay/downgrade versions.
+  5. **Exact Platform Asset Binding** - only the archive compiled for the running OS + CPU.
+  6. **Constant-Time SHA-256 Verification Before Decompression** against `SHA256SUMS.txt`.
+  7. **Anti-Bomb & Anti-Traversal In-Memory Extraction** - blocks `TarSlip`/`ZipSlip`, symlinks,
+     hardlinks, device nodes, unexpected sidecars, duplicate-entry shadowing, and decompression
+     bombs.
+  8. **Native Executable Header Check + Atomic In-Place Swap** - validates `ELF64 x86_64`,
+     `Mach-O 64-bit arm64/x86_64`, or `PE32+ AMD64 WINDOWS_GUI`, swaps via sibling staging with
+     `.old` backup and rollback, and relaunches automatically.
 
 ---
 
 ## Pro Grading Suite Workstation
 
-- **Calibrated Pro Grading Suite Chrome:**
-  - Neutral matte `#141416` / `#1C1C1F` surfaces, tight `2px` precision geometry, `1px` low-contrast hairline rules, collapsible `All | Color | Geometry | Output` inspector (`Ctrl+B`), one-click **Reset to Default** (`Ctrl+Shift+R`), and custom two-column scrub faders with double-click-to-reset.
-  - Zero emojis anywhere in the interface or binary (`eframe` stock fonts and `NotoEmoji` stripped at compile time) and zero glowing neon UI badges so canvas color grading never competes with application chrome.
-- **Embedded Studio Typography (`IBM Plex Sans` + `JetBrains Mono`):**
-  - Self-contained with **IBM Plex Sans** (`Regular` + `Medium`) for UI labels and **JetBrains Mono** for aligned tabular numeric readouts, hex codes, cell coordinates, `lg2:` Look Codes, and the 95-glyph ASCII engine.
-- **Multi-Tab Workstation Settings (`Ctrl+,`):**
-  - **Appearance:** 5 calibrated workstation themes (**Graphite Pro**, **OLED Reference `#000000`**, **Carbon Tungsten**, **Nordic Slate**, and **Daylight Paper**), 6 indicator accent overrides, UI density scaling, corner geometry, and alpha checkerboard contrast.
-  - **Engine & Defaults:** Persistent startup grid columns, character preset, color mode, OLED matte default, font loader, **Reset ASCII Parameters to Normal Default**, and **Restore All Settings to Default**.
-  - **Export & Video:** PNG raster supersampling (`1x` / `2x HiDPI` / `3x Print`), H.264 MP4 `-crf` quality control, and custom `ffmpeg` / `ffprobe` binary directory configuration.
-  - **Shortcuts:** Complete keyboard and mouse reference.
-  - **About & Build:** Live diagnostic table, one-click **Copy Build Info**, opt-in **Check Releases**, and **Update & Relaunch**.
+- **Calibrated Pro Grading Suite Chrome:** neutral matte `#141416` / `#1C1C1F` surfaces, tight `2px`
+  precision geometry, `1px` low-contrast hairline rules, collapsible `All | Color | Geometry |
+  Output` inspector (`Ctrl+B`), one-click **Reset to Default** (`Ctrl+Shift+R`), and custom
+  two-column scrub faders with double-click-to-reset. Zero emojis and zero glowing badges, so canvas
+  color grading never competes with application chrome.
+- **Embedded Studio Typography:** **IBM Plex Sans** (Regular + Medium) for UI labels and
+  **JetBrains Mono** for aligned tabular numerics, hex codes, cell coordinates, `lg2:` Look Codes.
+- **Seven-Tab Workstation Settings (`Ctrl+,`):** Appearance, Engine & Defaults, **Rendering &
+  Quality**, **Optimisations**, Export & Video, Shortcuts, and About & Build.
 
 ![LumaGlyph Workstation Settings: Appearance & Themes](docs/screenshots/v033-settings-appearance.png)
 
@@ -79,37 +183,48 @@ Unlike basic 10-character brightness ramps (`@%#*+=-:. `), **LumaGlyph** treats 
 
 ## Core Engine Capabilities
 
-- **Genuine 95-Character Shape-Vector Matching:** 6 staggered spatial sub-cells + 2D structure-tensor orientation (`Jxx - Jyy`, `2*Jxy`) with external-neighbor directional contrast crunching.
-- **True OLED `#000000` Pitch-Black Mode + Shadow Noise Gate:** `--oled-black` + `--black-gate <0.00..0.35>` clamps dark sensor/compression grain cleanly to `' '` + `#000000`.
-- **Transparent Alpha Exports (`RGBA [0,0,0,0]`) + Neon Wireframe Mode:** `--transparent` and `--wireframe` render alpha-cutout overlays across **PNG**, **SVG**, **HTML**, **GIF**, **VP9 Alpha `.webm` (`yuva420p`)**, and **RGBA `.mov`**.
-- **Audio-Reactive Streaming Video (`--audio-reactive`):** Bounded `ffmpeg` pipes process 4K or hour-long videos in flat `~7-9 MB` RAM while preserving audio tracks and modulating edge lock and luminance in sync with transient beats.
-- **9 Color Modes & Custom Tri-Tone Ramps:** **TrueColor 24-bit** (with ink-coverage luminance compensation), **Dual-Color**, **Custom Tri-Tone** (`Shadow -> Midtone -> Highlight`), **CRT Amber & P1 Green**, **Cyberpunk Neon**, **ANSI-16**, **xterm-256**, and **Monochrome Ivory** + shareable `lg2:` Look Codes.
-- **100% Offline by Default & Path-Sanitized Releases:** Zero telemetry and zero startup network sockets. Cross-platform binaries for **Linux (`x86_64`)**, **macOS (`arm64` & `x86_64`)**, and **Windows (`x86_64`)** are built in GitHub Actions with `--remap-path-prefix`, `/DEBUG:NONE`, symbol stripping, Windows `WINDOWS_GUI` PE subsystem verification, and an automated CI binary path-leak audit.
+- **Genuine 95-Character Shape-Vector Matching:** 6 staggered spatial sub-cells + 2D structure-tensor
+  orientation (`Jxx - Jyy`, `2*Jxy`) with external-neighbor directional contrast crunching. Every
+  printable ASCII glyph (`0x20..=0x7E`) is treated as geometry, not as a brightness ramp.
+- **True OLED `#000000` Pitch-Black Mode + Shadow Noise Gate:** clamps dark sensor and compression
+  grain cleanly to `' '` + `#000000`.
+- **Transparent Alpha Exports (`RGBA [0,0,0,0]`) + Neon Wireframe Mode:** alpha-cutout overlays across
+  **PNG**, **SVG**, **HTML**, **GIF**, **VP9 Alpha `.webm` (`yuva420p`)**, and **RGBA `.mov`**.
+- **Audio-Reactive Streaming Video:** bounded `ffmpeg` pipes process 4K or hour-long videos in flat
+  `~7-9 MB` RAM while preserving audio tracks and modulating edge lock and luminance in sync with
+  transient beats.
+- **9 Color Modes & Custom Tri-Tone Ramps:** TrueColor 24-bit, Dual-Color, Custom Tri-Tone, CRT Amber
+  & P1 Green, Cyberpunk Neon, ANSI-16, xterm-256, Monochrome Ivory, plus shareable `lg2:` Look Codes.
+- **100% Offline by Default & Path-Sanitized Releases:** zero telemetry and zero startup network
+  sockets. Cross-platform binaries are built in GitHub Actions with `--remap-path-prefix`,
+  `/DEBUG:NONE`, symbol stripping, Windows `WINDOWS_GUI` PE subsystem verification, and an automated
+  binary path-leak audit.
 
 ---
 
-## Quick Start
+## Command Line
 
-Download prebuilt binaries for **Linux**, **macOS**, and **Windows** from [**GitHub Releases**](https://github.com/goldggs/lumaglyph/releases).
+Download prebuilt binaries from [**GitHub Releases**](https://github.com/goldggs/lumaglyph/releases).
 
-### Launch Native GPU Workstation
+### Launch the native GPU workstation
+
 ```bash
-# Opens clean empty default workstation:
-lumaglyph
-
-# Or open an image or video directly on launch:
-lumaglyph photo.png
+lumaglyph                                  # clean empty workstation
+lumaglyph photo.png                        # open an image immediately
 lumaglyph studio clip.mp4 --theme tungsten
+lumaglyph studio --settings optimisations   # jump straight to a settings tab
 ```
 
-### Inspect Build Diagnostics & Verified Release Updates
+### Build diagnostics & verified release updates
+
 ```bash
 lumaglyph build-info
 lumaglyph check-update
-lumaglyph self-update
+lumaglyph update            # verified in-place install + relaunch (alias of self-update)
 ```
 
-### Headless CLI — Image to Genuine ASCII
+### Headless CLI - image to genuine ASCII
+
 ```bash
 # True OLED #000000 pitch-black PNG with Shadow Noise Gate + CRT Bloom
 lumaglyph image input.jpg -o oled_art.png --cols 172 --oled-black --black-gate 0.06 --bloom
@@ -121,7 +236,8 @@ lumaglyph image input.jpg -o overlay.png --cols 168 --transparent --wireframe --
 lumaglyph image input.jpg -o styled.png --look "lg2:cols=180,cs=genuine95,cm=tritone,oled=1,gate=0.050,bl=1,tri=2A0A52-E11D48-FDE047"
 ```
 
-### Headless CLI — Flat-RAM Video to ASCII Video
+### Headless CLI - flat-RAM video to ASCII video
+
 > Requires `ffmpeg` / `ffprobe` on `PATH` (or configured in `Settings -> Export & Video`).
 
 ```bash
@@ -133,7 +249,8 @@ lumaglyph video input.mp4 -o alpha_overlay.webm --cols 152 --transparent --wiref
 lumaglyph video input.mp4 -o alpha_overlay.mov  --cols 152 --transparent --wireframe
 ```
 
-### Run Benchmark & Full 1,232-Test Suite
+### Benchmark and test
+
 ```bash
 lumaglyph bench --cols 180 --iters 200
 cargo test --release --locked
@@ -147,17 +264,12 @@ cargo test --release --locked
 cargo build --release --locked
 ```
 
-On Debian/Ubuntu Linux, install windowing and OpenGL headers before building:
-```bash
-sudo apt-get install -y \
-  libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-  libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
-  libxcursor-dev libxi-dev libxinerama-dev libxrandr-dev \
-  libgl1-mesa-dev libegl1-mesa-dev
-```
+Development setup, test-suite layout, release pipeline, and architecture notes live in
+**[docs/DEVELOPING.md](docs/DEVELOPING.md)**.
 
 ---
 
 ## License
 
-Released under the [MIT License](LICENSE). Includes embedded [IBM Plex Sans](assets/fonts/OFL-IBMPlexSans.txt) and [JetBrains Mono](assets/fonts/OFL-JetBrainsMono.txt) under the SIL Open Font License 1.1.
+Released under the [MIT License](LICENSE). Includes embedded [IBM Plex Sans](assets/fonts/OFL-IBMPlexSans.txt)
+and [JetBrains Mono](assets/fonts/OFL-JetBrainsMono.txt) under the SIL Open Font License 1.1.
