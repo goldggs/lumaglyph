@@ -17,6 +17,8 @@ Then, when you want more:
 | **[User Guide](USER-GUIDE.md)** | Every panel, every slider, every settings tab, and every keyboard shortcut explained. |
 | **[Troubleshooting & FAQ](TROUBLESHOOTING.md)** | "It will not open", "Windows says unknown app", "my video stutters", "no sound reaction", and other common questions. |
 | **[Building From Source](DEVELOPING.md)** | For developers: compile it yourself, run the test suite, understand the architecture. |
+| **[Testing](TESTING.md)** | For developers and the curious: what is tested, how, and what is deliberately not. Includes the exact per-suite counts in [TEST-INVENTORY.md](TEST-INVENTORY.md). |
+| **[Security](SECURITY.md)** | For anyone who wants proof this app is safe: no telemetry, one network module, HTTPS-only verified updates, and the full dependency list with a reason for each. |
 
 ---
 

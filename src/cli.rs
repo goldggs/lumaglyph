@@ -315,11 +315,16 @@ pub fn run_entry() -> Result<(), String> {
             if let Some(c) = cols {
                 params.cols = c;
             }
-            if let Some(cs) = charset.as_deref().and_then(CharsetPreset::from_cli) {
-                params.charset = cs;
+            // An unrecognised value is an error, not a silent fallback: a typo in a
+            // batch script would otherwise produce a whole folder of wrong-looking
+            // exports with exit code 0.
+            if let Some(cs) = charset.as_deref() {
+                params.charset = CharsetPreset::from_cli(cs)
+                    .ok_or_else(|| format!("unknown character set '{cs}'"))?;
             }
-            if let Some(cm) = color.as_deref().and_then(ColorMode::from_cli) {
-                params.color_mode = cm;
+            if let Some(cm) = color.as_deref() {
+                params.color_mode =
+                    ColorMode::from_cli(cm).ok_or_else(|| format!("unknown color mode '{cm}'"))?;
             }
             if let Some(tt) = tritone.as_deref() {
                 params.tritone = parse_tritone_arg(tt)?;
@@ -394,11 +399,16 @@ pub fn run_entry() -> Result<(), String> {
             if let Some(c) = cols {
                 params.cols = c;
             }
-            if let Some(cs) = charset.as_deref().and_then(CharsetPreset::from_cli) {
-                params.charset = cs;
+            // An unrecognised value is an error, not a silent fallback: a typo in a
+            // batch script would otherwise produce a whole folder of wrong-looking
+            // exports with exit code 0.
+            if let Some(cs) = charset.as_deref() {
+                params.charset = CharsetPreset::from_cli(cs)
+                    .ok_or_else(|| format!("unknown character set '{cs}'"))?;
             }
-            if let Some(cm) = color.as_deref().and_then(ColorMode::from_cli) {
-                params.color_mode = cm;
+            if let Some(cm) = color.as_deref() {
+                params.color_mode =
+                    ColorMode::from_cli(cm).ok_or_else(|| format!("unknown color mode '{cm}'"))?;
             }
             if let Some(tt) = tritone.as_deref() {
                 params.tritone = parse_tritone_arg(tt)?;
@@ -498,11 +508,16 @@ pub fn run_entry() -> Result<(), String> {
             if let Some(c) = cols {
                 params.cols = c;
             }
-            if let Some(cs) = charset.as_deref().and_then(CharsetPreset::from_cli) {
-                params.charset = cs;
+            // An unrecognised value is an error, not a silent fallback: a typo in a
+            // batch script would otherwise produce a whole folder of wrong-looking
+            // exports with exit code 0.
+            if let Some(cs) = charset.as_deref() {
+                params.charset = CharsetPreset::from_cli(cs)
+                    .ok_or_else(|| format!("unknown character set '{cs}'"))?;
             }
-            if let Some(cm) = color.as_deref().and_then(ColorMode::from_cli) {
-                params.color_mode = cm;
+            if let Some(cm) = color.as_deref() {
+                params.color_mode =
+                    ColorMode::from_cli(cm).ok_or_else(|| format!("unknown color mode '{cm}'"))?;
             }
             if let Some(tt) = tritone.as_deref() {
                 params.tritone = parse_tritone_arg(tt)?;

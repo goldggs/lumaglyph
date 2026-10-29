@@ -427,3 +427,386 @@ fn quantize_xterm256(rgb: [u8; 3]) -> [u8; 3] {
         cube
     }
 }
+
+#[cfg(test)]
+mod color_pipeline_tests {
+    use super::*;
+
+    /// A spread of inputs covering pure primaries, greys, and near-black / near-white.
+    fn sample_grid() -> Vec<(f32, f32, f32)> {
+        let mut out = Vec::new();
+        for step in 0..=10 {
+            let v = step as f32 / 10.0;
+            out.push((v, v, v));
+        }
+        out.push((1.0, 0.0, 0.0));
+        out.push((0.0, 1.0, 0.0));
+        out.push((0.0, 0.0, 1.0));
+        out.push((0.001, 0.0, 0.0));
+        out.push((0.0, 0.0, 0.999));
+        out
+    }
+
+    // ---------- luma ----------
+
+    #[test]
+    fn luma_matches_rec709_coefficients() {
+        assert!((luma_rgb(1.0, 0.0, 0.0) - 0.2126).abs() < 1e-6);
+        assert!((luma_rgb(0.0, 1.0, 0.0) - 0.7152).abs() < 1e-6);
+        assert!((luma_rgb(0.0, 0.0, 1.0) - 0.0722).abs() < 1e-6);
+        assert!((luma_rgb(1.0, 1.0, 1.0) - 1.0).abs() < 1e-6);
+        assert_eq!(luma_rgb(0.0, 0.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn luma_is_monotonic_in_every_channel() {
+        for channel in 0..3 {
+            let mut previous = -1.0;
+            for step in 0..=50 {
+                let v = step as f32 / 50.0;
+                let mut rgb = [0.0, 0.0, 0.0];
+                rgb[channel] = v;
+                let y = luma_rgb(rgb[0], rgb[1], rgb[2]);
+                assert!(y >= previous - 1e-6, "luma dipped as a channel rose");
+                previous = y;
+            }
+        }
+    }
+
+    #[test]
+    fn luma_is_scale_invariant_up_to_clamping() {
+        // Rec.709 weights are linear, so doubling every channel doubles luma.
+        for (r, g, b) in sample_grid() {
+            let single = luma_rgb(r, g, b);
+            let doubled = luma_rgb(r * 2.0, g * 2.0, b * 2.0);
+            assert!((doubled - single * 2.0).abs() < 1e-5);
+        }
+    }
+
+    // ---------- grading ----------
+
+    #[test]
+    fn neutral_grading_is_identity() {
+        for (r, g, b) in sample_grid() {
+            let (or, og, ob) = grade_rgb(r, g, b, 0.0, 1.0, 1.0, 1.0, false);
+            assert!((or - r).abs() < 1e-5, "{r} -> {or}");
+            assert!((og - g).abs() < 1e-5);
+            assert!((ob - b).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn grading_never_escapes_unit_range() {
+        let extremes = [-2.0f32, -0.5, 0.0, 0.5, 1.0, 2.0];
+        for (r, g, b) in sample_grid() {
+            for brightness in extremes {
+                for contrast in [-1.0f32, 0.0, 1.0, 4.0] {
+                    for saturation in [0.0f32, 1.0, 3.0] {
+                        for gamma in [0.05f32, 0.15, 1.0, 4.0] {
+                            for invert in [false, true] {
+                                let (or, og, ob) = grade_rgb(
+                                    r, g, b, brightness, contrast, saturation, gamma, invert,
+                                );
+                                for c in [or, og, ob] {
+                                    assert!(
+                                        (0.0..=1.0).contains(&c),
+                                        "grading produced {c} from ({r},{g},{b}) \
+                                         b={brightness} c={contrast} s={saturation} g={gamma}"
+                                    );
+                                    assert!(c.is_finite(), "grading produced a non-finite channel");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invert_is_self_inverse() {
+        for (r, g, b) in sample_grid() {
+            let (ir, ig, ib) = grade_rgb(r, g, b, 0.0, 1.0, 1.0, 1.0, true);
+            let (rr, rg, rb) = grade_rgb(ir, ig, ib, 0.0, 1.0, 1.0, 1.0, true);
+            assert!((rr - r).abs() < 1e-4, "double invert drifted: {r} -> {rr}");
+            assert!((rg - g).abs() < 1e-4);
+            assert!((rb - b).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn zero_saturation_yields_grey() {
+        for (r, g, b) in sample_grid() {
+            let (or, og, ob) = grade_rgb(r, g, b, 0.0, 1.0, 0.0, 1.0, false);
+            assert!((or - og).abs() < 1e-5, "channels differ at saturation 0");
+            assert!((og - ob).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn brightness_raises_and_lowers_luma() {
+        let base = luma_rgb(0.5, 0.5, 0.5);
+        let (r1, g1, b1) = grade_rgb(0.5, 0.5, 0.5, 0.2, 1.0, 1.0, 1.0, false);
+        let (r2, g2, b2) = grade_rgb(0.5, 0.5, 0.5, -0.2, 1.0, 1.0, 1.0, false);
+        assert!(luma_rgb(r1, g1, b1) > base);
+        assert!(luma_rgb(r2, g2, b2) < base);
+    }
+
+    #[test]
+    fn contrast_pivots_around_mid_grey() {
+        // 0.5 is the pivot, so it must not move at any contrast.
+        for contrast in [0.0f32, 0.5, 1.0, 2.0, 8.0] {
+            let (r, _, _) = grade_rgb(0.5, 0.5, 0.5, 0.0, contrast, 1.0, 1.0, false);
+            assert!((r - 0.5).abs() < 1e-5, "pivot moved at contrast {contrast}");
+        }
+    }
+
+    #[test]
+    fn gamma_never_divides_by_zero() {
+        // Gamma below the 0.15 floor must be treated as the floor, not as infinity.
+        for gamma in [0.0f32, 1e-9, 0.01] {
+            let (r, g, b) = grade_rgb(0.4, 0.6, 0.8, 0.0, 1.0, 1.0, gamma, false);
+            assert!(r.is_finite() && g.is_finite() && b.is_finite());
+        }
+    }
+
+    // ---------- hex ----------
+
+    #[test]
+    fn parse_hex_accepts_hash_and_bare_forms() {
+        assert_eq!(parse_hex_rgb("#FF8000"), Some([255, 128, 0]));
+        assert_eq!(parse_hex_rgb("ff8000"), Some([255, 128, 0]));
+        assert_eq!(parse_hex_rgb("  #ffffff  "), Some([255, 255, 255]));
+        assert_eq!(parse_hex_rgb("000000"), Some([0, 0, 0]));
+    }
+
+    #[test]
+    fn parse_hex_rejects_malformed_input() {
+        for bad in [
+            "", "#", "#FFF", "FFF", "#GGGGGG", "#FF80000", "#-1-1-1", "0x1234",
+        ] {
+            assert_eq!(parse_hex_rgb(bad), None, "accepted {bad:?}");
+        }
+    }
+
+    // ---------- tritone ----------
+
+    #[test]
+    fn tritone_round_trips_through_hex() {
+        for (name, pal) in TriTonePalette::PRESETS {
+            let hex = pal.to_hex_triplet();
+            let back = TriTonePalette::from_hex_triplet(&hex)
+                .unwrap_or_else(|| panic!("{name} failed to round-trip: {hex}"));
+            assert_eq!(back, pal, "{name} changed across a hex round trip");
+        }
+    }
+
+    #[test]
+    fn tritone_hex_accepts_comma_separated_triplets() {
+        let pal = TriTonePalette::SOLAR_FLARE;
+        let commas = pal.to_hex_triplet().replace('-', ",");
+        assert_eq!(TriTonePalette::from_hex_triplet(&commas), Some(pal));
+    }
+
+    #[test]
+    fn tritone_hex_rejects_wrong_stop_counts() {
+        assert_eq!(TriTonePalette::from_hex_triplet("2A0A52-E11D48"), None);
+        assert_eq!(
+            TriTonePalette::from_hex_triplet("2A0A52-E11D48-FDE047-000000"),
+            None
+        );
+        assert_eq!(TriTonePalette::from_hex_triplet("nonsense"), None);
+    }
+
+    #[test]
+    fn tritone_sample_hits_the_stops_exactly() {
+        let pal = TriTonePalette::TOKYO_MIDNIGHT;
+        assert_eq!(pal.sample(0.0), pal.shadow);
+        assert_eq!(pal.sample(0.5), pal.midtone);
+        assert_eq!(pal.sample(1.0), pal.highlight);
+        // Out-of-range input clamps instead of wrapping around.
+        assert_eq!(pal.sample(-5.0), pal.shadow);
+        assert_eq!(pal.sample(5.0), pal.highlight);
+    }
+
+    #[test]
+    fn tritone_sample_is_continuous() {
+        let pal = TriTonePalette::BLADE_TEAL_AMBER;
+        let mut previous = pal.sample(0.0);
+        for step in 1..=200 {
+            let current = pal.sample(step as f32 / 200.0);
+            for channel in 0..3 {
+                let delta = (current[channel] as i32 - previous[channel] as i32).abs();
+                assert!(delta <= 4, "gradient jumped {delta} at step {step}");
+            }
+            previous = current;
+        }
+    }
+
+    // ---------- colour modes ----------
+
+    #[test]
+    fn every_color_mode_has_a_unique_cli_name_that_round_trips() {
+        let mut seen = std::collections::HashSet::new();
+        for mode in ColorMode::ALL {
+            let name = mode.cli_name();
+            assert!(seen.insert(name), "duplicate cli_name {name}");
+            assert_eq!(
+                ColorMode::from_cli(name),
+                Some(mode),
+                "{name} did not round trip"
+            );
+            assert!(!mode.label().is_empty());
+        }
+    }
+
+    #[test]
+    fn color_mode_from_cli_is_case_insensitive_and_trims() {
+        assert_eq!(
+            ColorMode::from_cli("  TrueColor "),
+            Some(ColorMode::TrueColor)
+        );
+        assert_eq!(ColorMode::from_cli("NEON"), Some(ColorMode::Cyberpunk));
+        assert_eq!(
+            ColorMode::from_cli("Matrix"),
+            Some(ColorMode::PhosphorGreen)
+        );
+        assert_eq!(ColorMode::from_cli("nope"), None);
+    }
+
+    #[test]
+    fn resolve_cell_colors_is_total_across_every_mode() {
+        let pal = TriTonePalette::SOLAR_FLARE;
+        for mode in ColorMode::ALL {
+            for (r, g, b) in sample_grid() {
+                for boost in [0.0f32, 1.0, 3.0] {
+                    for oled in [false, true] {
+                        let (fg, bg) = resolve_cell_colors(mode, r, g, b, boost, 0.25, oled, &pal);
+                        // Colours are bytes, so the only real risk is a panic or NaN cast;
+                        // reaching this point at all proves the cast was safe.
+                        assert_eq!(fg.len(), 3);
+                        assert_eq!(bg.len(), 3);
+                        if oled && !matches!(mode, ColorMode::DualColor) {
+                            assert_eq!(bg, OLED_BG, "{mode:?} ignored OLED black");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dual_color_background_responds_to_bg_intensity() {
+        let pal = TriTonePalette::SOLAR_FLARE;
+        let flat = resolve_cell_colors(ColorMode::DualColor, 1.0, 0.0, 0.0, 1.0, 0.0, false, &pal);
+        let rich = resolve_cell_colors(ColorMode::DualColor, 1.0, 0.0, 0.0, 1.0, 0.6, false, &pal);
+        assert_ne!(flat.1, rich.1, "bg_intensity had no effect");
+        // A brighter cell must push the ambient background further from the page colour.
+        let distance = |bg: [u8; 3]| -> i32 {
+            (0..3)
+                .map(|i| (bg[i] as i32 - DEFAULT_BG[i] as i32).abs())
+                .sum()
+        };
+        assert!(distance(rich.1) > distance(flat.1));
+    }
+
+    #[test]
+    fn boost_saturates_without_wrapping() {
+        // apply_boost caps near 1.12 and clamps, so extreme brightness must not spill.
+        let pal = TriTonePalette::SOLAR_FLARE;
+        let (fg, _) =
+            resolve_cell_colors(ColorMode::TrueColor, 1.0, 1.0, 1.0, 100.0, 0.0, false, &pal);
+        assert!(fg.iter().all(|&c| c >= 250), "peak white lost: {fg:?}");
+    }
+
+    #[test]
+    fn ansi16_quantisation_only_returns_palette_entries() {
+        let pal = TriTonePalette::SOLAR_FLARE;
+        for (r, g, b) in sample_grid() {
+            let (fg, _) = resolve_cell_colors(ColorMode::Ansi16, r, g, b, 1.0, 0.0, false, &pal);
+            assert!(
+                ANSI_16_PALETTE.contains(&fg),
+                "{fg:?} is not one of the 16 ANSI colours"
+            );
+        }
+    }
+
+    #[test]
+    fn xterm256_quantisation_returns_palette_values() {
+        // xterm-256 is a 6x6x6 colour cube plus a 24-step grey ramp, so a result is
+        // either three cube levels or a neutral grey from the ramp.
+        const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+        let pal = TriTonePalette::SOLAR_FLARE;
+        for (r, g, b) in sample_grid() {
+            let (fg, _) = resolve_cell_colors(ColorMode::Xterm256, r, g, b, 1.0, 0.0, false, &pal);
+            let in_cube = fg.iter().all(|c| LEVELS.contains(c));
+            let in_grey_ramp = fg[0] == fg[1] && fg[1] == fg[2] && (fg[0] - 8) % 10 == 0;
+            assert!(
+                in_cube || in_grey_ramp,
+                "{fg:?} is neither a cube value nor a grey step"
+            );
+        }
+    }
+
+    #[test]
+    fn monochrome_output_is_neutral() {
+        let pal = TriTonePalette::SOLAR_FLARE;
+        let (fg, _) =
+            resolve_cell_colors(ColorMode::Monochrome, 0.9, 0.1, 0.4, 1.0, 0.0, false, &pal);
+        // Ivory is a slight warm bias, never a full hue swing.
+        assert!(fg[0] >= fg[1] && fg[1] >= fg[2]);
+        assert!(
+            fg[0] as i32 - fg[2] as i32 <= 12,
+            "monochrome drifted warm: {fg:?}"
+        );
+    }
+
+    #[test]
+    fn phosphor_modes_keep_their_signature_channel_dominant() {
+        let pal = TriTonePalette::SOLAR_FLARE;
+        for step in 1..=9 {
+            let v = step as f32 / 9.0;
+            let (amber, _) =
+                resolve_cell_colors(ColorMode::PhosphorAmber, v, v, v, 1.0, 0.0, false, &pal);
+            assert!(
+                amber[0] >= amber[1] && amber[1] >= amber[2],
+                "amber went cold: {amber:?}"
+            );
+            let (green, _) =
+                resolve_cell_colors(ColorMode::PhosphorGreen, v, v, v, 1.0, 0.0, false, &pal);
+            assert!(
+                green[1] >= green[0] && green[1] >= green[2],
+                "green lost dominance: {green:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn canvas_backgrounds_are_distinct_and_expected() {
+        assert_eq!(active_canvas_bg(true), OLED_BG);
+        assert_eq!(active_canvas_bg(false), DEFAULT_BG);
+        assert_eq!(OLED_BG, [0, 0, 0]);
+        assert_ne!(DEFAULT_BG, OLED_BG);
+    }
+
+    #[test]
+    fn bayer_matrix_is_balanced_and_in_range() {
+        let mut sum = 0.0;
+        for row in BAYER_4X4 {
+            for v in row {
+                assert!((-0.5..=0.5).contains(&v), "bayer value {v} out of range");
+                sum += v;
+            }
+        }
+        assert!(sum.abs() < 1e-4, "bayer matrix is not zero-mean: {sum}");
+        // All 16 thresholds must be distinct, otherwise dithering bands.
+        let mut flat: Vec<i32> = BAYER_4X4
+            .iter()
+            .flatten()
+            .map(|v| (v * 32.0) as i32)
+            .collect();
+        flat.sort_unstable();
+        flat.dedup();
+        assert_eq!(flat.len(), 16);
+    }
+}

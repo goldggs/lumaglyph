@@ -827,3 +827,184 @@ pub fn rasterize_rgb24_even(
 
     (out_w, out_h)
 }
+#[cfg(test)]
+mod engine_unit_tests {
+    // Test fixtures read more clearly as `default()` plus explicit overrides.
+    #![allow(clippy::field_reassign_with_default)]
+
+    use super::*;
+
+    fn frame_of(cols: u32, rows: u32, ch: u8) -> AsciiFrame {
+        let mut f = AsciiFrame::new();
+        f.cols = cols;
+        f.rows = rows;
+        f.cells = vec![
+            AsciiCell {
+                ch,
+                flags: 0,
+                fg: [200, 100, 50],
+                bg: [10, 10, 10],
+            };
+            (cols * rows) as usize
+        ];
+        f
+    }
+
+    #[test]
+    fn plain_text_has_one_line_per_row() {
+        let f = frame_of(5, 3, b'#');
+        let text = f.to_plain_text();
+        assert_eq!(text.lines().count(), 3);
+        assert_eq!(text, "#####\n#####\n#####");
+    }
+
+    #[test]
+    fn plain_text_has_no_trailing_newline() {
+        let f = frame_of(4, 2, b'.');
+        let text = f.to_plain_text();
+        assert!(!text.ends_with('\n'));
+        assert_eq!(text.len(), 9); // 4 + newline + 4
+    }
+
+    #[test]
+    fn plain_text_of_empty_frame_is_empty() {
+        assert_eq!(AsciiFrame::new().to_plain_text(), "");
+    }
+
+    #[test]
+    fn plain_text_preserves_every_printable_ascii_glyph() {
+        for byte in 0x20u8..=0x7E {
+            let f = frame_of(3, 1, byte);
+            let text = f.to_plain_text();
+            assert_eq!(text.chars().count(), 3);
+            assert!(text.chars().all(|c| c == byte as char));
+        }
+    }
+
+    #[test]
+    fn plain_text_row_width_matches_cols() {
+        for cols in [1u32, 7, 32, 156] {
+            let f = frame_of(cols, 2, b'x');
+            for line in f.to_plain_text().lines() {
+                assert_eq!(line.chars().count() as u32, cols);
+            }
+        }
+    }
+
+    #[test]
+    fn default_render_params_are_neutral() {
+        let p = RenderParams::default();
+        // A neutral look is the promise of the Reset button.
+        assert_eq!(p.brightness, 0.0);
+        assert_eq!(p.contrast, 1.0);
+        assert_eq!(p.saturation, 1.0);
+        assert_eq!(p.gamma, 1.0);
+        assert_eq!(p.vignette_focus, 0.0);
+        assert!(!p.invert);
+        assert!(!p.scanlines);
+        assert!(!p.crt_bloom);
+        assert!(p.cols >= 16 && p.cols <= 420);
+    }
+
+    #[test]
+    fn default_frame_is_empty_and_consistent() {
+        let f = AsciiFrame::new();
+        assert_eq!(f.cols, 0);
+        assert_eq!(f.rows, 0);
+        assert!(f.cells.is_empty());
+        assert_eq!(f.unique_glyphs, 0);
+        assert_eq!(f.render_ms, 0.0);
+    }
+
+    #[test]
+    fn rasterised_dimensions_are_exact_multiples_of_the_cell_grid() {
+        let atlas = GlyphAtlas::default_embedded(20);
+        let params = RenderParams::default();
+        let mut out = Vec::new();
+        for (cols, rows) in [(1u32, 1u32), (10, 4), (156, 51)] {
+            let frame = frame_of(cols, rows, b'A');
+            let (w, h) = rasterize_rgba(&frame, &atlas, &params, 0.0, &mut out);
+            assert_eq!(w, cols as usize * atlas.cell_w);
+            assert_eq!(h, rows as usize * atlas.cell_h);
+            assert_eq!(out.len(), w * h * 4);
+        }
+    }
+
+    #[test]
+    fn empty_frame_rasterises_to_zero() {
+        let atlas = GlyphAtlas::default_embedded(20);
+        let params = RenderParams::default();
+        let mut out = Vec::new();
+        let (w, h) = rasterize_rgba(&AsciiFrame::new(), &atlas, &params, 0.0, &mut out);
+        assert_eq!((w, h), (0, 0));
+    }
+
+    #[test]
+    fn raster_output_is_opaque_when_not_transparent() {
+        let atlas = GlyphAtlas::default_embedded(20);
+        let mut params = RenderParams::default();
+        params.transparent_bg = false;
+        let frame = frame_of(6, 3, b'@');
+        let mut out = Vec::new();
+        let (w, h) = rasterize_rgba(&frame, &atlas, &params, 0.0, &mut out);
+        assert!(
+            out.chunks_exact(4).all(|px| px[3] == 255),
+            "found a translucent pixel"
+        );
+        assert_eq!(out.len(), w * h * 4);
+    }
+
+    #[test]
+    fn transparent_raster_leaves_background_clear() {
+        let atlas = GlyphAtlas::default_embedded(20);
+        let mut params = RenderParams::default();
+        params.transparent_bg = true;
+        let mut frame = frame_of(4, 2, b' ');
+        for cell in &mut frame.cells {
+            cell.ch = b' ';
+        }
+        let mut out = Vec::new();
+        rasterize_rgba(&frame, &atlas, &params, 0.0, &mut out);
+        assert!(
+            out.chunks_exact(4).all(|px| px[3] == 0),
+            "space cells should be fully clear"
+        );
+    }
+
+    #[test]
+    fn rasterisation_is_deterministic() {
+        let atlas = GlyphAtlas::default_embedded(20);
+        let params = RenderParams::default();
+        let frame = frame_of(12, 5, b'%');
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        rasterize_rgba(&frame, &atlas, &params, 0.0, &mut a);
+        rasterize_rgba(&frame, &atlas, &params, 0.0, &mut b);
+        assert_eq!(a, b, "identical frames produced different pixels");
+    }
+
+    #[test]
+    fn rgb24_and_rgba_rasterisers_agree_on_size() {
+        let atlas = GlyphAtlas::default_embedded(20);
+        let params = RenderParams::default();
+        let frame = frame_of(8, 4, b'*');
+        let mut rgba = Vec::new();
+        let mut rgb = Vec::new();
+        let (aw, ah) = rasterize_rgba(&frame, &atlas, &params, 0.0, &mut rgba);
+        let (bw, bh) = rasterize_rgb24_even(&frame, &atlas, &params, 0.0, &mut rgb);
+        assert_eq!((aw, ah), (bw, bh));
+        assert_eq!(rgb.len(), aw * ah * 3);
+    }
+
+    #[test]
+    fn rasteriser_reuses_its_buffer_without_leaking_size() {
+        let atlas = GlyphAtlas::default_embedded(20);
+        let params = RenderParams::default();
+        let mut out = Vec::new();
+        rasterize_rgba(&frame_of(20, 10, b'#'), &atlas, &params, 0.0, &mut out);
+        let big = out.len();
+        let (w, h) = rasterize_rgba(&frame_of(2, 1, b'#'), &atlas, &params, 0.0, &mut out);
+        assert!(out.len() < big, "buffer was not resized down");
+        assert_eq!(out.len(), w * h * 4);
+    }
+}

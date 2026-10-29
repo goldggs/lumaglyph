@@ -263,3 +263,228 @@ impl RenderParams {
         Ok(())
     }
 }
+#[cfg(test)]
+mod look_code_tests {
+    // Test fixtures read more clearly as `default()` plus explicit overrides.
+    #![allow(clippy::field_reassign_with_default)]
+
+    use super::*;
+    use crate::charset::CharsetPreset;
+    use crate::color::{ColorMode, TriTonePalette};
+
+    /// Look codes are untrusted input: people paste them from chat and screenshots.
+    fn hostile_corpus() -> Vec<String> {
+        let mut out = Vec::new();
+        for len in [0usize, 1, 5, 2047, 2048, 2049, 4096, 100_000] {
+            out.push("lg2:cols=".to_string() + &"9".repeat(len));
+        }
+        for bad in [
+            "lg2:cols=NaN",
+            "lg2:br=inf",
+            "lg2:ct=-inf",
+            "lg2:gam=NaN",
+            "lg2:cols=-5",
+            "lg2:cols=999999",
+            "lg2:cm=../../etc/passwd",
+            "lg2:tri=zzzzzz-zzzzzz-zzzzzz",
+            "lg2:,,,,",
+            "lg2:",
+            "lg2",
+            "",
+            "   ",
+            "lg1:cols=100",
+            "cols=100",
+            "\u{0}lg2:cols=10\u{0}",
+            "lg2:cc=\u{0}\u{1}\u{2}",
+            "lg2:cols=80,cols=90,cols=100",
+            "lg2:gate=99999",
+            "lg2:ar=-99999",
+        ] {
+            out.push(bad.to_string());
+        }
+        out
+    }
+
+    #[test]
+    fn default_params_round_trip_through_a_look_code() {
+        let original = RenderParams::default();
+        let code = original.to_look_code();
+        assert!(code.starts_with("lg2:"), "look code must be tagged lg2:");
+        let mut parsed = RenderParams::default();
+        parsed.apply_look_code(&code).unwrap();
+        assert_eq!(parsed.to_look_code(), code, "round trip changed the code");
+    }
+
+    #[test]
+    fn round_trip_preserves_every_field() {
+        let mut p = RenderParams::default();
+        p.cols = 220;
+        p.charset = CharsetPreset::StructuralEdge;
+        p.color_mode = ColorMode::Cyberpunk;
+        p.oled_black = true;
+        p.black_gate = 0.15;
+        p.transparent_bg = false;
+        p.wireframe_only = true;
+        p.audio_reactive = 1.5;
+        p.brightness = -0.2;
+        p.contrast = 1.7;
+        p.saturation = 0.4;
+        p.gamma = 2.2;
+        p.dither = 0.5;
+        p.vignette_focus = 0.3;
+        p.temporal_stability = 0.4;
+        p.crt_bloom = true;
+        p.scanlines = true;
+        p.invert = true;
+        p.tritone = TriTonePalette::EMERALD_ICE;
+
+        let mut other = RenderParams::default();
+        other.apply_look_code(&p.to_look_code()).unwrap();
+
+        assert_eq!(other.cols, p.cols);
+        assert_eq!(other.charset, p.charset);
+        assert_eq!(other.color_mode, p.color_mode);
+        assert_eq!(other.oled_black, p.oled_black);
+        assert!((other.black_gate - p.black_gate).abs() < 1e-3);
+        assert_eq!(other.wireframe_only, p.wireframe_only);
+        assert!((other.audio_reactive - p.audio_reactive).abs() < 0.01);
+        assert!((other.brightness - p.brightness).abs() < 0.01);
+        assert!((other.contrast - p.contrast).abs() < 0.01);
+        assert!((other.saturation - p.saturation).abs() < 0.01);
+        assert!((other.gamma - p.gamma).abs() < 0.01);
+        assert!((other.dither - p.dither).abs() < 0.01);
+        assert!((other.vignette_focus - p.vignette_focus).abs() < 0.01);
+        assert!(other.crt_bloom && other.scanlines && other.invert);
+        assert_eq!(other.tritone, p.tritone);
+    }
+
+    #[test]
+    fn hostile_input_never_panics() {
+        for raw in hostile_corpus() {
+            let mut p = RenderParams::default();
+            // Any result is acceptable; crashing is not.
+            let _ = p.apply_look_code(&raw);
+        }
+    }
+
+    #[test]
+    fn oversized_codes_are_rejected_without_being_parsed() {
+        let huge = "lg2:cols=100,".repeat(200); // ~2.6 KB
+        let mut p = RenderParams::default();
+        let before = p.cols;
+        let err = p.apply_look_code(&huge).unwrap_err();
+        assert!(
+            err.contains("length") || err.contains("exceed"),
+            "got: {err}"
+        );
+        assert_eq!(p.cols, before, "a rejected code must not mutate the params");
+    }
+
+    #[test]
+    fn non_finite_numbers_are_ignored() {
+        let mut p = RenderParams::default();
+        let defaults = p.to_look_code();
+        let _ = p.apply_look_code("lg2:br=NaN,ct=inf,gam=-inf,sat=NaN");
+        assert_eq!(
+            p.to_look_code(),
+            defaults,
+            "NaN/inf leaked into the parameters"
+        );
+        assert!(p.brightness.is_finite() && p.contrast.is_finite() && p.gamma.is_finite());
+    }
+
+    #[test]
+    fn numeric_fields_clamp_to_their_documented_ranges() {
+        let mut p = RenderParams::default();
+        p.apply_look_code("lg2:cols=999999,gate=99,ar=-99,ct=99999")
+            .unwrap();
+        assert!(
+            (16..=420).contains(&p.cols),
+            "cols escaped its range: {}",
+            p.cols
+        );
+        assert!((0.0..=0.35).contains(&p.black_gate));
+        assert!(p.audio_reactive >= 0.0);
+        assert!(p.contrast.is_finite());
+    }
+
+    #[test]
+    fn unknown_keys_are_skipped_but_known_keys_still_apply() {
+        let mut p = RenderParams::default();
+        p.apply_look_code("lg2:totally_fake=1,cols=99,another=xyz")
+            .unwrap();
+        assert_eq!(p.cols, 99);
+    }
+
+    #[test]
+    fn missing_prefix_is_rejected() {
+        let mut p = RenderParams::default();
+        assert!(p.apply_look_code("cols=100,cm=mono").is_err());
+        assert!(p.apply_look_code("lg3:cols=100").is_err());
+    }
+
+    #[test]
+    fn lg1_codes_are_still_accepted_for_forward_compatibility() {
+        let mut p = RenderParams::default();
+        p.apply_look_code("lg1:cols=120").unwrap();
+        assert_eq!(p.cols, 120);
+    }
+
+    #[test]
+    fn codes_wrapped_in_quotes_or_backticks_are_accepted() {
+        for raw in [
+            "`lg2:cols=100`",
+            "\"lg2:cols=100\"",
+            "'lg2:cols=100'",
+            "  lg2:cols=100  ",
+        ] {
+            let mut p = RenderParams::default();
+            p.apply_look_code(raw).unwrap();
+            assert_eq!(p.cols, 100, "failed to unwrap {raw:?}");
+        }
+    }
+
+    #[test]
+    fn oled_and_transparency_stay_mutually_exclusive() {
+        let mut p = RenderParams::default();
+        p.apply_look_code("lg2:oled=1").unwrap();
+        assert!(p.oled_black && !p.transparent_bg);
+        p.apply_look_code("lg2:alpha=1").unwrap();
+        assert!(p.transparent_bg && !p.oled_black, "alpha and OLED both on");
+    }
+
+    #[test]
+    fn control_bytes_never_reach_the_output_code() {
+        for raw in hostile_corpus() {
+            let mut p = RenderParams::default();
+            if p.apply_look_code(&raw).is_ok() {
+                let code = p.to_look_code();
+                assert!(
+                    !code.bytes().any(|b| b < 0x20 || b == 0x7F),
+                    "control byte survived into {code:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_keys_let_the_last_one_win() {
+        let mut p = RenderParams::default();
+        p.apply_look_code("lg2:cols=80,cols=200,cols=120").unwrap();
+        assert_eq!(p.cols, 120);
+    }
+
+    #[test]
+    fn custom_charset_survives_a_round_trip() {
+        let mut p = RenderParams::default();
+        p.charset = CharsetPreset::Custom;
+        p.custom_chars = " .:-=+*#%@".to_string();
+        let mut other = RenderParams::default();
+        other.apply_look_code(&p.to_look_code()).unwrap();
+        assert_eq!(other.charset, CharsetPreset::Custom);
+        assert_eq!(
+            other.custom_chars, p.custom_chars,
+            "the custom glyph set must survive a share"
+        );
+    }
+}

@@ -4,13 +4,7 @@ pub fn current_rss_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
-        let mut cols = statm.split_whitespace();
-        let _total_pages: u64 = cols.next()?.parse().ok()?;
-        let rss_pages: u64 = cols.next()?.parse().ok()?;
-        let shared_pages: u64 = cols.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        // Report private resident memory (`RssAnon` = resident - shared OS `.so` files),
-        // matching Windows Private Working Set & macOS Activity Monitor "Memory".
-        Some(rss_pages.saturating_sub(shared_pages) * 4096)
+        parse_linux_statm(&statm)
     }
 
     #[cfg(target_os = "macos")]
@@ -48,6 +42,7 @@ pub fn current_rss_bytes() -> Option<u64> {
             )
         };
         if kr == 0 {
+            // SAFETY: task_info returned KERN_SUCCESS, so it filled the struct.
             let info = unsafe { info.assume_init() };
             Some(info.resident_size)
         } else {
@@ -87,6 +82,7 @@ pub fn current_rss_bytes() -> Option<u64> {
             K32GetProcessMemoryInfo(GetCurrentProcess(), pmc.as_mut_ptr(), cb)
         };
         if ok != 0 {
+            // SAFETY: K32GetProcessMemoryInfo returned non-zero, so it filled the struct.
             let pmc = unsafe { pmc.assume_init() };
             Some(pmc.working_set_size as u64)
         } else {
@@ -104,5 +100,99 @@ pub fn format_rss_mb() -> String {
     match current_rss_bytes() {
         Some(bytes) => format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0)),
         None => "N/A".to_string(),
+    }
+}
+
+/// Parse `/proc/self/statm` into private resident bytes.
+///
+/// Field 1 is total pages, field 2 is resident pages, field 3 is shared pages.
+/// Shared pages are subtracted because they are memory-mapped libraries (GTK, GL,
+/// the C runtime) that every app on the system shares; counting them would make
+/// LumaGlyph look far heavier than it is and would not match what Windows Task
+/// Manager or macOS Activity Monitor report.
+///
+/// Kept separate from the `/proc` read so the arithmetic can be tested on any OS.
+pub fn parse_linux_statm(statm: &str) -> Option<u64> {
+    const PAGE_SIZE: u64 = 4096;
+    let mut cols = statm.split_whitespace();
+    let _total_pages: u64 = cols.next()?.parse().ok()?;
+    let rss_pages: u64 = cols.next()?.parse().ok()?;
+    let shared_pages: u64 = cols.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    Some(rss_pages.saturating_sub(shared_pages) * PAGE_SIZE)
+}
+
+#[cfg(test)]
+mod telemetry_tests {
+    use super::*;
+
+    #[test]
+    fn statm_parses_a_realistic_line() {
+        // total, resident, shared, then text/lib/data/dirty pages.
+        let line = "20000 5000 1000 400 0 900 0\n";
+        let bytes = parse_linux_statm(line).unwrap();
+        assert_eq!(bytes, (5000 - 1000) * 4096);
+    }
+
+    #[test]
+    fn statm_subtracts_shared_library_pages() {
+        let with_shared = parse_linux_statm("1000 1000 600 0 0 0 0").unwrap();
+        let without_shared = parse_linux_statm("1000 1000 0 0 0 0 0").unwrap();
+        assert!(with_shared < without_shared);
+        assert_eq!(without_shared - with_shared, 600 * 4096);
+    }
+
+    #[test]
+    fn statm_never_underflows_when_shared_exceeds_resident() {
+        // A kernel that reports odd numbers must not wrap into an enormous value.
+        let bytes = parse_linux_statm("500 100 900 0 0 0 0").unwrap();
+        assert_eq!(bytes, 0);
+    }
+
+    #[test]
+    fn statm_tolerates_two_field_lines() {
+        // The third field is optional in the parser.
+        assert_eq!(parse_linux_statm("500 200"), Some(200 * 4096));
+    }
+
+    #[test]
+    fn statm_rejects_garbage() {
+        for junk in ["", "   ", "abc", "1 two 3", "-5 10 2"] {
+            assert_eq!(parse_linux_statm(junk), None, "accepted {junk:?}");
+        }
+    }
+
+    #[test]
+    fn rss_reading_is_available_on_supported_platforms() {
+        // Linux, macOS and Windows all have a real implementation.
+        let value = current_rss_bytes();
+        assert!(value.is_some(), "no RSS reading on this platform");
+        let bytes = value.unwrap();
+        assert!(bytes > 0, "RSS reported as zero bytes");
+        // The test process alone is at least a few hundred kilobytes.
+        assert!(bytes > 256 * 1024, "RSS implausibly small: {bytes}");
+    }
+
+    #[test]
+    fn formatted_report_is_stable_and_readable() {
+        let text = format_rss_mb();
+        assert!(
+            text.ends_with(" MB") || text == "N/A",
+            "unexpected format: {text}"
+        );
+        if text != "N/A" {
+            let number: f64 = text.trim_end_matches(" MB").parse().expect("not a number");
+            assert!(
+                number > 0.0 && number < 100_000.0,
+                "implausible report: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_reads_do_not_drift_wildly() {
+        let first = current_rss_bytes().unwrap();
+        let second = current_rss_bytes().unwrap();
+        // Memory can grow, but it cannot halve between two calls.
+        assert!(second * 2 > first, "RSS collapsed from {first} to {second}");
     }
 }

@@ -33,6 +33,111 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::time::Instant;
 
+// ---------------------------------------------------------------------------
+// View geometry
+//
+// These are the arithmetic parts of the canvas: how far a scroll moves the zoom,
+// how the viewport splits between picture and transport strip, and where a
+// pointer lands in the character grid. They are plain functions so the layout
+// can be tested without a GPU, a window, or an event loop.
+// ---------------------------------------------------------------------------
+
+/// Zoom limits for the canvas: 20% is about a thumbnail, 600% is a loupe.
+pub const ZOOM_MIN: f32 = 0.20;
+pub const ZOOM_MAX: f32 = 6.0;
+
+/// Padding between the picture and the edge of the canvas, in points.
+pub const CANVAS_FIT_PAD: f32 = 28.0;
+
+/// Height of the docked transport band beneath a video.
+pub const TRANSPORT_BAND_H: f32 = 46.0;
+
+/// Scroll to zoom conversion: one wheel notch is roughly 2.5% at the current scale.
+///
+/// A non-finite delta is ignored rather than applied. Trackpads on some drivers
+/// report `NaN`, and multiplying it into the zoom used to poison the canvas
+/// transform permanently (SEC-2026-002): every later `Rect` became `NaN` and the
+/// picture silently stopped drawing.
+pub fn zoom_after_scroll(current: f32, scroll_delta: f32) -> f32 {
+    let safe_current = if current.is_finite() {
+        current.clamp(ZOOM_MIN, ZOOM_MAX)
+    } else {
+        1.0
+    };
+    if !scroll_delta.is_finite() {
+        return safe_current;
+    }
+    let factor = (1.0 + scroll_delta * 0.0025).clamp(0.8, 1.25);
+    (safe_current * factor).clamp(ZOOM_MIN, ZOOM_MAX)
+}
+
+/// Zoom that fits `base_w x base_h` inside the canvas with padding, never below 10%.
+pub fn fit_zoom(canvas_w: f32, canvas_h: f32, base_w: f32, base_h: f32) -> f32 {
+    if base_w <= 0.0 || base_h <= 0.0 {
+        return 1.0;
+    }
+    let sx = ((canvas_w - CANVAS_FIT_PAD) / base_w).max(0.1);
+    let sy = ((canvas_h - CANVAS_FIT_PAD) / base_h).max(0.1);
+    sx.min(sy)
+}
+
+/// Split the viewport into the picture area and the transport band.
+///
+/// The band only exists when a video is loaded and zen mode is off, and never
+/// takes more than 35% of the height, so a short window still shows a picture.
+pub fn split_canvas_and_transport(avail: Rect, is_video: bool, zen: bool) -> (Rect, Rect) {
+    let band_h = if is_video && !zen {
+        TRANSPORT_BAND_H.min(avail.height() * 0.35)
+    } else {
+        0.0
+    };
+    let canvas = Rect::from_min_max(avail.min, Pos2::new(avail.max.x, avail.max.y - band_h));
+    let band = Rect::from_min_max(Pos2::new(avail.min.x, avail.max.y - band_h), avail.max);
+    (canvas, band)
+}
+
+/// Fraction `0.0..=1.0` of the way along a track for a given x position.
+pub fn track_ratio(x: f32, track_left: f32, track_width: f32) -> f32 {
+    if track_width <= 0.0 {
+        return 0.0;
+    }
+    ((x - track_left) / track_width).clamp(0.0, 1.0)
+}
+
+/// Timeline position in seconds for a horizontal position on the scrub track.
+pub fn timeline_secs_at(x: f32, track_left: f32, track_width: f32, duration: f64) -> f64 {
+    if duration <= 0.0 || !duration.is_finite() {
+        return 0.0;
+    }
+    track_ratio(x, track_left, track_width) as f64 * duration
+}
+
+/// X coordinate of the scrub knob for a playback position.
+pub fn timeline_x_for(position: f64, track_left: f32, track_width: f32, duration: f64) -> f32 {
+    let ratio = if duration > 0.0 && duration.is_finite() {
+        (position / duration).clamp(0.0, 1.0) as f32
+    } else {
+        0.0
+    };
+    track_left + track_width * ratio
+}
+
+/// Character cell under a pointer, or `None` when the pointer is outside the picture.
+pub fn cell_at(pointer: Pos2, dest: Rect, cols: u32, rows: u32) -> Option<(usize, usize)> {
+    if cols == 0 || rows == 0 || dest.width() <= 0.0 || dest.height() <= 0.0 {
+        return None;
+    }
+    if !dest.contains(pointer) {
+        return None;
+    }
+    let rel_x = ((pointer.x - dest.left()) / dest.width()).clamp(0.0, 0.9999);
+    let rel_y = ((pointer.y - dest.top()) / dest.height()).clamp(0.0, 0.9999);
+    Some((
+        (rel_x * cols as f32) as usize,
+        (rel_y * rows as f32) as usize,
+    ))
+}
+
 /// A vertical hairline between two readouts.
 ///
 /// The header strip, the status bar and the canvas readout all use this instead
@@ -261,14 +366,19 @@ impl LumaGlyphApp {
         let gpu_renderer = cc
             .gl
             .as_ref()
-            .map(|gl| unsafe {
-                use eframe::glow::HasContext;
-                let r = gl.get_parameter_string(eframe::glow::RENDERER);
-                let v = gl.get_parameter_string(eframe::glow::VENDOR);
-                if v.is_empty() {
-                    r
-                } else {
-                    format!("{r} ({v})")
+            .map(|gl| {
+                // SAFETY: Querying GL_RENDERER / GL_VENDOR on a context that glow
+                // handed us during `CreationContext`; both return NUL-terminated
+                // strings owned by the GL implementation, which glow copies.
+                unsafe {
+                    use eframe::glow::HasContext;
+                    let r = gl.get_parameter_string(eframe::glow::RENDERER);
+                    let v = gl.get_parameter_string(eframe::glow::VENDOR);
+                    if v.is_empty() {
+                        r
+                    } else {
+                        format!("{r} ({v})")
+                    }
                 }
             })
             .unwrap_or_else(|| "OpenGL Hardware Context".to_string());
@@ -2097,18 +2207,14 @@ impl LumaGlyphApp {
             let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
             if scroll_y.abs() > 0.5 {
                 self.auto_fit = false;
-                let factor = (1.0 + scroll_y * 0.0025).clamp(0.8, 1.25);
-                self.zoom = (self.zoom * factor).clamp(0.20, 6.0);
+                self.zoom = zoom_after_scroll(self.zoom, scroll_y);
             }
         }
 
         let base_w = self.ascii_px_w as f32;
         let base_h = self.ascii_px_h as f32;
         if self.auto_fit {
-            let pad = 28.0;
-            let sx = ((canvas_avail.width() - pad) / base_w).max(0.1);
-            let sy = ((canvas_avail.height() - pad) / base_h).max(0.1);
-            self.zoom = sx.min(sy);
+            self.zoom = fit_zoom(canvas_avail.width(), canvas_avail.height(), base_w, base_h);
             self.pan_offset = Vec2::ZERO;
         }
 
@@ -2389,11 +2495,11 @@ impl LumaGlyphApp {
             self.timeline_drag = resp.dragged();
 
             painter.rect_filled(track, 1.0, pal.control_bg);
-            let ratio = if duration > 0.0 {
-                (position / duration).clamp(0.0, 1.0) as f32
-            } else {
-                0.0
-            };
+            let ratio = track_ratio(
+                timeline_x_for(position, track_left, track.width(), duration),
+                track_left,
+                track.width(),
+            );
             painter.rect_filled(
                 Rect::from_min_max(
                     track.left_top(),
@@ -2409,9 +2515,9 @@ impl LumaGlyphApp {
 
             if (resp.dragged() || resp.clicked()) && duration > 0.0 {
                 if let Some(p) = resp.interact_pointer_pos() {
-                    let r = ((p.x - track_left) / track.width()).clamp(0.0, 1.0) as f64;
+                    let secs = timeline_secs_at(p.x, track_left, track.width(), duration);
                     if let SourceKind::VideoFile(st) = &self.source_kind {
-                        st.seek_to(r * duration);
+                        st.seek_to(secs);
                     }
                 }
             }
@@ -4234,5 +4340,287 @@ pub fn launch_gui(boot: GuiBootOptions) -> Result<(), String> {
             })
         }
         Err(err) => Err(format!("Failed launching native GPU window: {err}")),
+    }
+}
+
+#[cfg(test)]
+mod view_geometry_tests {
+    use super::*;
+
+    fn avail() -> Rect {
+        Rect::from_min_max(Pos2::new(220.0, 42.0), Pos2::new(1520.0, 862.0))
+    }
+
+    // ---------- zoom ----------
+
+    #[test]
+    fn clicking_1_2_3_lands_inside_the_zoom_window() {
+        for target in [1.0f32, 2.0, 3.5] {
+            assert!(target >= ZOOM_MIN);
+        }
+    }
+
+    #[test]
+    fn scroll_in_zooms_and_scroll_out_shrinks() {
+        let start = 1.0_f32;
+        assert!(zoom_after_scroll(start, 40.0) > start);
+        assert!(zoom_after_scroll(start, -40.0) < start);
+    }
+
+    #[test]
+    fn a_single_scroll_step_is_gentle() {
+        // One wheel notch must not teleport the view.
+        let zoomed = zoom_after_scroll(1.0, 120.0);
+        assert!(zoomed < 1.30, "one notch zoomed to {zoomed}");
+        let shrank = zoom_after_scroll(1.0, -120.0);
+        assert!(shrank > 0.75, "one notch shrank to {shrank}");
+    }
+
+    #[test]
+    fn zoom_never_escapes_its_limits() {
+        let mut zoom = 1.0_f32;
+        for _ in 0..500 {
+            zoom = zoom_after_scroll(zoom, 1000.0);
+        }
+        assert!(zoom <= ZOOM_MAX, "zoomed past the ceiling: {zoom}");
+        for _ in 0..500 {
+            zoom = zoom_after_scroll(zoom, -1000.0);
+        }
+        assert!(zoom >= ZOOM_MIN, "zoomed past the floor: {zoom}");
+    }
+
+    #[test]
+    fn scroll_zoom_survives_hostile_input() {
+        for delta in [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            0.0,
+            -0.0,
+            1e9,
+            -1e9,
+        ] {
+            let z = zoom_after_scroll(1.0, delta);
+            assert!(z.is_finite(), "zoom went non-finite for delta {delta}");
+            assert!((ZOOM_MIN..=ZOOM_MAX).contains(&z), "zoom {z} out of range");
+        }
+    }
+
+    #[test]
+    fn a_non_finite_zoom_is_recovered_not_propagated() {
+        // SEC-2026-002: once the zoom became NaN every frame afterwards was blank.
+        // Recovers to the neutral 100% and then applies the one notch of scroll.
+        let recovered = zoom_after_scroll(f32::NAN, 40.0);
+        assert!((0.9..=1.3).contains(&recovered), "recovered to {recovered}");
+        // Any corrupted state resets to neutral rather than to an extreme.
+        assert_eq!(zoom_after_scroll(f32::INFINITY, 0.0), 1.0);
+        assert_eq!(zoom_after_scroll(f32::NEG_INFINITY, 0.0), 1.0);
+        assert!(zoom_after_scroll(f32::NAN, f32::NAN).is_finite());
+    }
+
+    #[test]
+    fn fit_zoom_keeps_the_whole_picture_inside_the_canvas() {
+        // Realistic canvas sizes: fit must never overflow either axis.
+        for (cw, ch, bw, bh) in [
+            (1300.0f32, 800.0f32, 2400.0f32, 1000.0f32),
+            (1300.0, 800.0, 400.0, 400.0),
+            (1300.0, 800.0, 4000.0, 120.0),
+        ] {
+            let z = fit_zoom(cw, ch, bw, bh);
+            assert!(bw * z <= cw, "picture wider than the canvas at {z}");
+            assert!(bh * z <= ch, "picture taller than the canvas at {z}");
+        }
+    }
+
+    #[test]
+    fn fit_zoom_degrades_gracefully_when_the_canvas_is_tiny() {
+        // Below the 10% floor the picture is cropped by the clip rect rather than
+        // scaled to nothing, which is the intended behaviour for a 300px window.
+        let z = fit_zoom(300.0, 200.0, 4000.0, 100.0);
+        assert!((z - 0.1).abs() < 1e-5, "expected the 10% floor, got {z}");
+    }
+
+    #[test]
+    fn fit_zoom_fills_at_least_one_axis() {
+        // A fit that leaves both axes short would look like a bug.
+        let z = fit_zoom(1000.0, 600.0, 2000.0, 500.0);
+        let (w, h) = (2000.0 * z, 500.0 * z);
+        assert!(
+            (w - (1000.0 - CANVAS_FIT_PAD)).abs() < 1.0
+                || (h - (600.0 - CANVAS_FIT_PAD)).abs() < 1.0
+        );
+    }
+
+    #[test]
+    fn fit_zoom_refuses_to_divide_by_zero() {
+        for (bw, bh) in [(0.0f32, 100.0f32), (100.0, 0.0), (0.0, 0.0)] {
+            let z = fit_zoom(800.0, 600.0, bw, bh);
+            assert!(z.is_finite() && z > 0.0);
+        }
+    }
+
+    #[test]
+    fn fit_zoom_on_a_tiny_canvas_still_returns_something_drawable() {
+        let z = fit_zoom(10.0, 10.0, 2000.0, 1000.0);
+        assert!(z > 0.0 && z <= 0.1 + 1e-6);
+    }
+
+    // ---------- viewport split ----------
+
+    #[test]
+    fn video_gets_a_transport_band_and_images_do_not() {
+        let (canvas, band) = split_canvas_and_transport(avail(), true, false);
+        assert!(band.height() > 0.0);
+        assert!(canvas.height() < avail().height());
+        let (img_canvas, img_band) = split_canvas_and_transport(avail(), false, false);
+        assert_eq!(img_band.height(), 0.0);
+        assert_eq!(
+            img_canvas,
+            avail(),
+            "an image should use the whole viewport"
+        );
+    }
+
+    #[test]
+    fn zen_mode_drops_the_transport_band() {
+        let (canvas, band) = split_canvas_and_transport(avail(), true, true);
+        assert_eq!(band.height(), 0.0);
+        assert_eq!(canvas, avail());
+    }
+
+    #[test]
+    fn the_band_never_overlaps_the_picture() {
+        for height in [120.0f32, 200.0, 400.0, 820.0, 2000.0] {
+            let r = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1000.0, height));
+            let (canvas, band) = split_canvas_and_transport(r, true, false);
+            assert!(
+                canvas.bottom() <= band.top() + 0.001,
+                "canvas overlaps the transport band at height {height}"
+            );
+            assert!((canvas.height() + band.height() - height).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn the_band_never_eats_more_than_a_third_of_a_short_window() {
+        let r = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(600.0, 100.0));
+        let (canvas, band) = split_canvas_and_transport(r, true, false);
+        assert!(band.height() <= 100.0 * 0.35 + 0.01);
+        assert!(canvas.height() > 60.0, "picture area collapsed");
+    }
+
+    // ---------- timeline ----------
+
+    #[test]
+    fn timeline_maps_its_ends_to_the_clip_ends() {
+        assert_eq!(timeline_secs_at(100.0, 100.0, 200.0, 10.0), 0.0);
+        assert_eq!(timeline_secs_at(300.0, 100.0, 200.0, 10.0), 10.0);
+        assert_eq!(timeline_secs_at(200.0, 100.0, 200.0, 10.0), 5.0);
+    }
+
+    #[test]
+    fn timeline_clamps_outside_the_track() {
+        // Dragging past either end must pin to the ends, not extrapolate.
+        assert_eq!(timeline_secs_at(-500.0, 100.0, 200.0, 10.0), 0.0);
+        assert_eq!(timeline_secs_at(9999.0, 100.0, 200.0, 10.0), 10.0);
+    }
+
+    #[test]
+    fn timeline_handles_zero_length_media() {
+        for duration in [0.0f64, -5.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(timeline_secs_at(150.0, 100.0, 200.0, duration), 0.0);
+            assert_eq!(timeline_x_for(3.0, 100.0, 200.0, duration), 100.0);
+        }
+        assert_eq!(track_ratio(150.0, 100.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn timeline_position_and_time_are_inverse() {
+        let (left, width, duration) = (120.0f32, 460.0f32, 90.0f64);
+        for secs in [0.0f64, 1.0, 22.5, 45.0, 89.9, 90.0] {
+            let x = timeline_x_for(secs, left, width, duration);
+            let back = timeline_secs_at(x, left, width, duration);
+            assert!((back - secs).abs() < 0.05, "{secs}s became {back}s");
+        }
+    }
+
+    #[test]
+    fn the_knob_stays_inside_the_track() {
+        let (left, width, duration) = (100.0f32, 200.0f32, 60.0f64);
+        for position in [-10.0f64, 0.0, 30.0, 60.0, 999.0] {
+            let x = timeline_x_for(position, left, width, duration);
+            assert!((left..=left + width).contains(&x), "knob escaped to {x}");
+        }
+    }
+
+    // ---------- hit testing ----------
+
+    #[test]
+    fn cell_at_maps_corners_to_the_corner_cells() {
+        let dest = Rect::from_min_max(Pos2::new(100.0, 50.0), Pos2::new(400.0, 250.0));
+        assert_eq!(cell_at(dest.left_top(), dest, 10, 8), Some((0, 0)));
+        assert_eq!(
+            cell_at(dest.right_bottom() - Vec2::splat(0.5), dest, 10, 8),
+            Some((9, 7))
+        );
+    }
+
+    #[test]
+    fn cell_at_returns_none_outside_the_picture() {
+        let dest = Rect::from_min_max(Pos2::new(100.0, 50.0), Pos2::new(400.0, 250.0));
+        for p in [
+            Pos2::new(99.0, 100.0),
+            Pos2::new(401.0, 100.0),
+            Pos2::new(200.0, 49.0),
+            Pos2::new(200.0, 251.0),
+            Pos2::new(-1e6, -1e6),
+        ] {
+            assert_eq!(cell_at(p, dest, 10, 8), None, "{p:?} should miss");
+        }
+    }
+
+    #[test]
+    fn cell_at_never_indexes_past_the_grid() {
+        let dest = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(100.0, 100.0));
+        for cols in [1u32, 2, 95, 420] {
+            for rows in [1u32, 3, 51] {
+                for x in [0.0f32, 0.5, 50.0, 99.9, 100.0] {
+                    for y in [0.0f32, 0.5, 50.0, 99.9, 100.0] {
+                        if let Some((c, r)) = cell_at(Pos2::new(x, y), dest, cols, rows) {
+                            assert!(c < cols as usize, "column {c} out of {cols}");
+                            assert!(r < rows as usize, "row {r} out of {rows}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cell_at_rejects_degenerate_geometry() {
+        let zero = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(0.0, 0.0));
+        assert_eq!(cell_at(Pos2::new(0.0, 0.0), zero, 10, 10), None);
+        let flat = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(100.0, 0.0));
+        assert_eq!(cell_at(Pos2::new(50.0, 0.0), flat, 10, 10), None);
+        let normal = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(10.0, 10.0));
+        assert_eq!(cell_at(Pos2::new(5.0, 5.0), normal, 0, 0), None);
+    }
+
+    #[test]
+    fn cell_at_is_consistent_across_a_full_sweep() {
+        // Every cell must be reachable from its own centre pixel.
+        let dest = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(120.0, 60.0));
+        let (cols, rows) = (12u32, 6u32);
+        let cw = dest.width() / cols as f32;
+        let ch = dest.height() / rows as f32;
+        for r in 0..rows {
+            for c in 0..cols {
+                let p = Pos2::new(
+                    dest.left() + (c as f32 + 0.5) * cw,
+                    dest.top() + (r as f32 + 0.5) * ch,
+                );
+                assert_eq!(cell_at(p, dest, cols, rows), Some((c as usize, r as usize)));
+            }
+        }
     }
 }

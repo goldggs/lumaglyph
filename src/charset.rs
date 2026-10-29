@@ -108,3 +108,79 @@ impl CharsetPreset {
         mask
     }
 }
+#[cfg(test)]
+mod charset_unit_tests {
+    use super::*;
+
+    #[test]
+    fn every_preset_round_trips_through_its_cli_name() {
+        let mut seen = std::collections::HashSet::new();
+        for preset in CharsetPreset::ALL {
+            let name = preset.cli_name();
+            assert!(seen.insert(name), "duplicate cli_name {name}");
+            assert_eq!(CharsetPreset::from_cli(name), Some(preset));
+            assert!(!preset.label().is_empty());
+        }
+    }
+
+    #[test]
+    fn ascii_count_matches_the_printable_range() {
+        assert_eq!(ASCII_COUNT, 0x7E - 0x20 + 1);
+        assert_eq!(ASCII_MIN, 0x20);
+        assert_eq!(ASCII_COUNT, 95);
+    }
+
+    #[test]
+    fn genuine95_activates_every_glyph() {
+        let mask = CharsetPreset::Genuine95.active_mask("");
+        assert_eq!(mask.len(), ASCII_COUNT);
+        assert!(mask.iter().all(|&b| b), "Genuine95 must use all 95 glyphs");
+    }
+
+    #[test]
+    fn subset_presets_always_keep_space() {
+        for preset in CharsetPreset::ALL {
+            let mask = preset.active_mask("");
+            assert!(
+                mask[0],
+                "{preset:?} dropped the space glyph, breaking background cells"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_mask_reflects_only_the_supplied_characters() {
+        let mask = CharsetPreset::active_mask(CharsetPreset::Custom, "ABC");
+        let active: Vec<char> = mask
+            .iter()
+            .enumerate()
+            .filter(|(_, &on)| on)
+            .map(|(i, _)| (i as u8 + ASCII_MIN) as char)
+            .collect();
+        // Space is always retained, plus the three requested glyphs.
+        assert_eq!(active, vec![' ', 'A', 'B', 'C']);
+    }
+
+    #[test]
+    fn custom_mask_ignores_out_of_range_and_duplicate_characters() {
+        let with_junk = CharsetPreset::active_mask(CharsetPreset::Custom, "A\nA\t\u{1F600}AA");
+        let count = with_junk.iter().filter(|&&b| b).count();
+        assert_eq!(count, 2, "expected space + 'A', got {count}");
+    }
+
+    #[test]
+    fn empty_custom_charset_still_leaves_a_drawable_glyph() {
+        let mask = CharsetPreset::active_mask(CharsetPreset::Custom, "");
+        assert!(
+            mask.iter().any(|&b| b),
+            "an empty custom set must not disable every glyph"
+        );
+    }
+
+    #[test]
+    fn masks_are_stable_across_repeated_calls() {
+        for preset in CharsetPreset::ALL {
+            assert_eq!(preset.active_mask("XYZ"), preset.active_mask("XYZ"));
+        }
+    }
+}

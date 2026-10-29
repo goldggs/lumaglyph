@@ -249,3 +249,196 @@ pub fn export_html(frame: &AsciiFrame, params: &RenderParams, path: &Path) -> Re
     html.push_str("</pre>\n</body>\n</html>\n");
     fs::write(path, html).map_err(|e| format!("Failed to write HTML: {e}"))
 }
+#[cfg(test)]
+mod export_unit_tests {
+    // Test fixtures read more clearly as `default()` plus explicit overrides.
+    #![allow(clippy::field_reassign_with_default)]
+
+    use super::*;
+    use crate::engine::AsciiCell;
+
+    fn frame(cols: u32, rows: u32) -> AsciiFrame {
+        let mut f = AsciiFrame::new();
+        f.cols = cols;
+        f.rows = rows;
+        f.cells = vec![
+            AsciiCell {
+                ch: b'A',
+                flags: 0,
+                fg: [10, 20, 30],
+                bg: [40, 50, 60],
+            };
+            (cols * rows) as usize
+        ];
+        f
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lumaglyph_export_{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn png_export_writes_a_readable_image_of_the_right_size() {
+        let dir = temp_dir("png");
+        let path = dir.join("out.png");
+        let atlas = GlyphAtlas::default_embedded(20);
+        let params = RenderParams::default();
+        let (w, h) = export_png(&frame(8, 4), &atlas, 20, &params, &path).unwrap();
+        assert!(path.exists());
+        let img = image::open(&path).unwrap();
+        assert_eq!(img.width() as usize, w);
+        assert_eq!(img.height() as usize, h);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn png_export_rejects_an_empty_frame_instead_of_writing_a_0x0_file() {
+        let dir = temp_dir("png_empty");
+        let path = dir.join("empty.png");
+        let atlas = GlyphAtlas::default_embedded(20);
+        let params = RenderParams::default();
+        let err = export_png(&AsciiFrame::new(), &atlas, 20, &params, &path).unwrap_err();
+        assert!(err.contains("Empty"));
+        assert!(!path.exists(), "an empty frame must not produce a file");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn png_scale_changes_pixel_size_but_not_grid() {
+        let dir = temp_dir("png_scale");
+        let atlas = GlyphAtlas::default_embedded(20);
+        let params = RenderParams::default();
+        let (w1, h1) = export_png(&frame(4, 2), &atlas, 20, &params, &dir.join("a.png")).unwrap();
+        let (w2, h2) = export_png(&frame(4, 2), &atlas, 40, &params, &dir.join("b.png")).unwrap();
+        assert!(w2 >= w1 && h2 > h1, "2x scale should be at least as large");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn txt_export_is_exactly_the_plain_text() {
+        let dir = temp_dir("txt");
+        let path = dir.join("out.txt");
+        let f = frame(5, 3);
+        export_txt(&f, &path).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(written, f.to_plain_text());
+        assert_eq!(written.lines().count(), 3);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ansi_export_emits_escape_sequences_and_matching_dimensions() {
+        let f = frame(6, 2);
+        let params = RenderParams::default();
+        let ansi = frame_to_ansi_string(&f, &params);
+        assert!(ansi.contains('\u{1b}'), "no ANSI escapes were emitted");
+        assert!(
+            ansi.contains("[38;2;"),
+            "missing 24-bit foreground sequence"
+        );
+        // Six glyphs per row, two rows.
+        let glyphs = ansi.chars().filter(|&c| c == 'A').count();
+        assert_eq!(glyphs, 12);
+        std::fs::remove_dir_all(temp_dir("ansi_noop")).ok();
+    }
+
+    #[test]
+    fn ansi_export_writes_its_string_verbatim() {
+        let dir = temp_dir("ansi");
+        let path = dir.join("out.ansi");
+        let f = frame(3, 2);
+        let params = RenderParams::default();
+        export_ansi(&f, &params, &path).unwrap();
+        let written = std::fs::read(&path).unwrap();
+        assert_eq!(written, frame_to_ansi_string(&f, &params).into_bytes());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn svg_export_is_well_formed_and_sized() {
+        let dir = temp_dir("svg");
+        let path = dir.join("out.svg");
+        let params = RenderParams::default();
+        export_svg(&frame(4, 3), &params, &path).unwrap();
+        let svg = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            svg.starts_with("<svg") || svg.contains("<svg"),
+            "not an SVG document"
+        );
+        assert!(svg.trim_end().ends_with("</svg>"), "SVG was not closed");
+        assert!(svg.contains("width=") && svg.contains("height="));
+        assert!(!svg.contains("NaN"), "SVG contains NaN coordinates");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn html_export_is_a_complete_document() {
+        let dir = temp_dir("html");
+        let path = dir.join("out.html");
+        let params = RenderParams::default();
+        export_html(&frame(4, 2), &params, &path).unwrap();
+        let html = std::fs::read_to_string(&path).unwrap();
+        assert!(html.to_lowercase().contains("<!doctype html>"));
+        assert!(html.contains("</html>"));
+        assert!(html.contains("<pre") || html.contains("<div"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn html_export_escapes_glyphs_that_would_break_markup() {
+        // '<', '>' and '&' are legitimate printable ASCII glyphs, so an HTML export
+        // must escape them or the document breaks out of its container.
+        let dir = temp_dir("html_escape");
+        let path = dir.join("out.html");
+        let mut f = frame(3, 1);
+        f.cells[0].ch = b'<';
+        f.cells[1].ch = b'&';
+        f.cells[2].ch = b'>';
+        let params = RenderParams::default();
+        export_html(&f, &params, &path).unwrap();
+        let html = std::fs::read_to_string(&path).unwrap();
+        assert!(!html.contains("<A<"), "raw markup leaked");
+        assert!(
+            html.contains("&lt;") || html.contains("&#60;") || html.contains("&#x3C;"),
+            "angle bracket was not escaped"
+        );
+        assert!(
+            html.contains("&amp;") || html.contains("&#38;"),
+            "'&' was not escaped"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn transparent_html_uses_a_transparent_background() {
+        let dir = temp_dir("html_alpha");
+        let path = dir.join("out.html");
+        let mut params = RenderParams::default();
+        params.transparent_bg = true;
+        export_html(&frame(2, 2), &params, &path).unwrap();
+        let html = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            html.contains("transparent"),
+            "alpha export lost its transparency"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn export_paths_report_errors_when_the_directory_does_not_exist() {
+        let missing = std::env::temp_dir()
+            .join("lumaglyph_no_such_dir_xyz")
+            .join("x.txt");
+        let err = export_txt(&frame(2, 1), &missing).unwrap_err();
+        assert!(err.to_lowercase().contains("txt"), "unhelpful error: {err}");
+    }
+}

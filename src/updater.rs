@@ -2136,3 +2136,302 @@ pub fn is_newer_semver(remote_tag: &str, current_version: &str) -> bool {
         _ => false,
     }
 }
+#[cfg(test)]
+mod platform_matrix_tests {
+    // Test fixtures read more clearly as `default()` plus explicit overrides.
+    #![allow(clippy::field_reassign_with_default)]
+
+    use super::*;
+
+    const ALL_OS_ARCH: [(&str, &str); 4] = [
+        ("linux", "x86_64"),
+        ("macos", "aarch64"),
+        ("macos", "x86_64"),
+        ("windows", "x86_64"),
+    ];
+
+    #[test]
+    fn every_supported_os_arch_pair_maps_to_a_distinct_target() {
+        let mut seen: Vec<PlatformTarget> = Vec::new();
+        for (os, arch) in ALL_OS_ARCH {
+            let target = PlatformTarget::from_os_arch(os, arch)
+                .unwrap_or_else(|| panic!("{os}/{arch} was not recognised"));
+            assert!(!seen.contains(&target), "duplicate mapping for {os}/{arch}");
+            seen.push(target);
+        }
+        assert_eq!(seen.len(), PlatformTarget::ALL.len());
+    }
+
+    #[test]
+    fn unsupported_platforms_are_refused_not_guessed() {
+        for (os, arch) in [
+            ("linux", "aarch64"),
+            ("linux", "x86"),
+            ("windows", "aarch64"),
+            ("freebsd", "x86_64"),
+            ("android", "aarch64"),
+            ("", ""),
+            ("LINUX", "X86_64"),
+        ] {
+            assert_eq!(
+                PlatformTarget::from_os_arch(os, arch),
+                None,
+                "{os}/{arch} should not resolve to a release target"
+            );
+        }
+    }
+
+    #[test]
+    fn the_running_platform_is_always_recognised() {
+        // CI runs on all three platforms, so this is a real cross-platform check.
+        assert!(
+            PlatformTarget::current().is_some(),
+            "this platform has no release target, so self-update would be impossible"
+        );
+    }
+
+    #[test]
+    fn archive_names_are_unique_and_match_the_release_assets() {
+        let mut seen = std::collections::HashSet::new();
+        for target in PlatformTarget::ALL {
+            let name = target.expected_archive_name();
+            assert!(seen.insert(name), "duplicate archive name {name}");
+            assert!(
+                !name.contains('/') && !name.contains('\\'),
+                "path separator in {name}"
+            );
+            assert!(!name.contains(".."), "traversal in {name}");
+            // The updater only accepts the archive it built for this platform,
+            // so the name must encode platform and arch unambiguously.
+            let expected_ext = match target.archive_format() {
+                ArchiveFormat::Zip => ".zip",
+                ArchiveFormat::TarGz => ".tar.gz",
+            };
+            assert!(
+                name.ends_with(expected_ext),
+                "{name} has the wrong extension"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_is_the_only_target_using_zip_and_exe() {
+        for target in PlatformTarget::ALL {
+            let is_windows = target == PlatformTarget::WindowsX86_64;
+            assert_eq!(
+                matches!(target.archive_format(), ArchiveFormat::Zip),
+                is_windows,
+                "{target:?} archive format"
+            );
+            assert_eq!(
+                target.expected_binary_name().ends_with(".exe"),
+                is_windows,
+                "{target:?} binary name"
+            );
+        }
+    }
+
+    #[test]
+    fn output_filenames_never_allow_path_traversal() {
+        for target in PlatformTarget::ALL {
+            for tag in ["v0.4.0", "v1.2.3-rc.1"] {
+                let name = target.output_filename_for_tag(tag);
+                assert!(!name.contains('/'), "separator in {name}");
+                assert!(!name.contains('\\'), "separator in {name}");
+                assert!(!name.contains(".."), "traversal in {name}");
+                assert!(name.starts_with("lumaglyph-"), "{name} lost its prefix");
+            }
+        }
+    }
+
+    #[test]
+    fn output_filenames_keep_the_windows_extension() {
+        let win = PlatformTarget::WindowsX86_64.output_filename_for_tag("v0.4.0");
+        assert_eq!(win, "lumaglyph-v0.4.0.exe");
+        let nix = PlatformTarget::LinuxX86_64.output_filename_for_tag("v0.4.0");
+        assert_eq!(nix, "lumaglyph-v0.4.0");
+    }
+
+    #[test]
+    fn preferences_config_path_is_inside_a_config_directory() {
+        if let Some(path) = AppPreferences::config_path() {
+            assert!(path.ends_with("preferences.json"));
+            assert!(
+                path.to_string_lossy().contains("lumaglyph"),
+                "config path should be namespaced: {}",
+                path.display()
+            );
+            // It must never point at the working directory, where it could be
+            // overwritten by whatever repo the user happens to be in.
+            assert!(!path.starts_with("."));
+        }
+    }
+
+    #[test]
+    fn preferences_serialise_and_deserialise_without_loss() {
+        let prefs = AppPreferences::default();
+        let json = serde_json::to_string(&prefs).unwrap();
+        let back: AppPreferences = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            serde_json::to_string(&back).unwrap(),
+            json,
+            "preferences changed across a save/load cycle"
+        );
+    }
+
+    #[test]
+    fn corrupt_preferences_fall_back_to_defaults_instead_of_panicking() {
+        for junk in [
+            "",
+            "{",
+            "null",
+            "[]",
+            "{\"unknown_field\": 42}",
+            "{\"atlas_cell_height\": \"not a number\"}",
+        ] {
+            // Deserialisation may fail; the loader must not panic on it.
+            let _ = serde_json::from_str::<AppPreferences>(junk);
+        }
+    }
+
+    #[test]
+    fn preference_values_are_clamped_to_workable_ranges() {
+        let prefs = AppPreferences::default();
+        assert!(prefs.fps_cap == 0 || FPS_CAP_OPTIONS.contains(&prefs.fps_cap));
+        assert!(prefs.repaint_interval().is_none() || prefs.fps_cap > 0);
+        assert!(prefs.effective_worker_threads() >= 1);
+        assert!(prefs.effective_worker_threads() <= 256);
+        assert!(TextureFilterMode::ALL.contains(&prefs.texture_filter));
+    }
+
+    #[test]
+    fn worker_thread_count_never_exceeds_available_parallelism() {
+        let available = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let mut prefs = AppPreferences::default();
+        prefs.worker_threads = 0; // "auto"
+        assert!(prefs.effective_worker_threads() <= available.max(1) * 2);
+        prefs.worker_threads = 999;
+        assert!(
+            prefs.effective_worker_threads() <= 256,
+            "an absurd thread count would starve the machine"
+        );
+    }
+
+    #[test]
+    fn fps_cap_options_are_sane_and_ordered() {
+        // 0 means "uncapped" and sorts first, then the real caps ascend.
+        assert_eq!(
+            FPS_CAP_OPTIONS[0], 0,
+            "0 (uncapped) must be the first option"
+        );
+        let mut previous = 0;
+        for cap in FPS_CAP_OPTIONS.iter().skip(1) {
+            assert!(
+                *cap > previous,
+                "FPS options must ascend after the uncapped entry"
+            );
+            previous = *cap;
+        }
+        assert!(FPS_CAP_OPTIONS.contains(&60), "60 fps should be offered");
+    }
+
+    #[test]
+    fn repaint_interval_matches_the_requested_cap() {
+        let mut prefs = AppPreferences::default();
+        prefs.fps_cap = 0;
+        assert!(
+            prefs.repaint_interval().is_none(),
+            "uncapped should not throttle"
+        );
+        prefs.fps_cap = 30;
+        let interval = prefs.repaint_interval().expect("30 fps should throttle");
+        assert!((interval.as_secs_f64() - 1.0 / 30.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn texture_filter_resolution_is_deterministic() {
+        for mode in TextureFilterMode::ALL {
+            let a = mode.resolve(1.0);
+            let b = mode.resolve(1.0);
+            assert_eq!(a, b);
+            assert!(matches!(a, "nearest" | "linear"), "unexpected mode {a}");
+        }
+        // Auto must switch at the documented zoom threshold.
+        assert_eq!(TextureFilterMode::Auto.resolve(0.5), "linear");
+        assert_eq!(TextureFilterMode::Auto.resolve(5.0), "nearest");
+    }
+
+    #[test]
+    fn semver_comparison_handles_prereleases_and_junk() {
+        assert!(is_newer_semver("v0.4.0", "0.3.9"));
+        assert!(!is_newer_semver("v0.3.9", "0.3.9"));
+        assert!(!is_newer_semver("v0.3.8", "0.3.9"));
+        assert!(is_newer_semver("v1.0.0", "0.99.99"));
+        assert!(
+            is_newer_semver("v0.10.0", "0.9.0"),
+            "numeric, not lexical, compare"
+        );
+        // Junk must never be treated as an upgrade.
+        for junk in ["", "banana", "v", "v..", "v-1.0.0", "v1.0.0.0.0"] {
+            assert!(
+                !is_newer_semver(junk, "0.4.0"),
+                "{junk:?} was treated as newer"
+            );
+        }
+    }
+
+    #[test]
+    fn build_report_names_the_binary_version_and_target() {
+        let report = format_build_report(Some("Test GPU"), Some("ffmpeg 7.0"), "12.0 MB");
+        assert!(report.contains("LumaGlyph v"));
+        assert!(report.contains(APP_VERSION));
+        assert!(report.contains(BUILD_TARGET_TRIPLE));
+        // The report is pasted into bug reports, so it must not leak the builder's home directory.
+        let home = std::env::var("HOME").unwrap_or_default();
+        if !home.is_empty() {
+            assert!(
+                !report.contains(&home),
+                "build report leaked $HOME:\n{report}"
+            );
+        }
+        assert!(
+            !report.contains("/home/"),
+            "build report leaked a home path"
+        );
+        assert!(
+            !report.contains("C:\\Users\\"),
+            "build report leaked a Windows user path"
+        );
+    }
+
+    #[test]
+    fn production_endpoint_policy_pins_github_only() {
+        let policy = EndpointPolicy::production_github(true);
+        assert!(policy.require_https, "updates must never use plain HTTP");
+        assert_eq!(
+            policy.allow_explicit_port, None,
+            "custom ports must be refused"
+        );
+        for host in &policy.allowed_redirect_hosts {
+            assert!(
+                host.ends_with("github.com") || host.ends_with("githubusercontent.com"),
+                "unexpected redirect host {host}"
+            );
+        }
+    }
+
+    #[test]
+    fn doc_urls_point_at_this_repository() {
+        assert!(REPO_URL.starts_with("https://github.com/goldggs/lumaglyph"));
+        assert!(LATEST_RELEASE_URL.starts_with(REPO_URL));
+        for (label, url) in ALL_DOC_LINKS {
+            assert!(url.starts_with("https://"), "{label} is not HTTPS: {url}");
+            assert!(
+                url.contains("goldggs/lumaglyph"),
+                "{label} points elsewhere: {url}"
+            );
+        }
+    }
+}

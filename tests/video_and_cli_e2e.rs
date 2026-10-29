@@ -146,7 +146,13 @@ fn compiled_cli_binary_executes_headless_commands_cleanly() {
     let info_out = Command::new(bin).arg("build-info").output().unwrap();
     assert!(info_out.status.success());
     let info_str = String::from_utf8_lossy(&info_out.stdout);
-    assert!(info_str.contains("LumaGlyph v0.3.9"));
+    // Compare against the crate version instead of a literal, so a release bump does
+    // not require editing a test (and cannot be forgotten in one).
+    assert!(
+        info_str.contains(&format!("LumaGlyph v{}", env!("CARGO_PKG_VERSION"))),
+        "build-info did not report version {}:\n{info_str}",
+        env!("CARGO_PKG_VERSION")
+    );
 
     let look_out = Command::new(bin).arg("look").output().unwrap();
     assert!(look_out.status.success());

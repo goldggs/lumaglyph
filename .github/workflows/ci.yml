@@ -43,6 +43,12 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
 
+      - name: Check the published test inventory is current
+        if: runner.os == 'Linux'
+        # The README quotes per-suite test counts. This keeps them honest: the script
+        # re-counts from the test binaries and fails if the committed table differs.
+        run: ./scripts/test_inventory.sh --check
+
       - name: Build, Clippy, Test & Path-Leak Audit
         shell: python
         env:

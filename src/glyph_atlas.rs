@@ -259,10 +259,111 @@ impl GlyphAtlas {
         .unwrap_or_else(|_| Self::default_embedded(new_cell_h))
     }
 
+    /// Alpha bitmap for one printable ASCII glyph.
+    ///
+    /// The index is clamped rather than trusted: an out-of-range glyph byte used to
+    /// overflow `glyph_idx * stride` and panic on the slice range (SEC-2026-001).
     #[inline(always)]
     pub fn glyph_slice(&self, glyph_idx: usize) -> &[u8] {
         let stride = self.cell_w * self.cell_h;
-        let start = glyph_idx * stride;
+        let idx = glyph_idx.min(ASCII_COUNT - 1);
+        let start = idx * stride;
         &self.bitmaps[start..start + stride]
+    }
+}
+#[cfg(test)]
+mod glyph_atlas_unit_tests {
+    use super::*;
+
+    #[test]
+    fn embedded_atlas_covers_every_printable_ascii_glyph() {
+        let atlas = GlyphAtlas::default_embedded(20);
+        assert_eq!(ASCII_COUNT, crate::charset::ASCII_COUNT);
+        for idx in 0..crate::charset::ASCII_COUNT {
+            assert_eq!(atlas.glyph_slice(idx).len(), atlas.cell_w * atlas.cell_h);
+        }
+    }
+
+    #[test]
+    fn glyph_slice_clamps_instead_of_panicking() {
+        // SEC-2026-001: `glyph_idx * stride` used to overflow and panic on the
+        // slice range. Every out-of-range index must return the last glyph.
+        let atlas = GlyphAtlas::default_embedded(20);
+        let last = atlas.glyph_slice(ASCII_COUNT - 1);
+        for idx in [ASCII_COUNT, ASCII_COUNT + 1, 10_000, usize::MAX] {
+            assert_eq!(
+                atlas.glyph_slice(idx),
+                last,
+                "index {idx} should saturate to the final glyph"
+            );
+        }
+        // And an in-range index is unaffected.
+        assert_eq!(
+            atlas.glyph_slice(0),
+            &atlas.bitmaps[..atlas.cell_w * atlas.cell_h]
+        );
+    }
+
+    #[test]
+    fn cell_height_override_scales_the_bitmap() {
+        let base = GlyphAtlas::default_embedded(20);
+        let tall = base.with_cell_height(40);
+        assert_eq!(tall.cell_h, 40);
+        assert!(tall.cell_h > base.cell_h);
+        assert_eq!(ASCII_COUNT, ASCII_COUNT);
+        for idx in 0..ASCII_COUNT {
+            assert_eq!(tall.glyph_slice(idx).len(), tall.cell_w * tall.cell_h);
+        }
+    }
+
+    #[test]
+    fn cell_height_override_keeps_the_aspect_ratio_sane() {
+        let atlas = GlyphAtlas::default_embedded(20).with_cell_height(28);
+        assert!(atlas.cell_w > 0 && atlas.cell_h > 0);
+        // A monospace cell is taller than it is wide but never a sliver.
+        assert!(atlas.cell_w as f32 / (atlas.cell_h as f32) > 0.3);
+        assert!(atlas.cell_w as f32 / (atlas.cell_h as f32) < 1.2);
+    }
+
+    #[test]
+    fn space_glyph_is_blank() {
+        let atlas = GlyphAtlas::default_embedded(20);
+        let space = atlas.glyph_slice(b' ' as usize - crate::charset::ASCII_MIN as usize);
+        assert!(space.iter().all(|&a| a == 0), "space rendered ink");
+    }
+
+    #[test]
+    fn dense_glyphs_carry_more_ink_than_sparse_ones() {
+        let atlas = GlyphAtlas::default_embedded(20);
+        let ink = |ch: u8| -> u32 {
+            atlas
+                .glyph_slice(ch as usize - crate::charset::ASCII_MIN as usize)
+                .iter()
+                .map(|&a| a as u32)
+                .sum()
+        };
+        assert!(ink(b'@') > ink(b'.'), "'@' should be denser than '.'");
+        assert!(ink(b'#') > ink(b' '));
+        assert!(ink(b'M') > ink(b'_'));
+    }
+
+    #[test]
+    fn atlas_construction_is_deterministic() {
+        let a = GlyphAtlas::default_embedded(20);
+        let b = GlyphAtlas::default_embedded(20);
+        assert_eq!(a.cell_w, b.cell_w);
+        assert_eq!(a.cell_h, b.cell_h);
+        for idx in 0..ASCII_COUNT {
+            assert_eq!(a.glyph_slice(idx), b.glyph_slice(idx));
+        }
+    }
+
+    #[test]
+    fn tiny_and_large_cell_heights_stay_within_bounds() {
+        for h in [12usize, 16, 20, 28, 36] {
+            let atlas = GlyphAtlas::default_embedded(h);
+            assert!(atlas.cell_h >= 12, "cell height {h} collapsed");
+            assert!(atlas.cell_w > 0);
+        }
     }
 }

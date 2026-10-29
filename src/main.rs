@@ -14,6 +14,8 @@ mod win_console {
     }
 
     pub fn has_valid_stderr() -> bool {
+        // SAFETY: GetStdHandle is always safe to call; it returns a pseudo-handle
+        // or INVALID_HANDLE_VALUE and never transfers ownership.
         let h = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
         h != 0 && h != INVALID_HANDLE_VALUE
     }
@@ -22,6 +24,9 @@ mod win_console {
     /// headless CLI subcommands when standard handles are not already redirected to pipes.
     /// Never calls `AllocConsole`, so launching `lumaglyph.exe` as a GUI app never opens a terminal.
     pub fn attach_parent_if_needed() {
+        // SAFETY: AttachConsole only links this process to an already-existing
+        // parent console. It allocates no memory and takes no pointers, and a
+        // failure is ignored, so there is nothing to invalidate.
         unsafe {
             let out_h = GetStdHandle(STD_OUTPUT_HANDLE);
             let err_h = GetStdHandle(STD_ERROR_HANDLE);

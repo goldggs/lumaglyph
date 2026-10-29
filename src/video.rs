@@ -986,3 +986,131 @@ impl Drop for LiveVideoStream {
         self.stop_flag.store(true, Ordering::Relaxed);
     }
 }
+#[cfg(test)]
+mod video_unit_tests {
+    use super::*;
+
+    #[test]
+    fn timecode_is_zero_padded_and_stable() {
+        assert_eq!(format_timecode(0.0), "00:00.0");
+        assert_eq!(format_timecode(1.5), "00:01.5");
+        assert_eq!(format_timecode(59.94), "00:59.9");
+        assert_eq!(format_timecode(60.0), "01:00.0");
+        // Past an hour the formatter switches to h:mm:ss.t
+        assert_eq!(format_timecode(3661.25), "1:01:01.3");
+        assert_eq!(format_timecode(3600.0), "1:00:00.0");
+    }
+
+    #[test]
+    fn timecode_never_renders_negative_or_nan() {
+        for bad in [-1.0f64, -1e9, f64::NAN] {
+            let text = format_timecode(bad);
+            assert!(!text.contains('-'), "negative timecode: {text}");
+            assert!(!text.contains("NaN"), "NaN timecode: {text}");
+            assert!(!text.contains("inf"), "infinite timecode: {text}");
+        }
+        assert_eq!(format_timecode(f64::INFINITY), "00:00.0");
+    }
+
+    #[test]
+    fn timecode_minutes_and_seconds_are_always_two_digits() {
+        for secs in [
+            0.0f64, 1.0, 9.0, 10.0, 59.0, 60.0, 61.0, 599.0, 600.0, 3599.0,
+        ] {
+            let text = format_timecode(secs);
+            let (minutes, rest) = text.split_once(':').expect("missing separator");
+            assert!(minutes.len() >= 2, "minutes not padded in {text}");
+            assert_eq!(rest.len(), 4, "seconds/tenths malformed in {text}");
+        }
+    }
+
+    #[test]
+    fn tool_resolution_returns_a_usable_path() {
+        let path = resolve_tool_binary("ffmpeg");
+        assert!(!path.as_os_str().is_empty());
+        // With nothing configured it falls back to the bare name, which PATH resolves.
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        assert!(name.starts_with("ffmpeg"), "unexpected binary name {name}");
+    }
+
+    #[test]
+    fn tool_resolution_is_deterministic() {
+        assert_eq!(
+            resolve_tool_binary("ffprobe"),
+            resolve_tool_binary("ffprobe")
+        );
+    }
+
+    #[test]
+    fn custom_ffmpeg_directory_is_honoured_only_when_it_contains_the_tool() {
+        let dir = std::env::temp_dir().join(format!("lumaglyph_ffmpeg_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        set_video_pipeline_prefs(&dir.to_string_lossy(), 18);
+        // Nothing was placed in the directory, so resolution must fall through
+        // rather than returning a path that does not exist.
+        let resolved = resolve_tool_binary("ffmpeg");
+        assert!(
+            !resolved.starts_with(&dir) || resolved.is_file(),
+            "resolved to a missing binary: {}",
+            resolved.display()
+        );
+        set_video_pipeline_prefs("", 18);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn clearing_the_custom_directory_restores_default_resolution() {
+        set_video_pipeline_prefs("/nonexistent/path/for/tests", 18);
+        set_video_pipeline_prefs("", 18);
+        let path = resolve_tool_binary("ffmpeg");
+        assert!(!path.starts_with("/nonexistent"));
+    }
+
+    #[test]
+    fn audio_envelope_returns_empty_for_a_missing_file_instead_of_panicking() {
+        let missing = std::path::Path::new("/nonexistent/video_for_envelope_test.mp4");
+        let envelope = extract_audio_envelope(missing, 30.0);
+        assert!(
+            envelope.is_empty(),
+            "a missing file should yield no envelope"
+        );
+    }
+
+    #[test]
+    fn audio_envelope_tolerates_absurd_frame_rates() {
+        let missing = std::path::Path::new("/nonexistent/video_for_envelope_test.mp4");
+        for fps in [0.0f64, -30.0, 1e9, f64::NAN] {
+            // The clamps must keep the buffer maths finite.
+            let envelope = extract_audio_envelope(missing, fps);
+            assert!(envelope.is_empty());
+        }
+    }
+
+    #[test]
+    fn ffmpeg_invocations_are_never_shelled_out_through_a_string() {
+        // Command injection guard: the video pipeline must build the process with
+        // Command::new and arguments, never `sh -c` on interpolated text.
+        // Only the production half of the file matters: the test module below
+        // necessarily contains the strings it is looking for.
+        let src = include_str!("video.rs");
+        let production = src.split("#[cfg(test)]").next().unwrap();
+        for banned in ["sh -c", "cmd /C", "cmd /c", "| sh", "system("] {
+            assert!(
+                !production.contains(banned),
+                "video.rs builds a shell command via '{banned}', which invites injection"
+            );
+        }
+        assert!(production.contains("Command::new"));
+    }
+
+    #[test]
+    fn subprocesses_cannot_pop_a_console_on_windows() {
+        let src = include_str!("video.rs");
+        if src.contains("configure_no_window") {
+            assert!(
+                src.contains("CREATE_NO_WINDOW"),
+                "Windows subprocesses must be created without a console window"
+            );
+        }
+    }
+}
