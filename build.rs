@@ -45,8 +45,25 @@ fn detect_rustc_version() -> String {
     "rustc (stable)".to_string()
 }
 
+#[cfg(windows)]
+fn embed_windows_icon_resources() {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    let mut res = winresource::WindowsResource::new();
+    res.set_icon("assets/icons/lumaglyph.ico")
+        .set("ProductName", "LumaGlyph")
+        .set("FileDescription", "LumaGlyph")
+        .set("InternalName", "lumaglyph")
+        .set("OriginalFilename", "lumaglyph.exe");
+    res.compile_for("lumaglyph")
+        .expect("Failed compiling Windows PE icon and version resources into lumaglyph.exe");
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=assets/icons/lumaglyph.ico");
+    println!("cargo:rerun-if-changed=assets/icons/lumaglyph-256.png");
     println!("cargo:rerun-if-env-changed=GITHUB_SHA");
 
     let target = env::var("TARGET").unwrap_or_else(|_| "unknown-target".to_string());
@@ -58,4 +75,7 @@ fn main() {
     println!("cargo:rustc-env=LUMAGLYPH_TARGET_TRIPLE={target}");
     println!("cargo:rustc-env=LUMAGLYPH_BUILD_PROFILE={profile}");
     println!("cargo:rustc-env=LUMAGLYPH_RUSTC_VERSION={rustc_ver}");
+
+    #[cfg(windows)]
+    embed_windows_icon_resources();
 }

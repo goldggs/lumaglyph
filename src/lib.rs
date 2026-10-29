@@ -5,6 +5,7 @@ pub mod engine;
 pub mod export;
 pub mod glyph_atlas;
 pub mod gui;
+pub mod icon;
 pub mod look;
 pub mod telemetry;
 pub mod theme;
@@ -108,14 +109,27 @@ mod tests {
 
     #[test]
     fn build_metadata_is_populated_and_path_free() {
-        assert_eq!(APP_VERSION, "0.3.4");
+        assert_eq!(APP_VERSION, "0.3.5");
         assert!(!BUILD_GIT_SHA.is_empty());
         assert!(!BUILD_TARGET_TRIPLE.is_empty());
         let report = format_build_report(Some("Test GPU"), Some("ffmpeg 7.1"), "8.0 MB");
-        assert!(report.contains("LumaGlyph v0.3.4"));
+        assert!(report.contains("LumaGlyph v0.3.5"));
         assert!(!report.contains("/home/"));
         assert!(!report.contains("/Users/"));
         assert!(!report.contains("C:\\Users\\"));
+    }
+
+    #[test]
+    fn embedded_application_icon_decodes_to_rgba_256() {
+        let (rgba, w, h) = crate::icon::decode_app_icon_rgba().expect("embedded icon must decode");
+        assert_eq!((w, h), (256, 256));
+        assert_eq!(rgba.len(), 256 * 256 * 4);
+        assert_eq!(rgba[3], 0, "top-left corner must be transparent");
+        let opaque_pixels = rgba.chunks_exact(4).filter(|px| px[3] > 200).count();
+        assert!(
+            opaque_pixels > 4_000,
+            "icon must contain crisp LG glyph pixels"
+        );
     }
 
     #[test]

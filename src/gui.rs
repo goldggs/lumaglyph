@@ -133,6 +133,7 @@ pub struct LumaGlyphApp {
     ascii_frame: AsciiFrame,
     raster_rgba: Vec<u8>,
     ascii_tex: Option<TextureHandle>,
+    app_logo_tex: Option<TextureHandle>,
     ascii_px_w: usize,
     ascii_px_h: usize,
 
@@ -225,6 +226,11 @@ impl LumaGlyphApp {
         });
         let show_settings_window = boot.open_settings_tab.is_some() || boot.show_update_modal;
 
+        let app_logo_tex = crate::icon::egui_logo_color_image().map(|img| {
+            cc.egui_ctx
+                .load_texture("lumaglyph_brand_logo", img, TextureOptions::LINEAR)
+        });
+
         let mut app = Self {
             atlas,
             params,
@@ -238,6 +244,7 @@ impl LumaGlyphApp {
             ascii_frame: AsciiFrame::new(),
             raster_rgba: Vec::new(),
             ascii_tex: None,
+            app_logo_tex,
             ascii_px_w: 0,
             ascii_px_h: 0,
             inspector_open: false,
@@ -787,6 +794,13 @@ impl LumaGlyphApp {
         let pal = self.palette;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
+
+            if let Some(tex) = &self.app_logo_tex {
+                ui.add(
+                    egui::Image::from_texture((tex.id(), Vec2::splat(17.0)))
+                        .fit_to_exact_size(Vec2::splat(17.0)),
+                );
+            }
 
             ui.label(
                 RichText::new("LUMAGLYPH")
@@ -1737,38 +1751,27 @@ impl LumaGlyphApp {
             Color32::from_rgba_unmultiplied(146, 150, 162, 138)
         };
 
-        // 1. Minimalist geometric frame/glyph mark (recessed vector hairlines, zero images/emojis)
-        let mark_c = Pos2::new(center.x, center.y - 88.0);
-        let half = 21.0_f32;
-        let leg = 8.5_f32;
-        let st = Stroke::new(1.5_f32, watermark_col);
-        for (sx, sy) in [(-1.0_f32, -1.0_f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
-            let corner = Pos2::new(mark_c.x + sx * half, mark_c.y + sy * half);
-            painter.line_segment([corner, Pos2::new(corner.x - sx * leg, corner.y)], st);
-            painter.line_segment([corner, Pos2::new(corner.x, corner.y - sy * leg)], st);
+        // 1. Subtle recessed LG brand watermark (like VS Code's empty-window mark)
+        let mark_c = Pos2::new(center.x, center.y - 90.0);
+        if let Some(tex) = &self.app_logo_tex {
+            let logo_rect = Rect::from_center_size(mark_c, Vec2::splat(64.0));
+            let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+            let tint = if pal.is_light {
+                Color32::from_rgba_unmultiplied(150, 165, 190, 96)
+            } else {
+                Color32::from_rgba_unmultiplied(210, 224, 245, 76)
+            };
+            painter.image(tex.id(), logo_rect, uv, tint);
+        } else {
+            let half = 21.0_f32;
+            let leg = 8.5_f32;
+            let st = Stroke::new(1.5_f32, watermark_col);
+            for (sx, sy) in [(-1.0_f32, -1.0_f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+                let corner = Pos2::new(mark_c.x + sx * half, mark_c.y + sy * half);
+                painter.line_segment([corner, Pos2::new(corner.x - sx * leg, corner.y)], st);
+                painter.line_segment([corner, Pos2::new(corner.x, corner.y - sy * leg)], st);
+            }
         }
-        // Subtle inner diagonal ASCII slash/backslash crosshairs
-        painter.line_segment(
-            [
-                Pos2::new(mark_c.x - 8.5, mark_c.y + 9.5),
-                Pos2::new(mark_c.x - 1.5, mark_c.y - 9.5),
-            ],
-            st,
-        );
-        painter.line_segment(
-            [
-                Pos2::new(mark_c.x + 1.5, mark_c.y - 9.5),
-                Pos2::new(mark_c.x + 8.5, mark_c.y + 9.5),
-            ],
-            st,
-        );
-        painter.line_segment(
-            [
-                Pos2::new(mark_c.x - 6.0, mark_c.y + 3.0),
-                Pos2::new(mark_c.x + 6.0, mark_c.y + 3.0),
-            ],
-            st,
-        );
 
         // Recessed wordmark
         painter.text(
@@ -2670,6 +2673,13 @@ impl LumaGlyphApp {
         let pal = self.palette;
 
         ui.horizontal(|ui| {
+            if let Some(tex) = &self.app_logo_tex {
+                ui.add(
+                    egui::Image::from_texture((tex.id(), Vec2::splat(36.0)))
+                        .fit_to_exact_size(Vec2::splat(36.0)),
+                );
+                ui.add_space(4.0);
+            }
             ui.label(
                 RichText::new("LUMAGLYPH")
                     .font(plex_medium(15.0))
@@ -3289,6 +3299,7 @@ pub fn launch_gui(boot: GuiBootOptions) -> Result<(), String> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("LumaGlyph")
+            .with_icon(crate::icon::eframe_icon_data())
             .with_inner_size([1520.0, 900.0])
             .with_min_inner_size([1024.0, 640.0])
             .with_drag_and_drop(true),

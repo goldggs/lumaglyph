@@ -146,7 +146,7 @@ fn compiled_cli_binary_executes_headless_commands_cleanly() {
     let info_out = Command::new(bin).arg("build-info").output().unwrap();
     assert!(info_out.status.success());
     let info_str = String::from_utf8_lossy(&info_out.stdout);
-    assert!(info_str.contains("LumaGlyph v0.3.4"));
+    assert!(info_str.contains("LumaGlyph v0.3.5"));
 
     let look_out = Command::new(bin).arg("look").output().unwrap();
     assert!(look_out.status.success());

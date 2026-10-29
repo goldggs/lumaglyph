@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/icons/lumaglyph-256.png" width="112" height="112" alt="LumaGlyph Logo" />
+</p>
+
 # LumaGlyph
 
 [![CI](https://github.com/goldggs/lumaglyph/actions/workflows/ci.yml/badge.svg)](https://github.com/goldggs/lumaglyph/actions/workflows/ci.yml)
@@ -8,11 +12,17 @@
 
 Unlike basic 10-character brightness ramps (`@%#*+=-:. `), **LumaGlyph** treats every printable 7-bit ASCII glyph (`0x20..=0x7E`) as 2D geometry. Each font is dynamically calibrated into 32-byte-aligned **8D shape + structure-tensor orientation vectors**, locking `/ \ | _ ( ) [ ] < > ^ ~ , ' ; ! ? $ & % W M # @` directly onto curves, diagonals, silhouettes, and tonal gradients at **500+ FPS** (`< 2 ms/frame`) and **`~7-9 MB` CLI RSS**.
 
-![LumaGlyph v0.3.4 - Fresh Empty Workstation](docs/screenshots/v033-fresh-window.png)
+![LumaGlyph v0.3.5 - Fresh Empty Workstation](docs/screenshots/v033-fresh-window.png)
 
 ---
 
-## New in `v0.3.4` - Fresh Empty Workstation, Normal Reset & Automatic Update-and-Relaunch
+## New in `v0.3.5` - Native Cross-Platform Brand Identity & Multi-OS App Packaging
+
+- **Native Application Icons Across Windows, macOS, and Linux:**
+  - **Windows (`.ico` compiled into `lumaglyph.exe`):** Multi-resolution `lumaglyph.ico` (`16, 24, 32, 48, 64, 128, 256` px 32-bit RGBA) and `VERSIONINFO` metadata (`LumaGlyph`) are embedded directly into `lumaglyph.exe`'s PE `.rsrc` resource section via `build.rs` (verified automatically in CI).
+  - **macOS (`.icns` + `LumaGlyph.app` bundle):** Ships native Apple Icon Image `lumaglyph.icns` (`16` up to `1024` px Retina) inside ready-to-launch `LumaGlyph-macos-{arm64,x86_64}-app.zip` bundles alongside standalone CLI tarballs.
+  - **Linux (`.png` + `.desktop`):** Ships `lumaglyph.desktop` + `512x512` `lumaglyph.png` in `lumaglyph-linux-x86_64-desktop.tar.gz`, while `ViewportBuilder::with_icon` sets the live X11/Wayland/Windows/macOS window, taskbar, and Dock icon at runtime from embedded `256x256` RGBA bytes.
+- **Fresh VS Code-Style Empty Startup, Normal Reset & Automatic Update-and-Relaunch:**
 
 - **Fresh VS Code-Style Empty Startup (Zero Samples Anywhere):**
   - Launching `lumaglyph` opens directly into a calm, uncluttered empty window - slim top menu strip, clean neutral workbench with discrete recessed keybinding hints (`Ctrl+O`, `Ctrl+Shift+O`, `Ctrl+B`, `Ctrl+,` + OS drag-and-drop), and a quiet `Ready` status bar with zero side panels or clutter until media is opened (or `Ctrl+B` toggles the Inspector).

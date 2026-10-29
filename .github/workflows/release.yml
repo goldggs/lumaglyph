@@ -55,7 +55,21 @@ jobs:
           LUMAGLYPH_GITHUB_REPO: ${{ github.repository }}
           BUILD_SPEC: ${{ matrix.spec }}
         run: |
-          import hashlib, os, pathlib, stat, subprocess, sys, tarfile, zipfile
+          import hashlib, os, pathlib, shutil, stat, subprocess, sys, tarfile, tempfile, zipfile
+
+          cargo_toml = pathlib.Path("Cargo.toml").read_text(encoding="utf-8")
+          pkg_version = "0.3.5"
+          for line in cargo_toml.splitlines():
+              if line.strip().startswith("version ="):
+                  pkg_version = line.split('"')[1]
+                  break
+
+          if sys.platform == "darwin":
+              sips_out = subprocess.check_output(
+                  ["sips", "-g", "format", "assets/icons/lumaglyph.icns"], text=True
+              )
+              assert "icns" in sips_out.lower(), f"Invalid macOS .icns asset: {sips_out}"
+              print("Verified macOS Apple Icon Image (assets/icons/lumaglyph.icns) via sips.")
 
           home = pathlib.Path.home()
           workspace = os.environ.get("GITHUB_WORKSPACE", str(pathlib.Path.cwd()))
@@ -94,11 +108,16 @@ jobs:
                   assert data[:2] == b"MZ", "Missing MZ header"
                   pe_off = struct.unpack_from("<I", data, 0x3C)[0]
                   assert data[pe_off:pe_off+4] == b"PE\x00\x00", "Missing PE signature"
-                  subsystem = struct.unpack_from("<H", data, pe_off + 24 + 68)[0]
+                  opt_off = pe_off + 24
+                  subsystem = struct.unpack_from("<H", data, opt_off + 68)[0]
                   if subsystem != 2:
                       print(f"FATAL: Expected IMAGE_SUBSYSTEM_WINDOWS_GUI (2), got {subsystem}", file=sys.stderr)
                       sys.exit(1)
-                  print("Verified Windows PE subsystem = IMAGE_SUBSYSTEM_WINDOWS_GUI (2) — single GUI app, no terminal.")
+                  rsrc_rva, rsrc_size = struct.unpack_from("<II", data, opt_off + 128)
+                  if rsrc_rva == 0 or rsrc_size < 100_000:
+                      print(f"FATAL: Expected embedded PE .rsrc icon table >= 100 KB, got rva={rsrc_rva}, size={rsrc_size}", file=sys.stderr)
+                      sys.exit(1)
+                  print(f"Verified Windows PE subsystem = WINDOWS_GUI (2) and embedded .ico resource section ({rsrc_size} bytes).")
 
               forbidden = [
                   b"/home/runner",
@@ -135,6 +154,45 @@ jobs:
                   f"{digest}  {out_archive.name}\n", encoding="utf-8"
               )
               print(f"Packaged {out_archive} (sha256={digest})")
+
+              if sys.platform == "darwin":
+                  arch_suffix = "arm64" if "aarch64" in target else "x86_64"
+                  app_zip = out_dir / f"LumaGlyph-macos-{arch_suffix}-app.zip"
+                  with tempfile.TemporaryDirectory() as tmpd:
+                      app_root = pathlib.Path(tmpd) / "LumaGlyph.app" / "Contents"
+                      (app_root / "MacOS").mkdir(parents=True)
+                      (app_root / "Resources").mkdir(parents=True)
+                      plist_tpl = pathlib.Path("assets/macos/Info.plist").read_text(encoding="utf-8")
+                      (app_root / "Info.plist").write_text(
+                          plist_tpl.replace("__LUMAGLYPH_VERSION__", pkg_version), encoding="utf-8"
+                      )
+                      shutil.copy2("assets/icons/lumaglyph.icns", app_root / "Resources" / "lumaglyph.icns")
+                      app_bin = app_root / "MacOS" / "lumaglyph"
+                      shutil.copy2(exe, app_bin)
+                      app_bin.chmod(0o755)
+                      with zipfile.ZipFile(app_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                          for p in sorted((pathlib.Path(tmpd) / "LumaGlyph.app").rglob("*")):
+                              if p.is_file():
+                                  zf.write(p, arcname=str(p.relative_to(tmpd)))
+                  app_digest = hashlib.sha256(app_zip.read_bytes()).hexdigest()
+                  (out_dir / f"{app_zip.name}.sha256").write_text(
+                      f"{app_digest}  {app_zip.name}\n", encoding="utf-8"
+                  )
+                  print(f"Packaged macOS .app bundle {app_zip} (sha256={app_digest})")
+
+              if sys.platform.startswith("linux"):
+                  desk_archive = out_dir / f"{artifact}-desktop.tar.gz"
+                  with tarfile.open(desk_archive, "w:gz") as tf:
+                      tf.add(exe, arcname=bin_name)
+                      tf.add("assets/linux/lumaglyph.desktop", arcname="lumaglyph.desktop")
+                      tf.add("assets/icons/lumaglyph-512.png", arcname="lumaglyph.png")
+                      tf.add("LICENSE", arcname="LICENSE")
+                      tf.add("README.md", arcname="README.md")
+                  desk_digest = hashlib.sha256(desk_archive.read_bytes()).hexdigest()
+                  (out_dir / f"{desk_archive.name}.sha256").write_text(
+                      f"{desk_digest}  {desk_archive.name}\n", encoding="utf-8"
+                  )
+                  print(f"Packaged Linux desktop bundle {desk_archive} (sha256={desk_digest})")
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4

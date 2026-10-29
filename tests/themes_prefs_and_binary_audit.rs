@@ -330,3 +330,166 @@ fn workstation_hygiene_no_split_wipe_no_theme_footer_and_normal_defaults() {
         "update"
     ]));
 }
+
+#[test]
+fn windows_ico_container_validates_all_7_resolutions_and_bounds() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let ico = std::fs::read(manifest_dir.join("assets/icons/lumaglyph.ico"))
+        .expect("assets/icons/lumaglyph.ico must exist");
+    assert!(ico.len() > 80_000, "ICO must contain rich 32-bit frames");
+
+    let reserved = u16::from_le_bytes([ico[0], ico[1]]);
+    let ico_type = u16::from_le_bytes([ico[2], ico[3]]);
+    let count = u16::from_le_bytes([ico[4], ico[5]]) as usize;
+    assert_eq!(reserved, 0);
+    assert_eq!(ico_type, 1, "ICO type must be 1 (icon)");
+    assert_eq!(count, 7, "ICO must carry all 7 Windows DPI sizes");
+
+    let expected_sizes: [u32; 7] = [16, 24, 32, 48, 64, 128, 256];
+    let mut cursor_offset = 6 + count * 16;
+
+    for (i, &exp_sz) in expected_sizes.iter().enumerate() {
+        let ent = &ico[6 + i * 16..6 + (i + 1) * 16];
+        let bw = if ent[0] == 0 { 256u32 } else { ent[0] as u32 };
+        let bh = if ent[1] == 0 { 256u32 } else { ent[1] as u32 };
+        let planes = u16::from_le_bytes([ent[4], ent[5]]);
+        let bpp = u16::from_le_bytes([ent[6], ent[7]]);
+        let size = u32::from_le_bytes([ent[8], ent[9], ent[10], ent[11]]) as usize;
+        let offset = u32::from_le_bytes([ent[12], ent[13], ent[14], ent[15]]) as usize;
+
+        assert_eq!((bw, bh), (exp_sz, exp_sz));
+        assert_eq!(planes, 1);
+        assert_eq!(bpp, 32);
+        assert_eq!(offset, cursor_offset, "ICO payloads must pack contiguously");
+        assert!(offset + size <= ico.len());
+
+        let payload = &ico[offset..offset + size];
+        if exp_sz == 256 {
+            assert_eq!(&payload[..8], b"\x89PNG\r\n\x1a\n");
+            let decoded = image::load_from_memory_with_format(payload, image::ImageFormat::Png)
+                .unwrap()
+                .into_rgba8();
+            assert_eq!(decoded.dimensions(), (256, 256));
+        } else {
+            let bi_size = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+            let bi_w = i32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+            let bi_h = i32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]);
+            let bi_planes = u16::from_le_bytes([payload[12], payload[13]]);
+            let bi_bit_count = u16::from_le_bytes([payload[14], payload[15]]);
+            assert_eq!(bi_size, 40);
+            assert_eq!(bi_w, exp_sz as i32);
+            assert_eq!(bi_h, (exp_sz * 2) as i32);
+            assert_eq!(bi_planes, 1);
+            assert_eq!(bi_bit_count, 32);
+        }
+
+        cursor_offset += size;
+    }
+    assert_eq!(cursor_offset, ico.len());
+}
+
+#[test]
+fn macos_icns_container_validates_all_7_ostypes_and_png_payloads() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let icns = std::fs::read(manifest_dir.join("assets/icons/lumaglyph.icns"))
+        .expect("assets/icons/lumaglyph.icns must exist");
+    assert_eq!(&icns[0..4], b"icns");
+    let total_len = u32::from_be_bytes([icns[4], icns[5], icns[6], icns[7]]) as usize;
+    assert_eq!(total_len, icns.len());
+
+    let expected: [(&[u8; 4], u32); 7] = [
+        (b"icp4", 16),
+        (b"icp5", 32),
+        (b"icp6", 64),
+        (b"ic07", 128),
+        (b"ic08", 256),
+        (b"ic09", 512),
+        (b"ic10", 1024),
+    ];
+
+    let mut pos = 8usize;
+    for (ostype, exp_sz) in expected {
+        assert!(pos + 8 <= icns.len());
+        assert_eq!(&icns[pos..pos + 4], ostype);
+        let chunk_len =
+            u32::from_be_bytes([icns[pos + 4], icns[pos + 5], icns[pos + 6], icns[pos + 7]])
+                as usize;
+        assert!(chunk_len > 8 && pos + chunk_len <= icns.len());
+        let png_bytes = &icns[pos + 8..pos + chunk_len];
+        assert_eq!(&png_bytes[..8], b"\x89PNG\r\n\x1a\n");
+        let img = image::load_from_memory_with_format(png_bytes, image::ImageFormat::Png)
+            .unwrap()
+            .into_rgba8();
+        assert_eq!(img.dimensions(), (exp_sz, exp_sz));
+        assert_eq!(
+            img.get_pixel(0, 0)[3],
+            0,
+            "ICNS corners must be transparent"
+        );
+        pos += chunk_len;
+    }
+    assert_eq!(pos, icns.len());
+}
+
+#[test]
+fn master_png_icons_are_metadata_free_rgba_and_exact_dimensions() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for sz in [1024u32, 512, 256, 64, 32] {
+        let p = manifest_dir.join(format!("assets/icons/lumaglyph-{sz}.png"));
+        let raw = std::fs::read(&p).unwrap();
+        assert_eq!(&raw[..8], b"\x89PNG\r\n\x1a\n");
+
+        // Walk raw PNG chunks to ensure zero host/timestamp/EXIF text metadata chunks exist
+        let mut idx = 8usize;
+        while idx + 12 <= raw.len() {
+            let len =
+                u32::from_be_bytes([raw[idx], raw[idx + 1], raw[idx + 2], raw[idx + 3]]) as usize;
+            let ctype = &raw[idx + 4..idx + 8];
+            assert!(
+                ctype != b"tEXt" && ctype != b"zTXt" && ctype != b"iTXt" && ctype != b"eXIf",
+                "Forbidden metadata chunk {:?} in {}",
+                std::str::from_utf8(ctype),
+                p.display()
+            );
+            idx += 12 + len;
+            if ctype == b"IEND" {
+                break;
+            }
+        }
+        assert_eq!(idx, raw.len());
+
+        let img = image::load_from_memory_with_format(&raw, image::ImageFormat::Png)
+            .unwrap()
+            .into_rgba8();
+        assert_eq!(img.dimensions(), (sz, sz));
+        assert_eq!(img.get_pixel(0, 0)[3], 0);
+        assert_eq!(img.get_pixel(sz - 1, 0)[3], 0);
+        assert_eq!(img.get_pixel(0, sz - 1)[3], 0);
+        assert_eq!(img.get_pixel(sz - 1, sz - 1)[3], 0);
+    }
+}
+
+#[test]
+fn runtime_eframe_icon_and_desktop_bundle_manifests_are_valid() {
+    let icon_data = lumaglyph::icon::eframe_icon_data();
+    assert_eq!((icon_data.width, icon_data.height), (256, 256));
+    assert_eq!(icon_data.rgba.len(), 256 * 256 * 4);
+
+    let ui_img = lumaglyph::icon::egui_logo_color_image().expect("UI logo ColorImage must decode");
+    assert_eq!(ui_img.size, [256, 256]);
+
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let desktop =
+        std::fs::read_to_string(manifest_dir.join("assets/linux/lumaglyph.desktop")).unwrap();
+    assert!(desktop.contains("Name=LumaGlyph"));
+    assert!(desktop.contains("Icon=lumaglyph"));
+    assert!(desktop.contains("Terminal=false"));
+
+    let plist = std::fs::read_to_string(manifest_dir.join("assets/macos/Info.plist")).unwrap();
+    assert!(plist.contains("<string>lumaglyph.icns</string>"));
+    assert!(plist.contains("<string>LumaGlyph</string>"));
+
+    let build_rs = std::fs::read_to_string(manifest_dir.join("build.rs")).unwrap();
+    assert!(build_rs.contains("assets/icons/lumaglyph.ico"));
+    assert!(build_rs.contains("compile_for(\"lumaglyph\")"));
+}
