@@ -1986,6 +1986,19 @@ impl LumaGlyphApp {
         let avail = ui.available_rect_before_wrap();
         let (response, painter) = ui.allocate_painter(avail.size(), Sense::click_and_drag());
 
+        // The video transport owns its own docked band beneath the picture, so it can never
+        // cover the bottom rows of the artwork.
+        let has_video = matches!(self.source_kind, SourceKind::VideoFile(_));
+        let transport_h = if has_video && !self.zen_mode {
+            46.0_f32.min(avail.height() * 0.35)
+        } else {
+            0.0
+        };
+        let canvas_avail =
+            Rect::from_min_max(avail.min, Pos2::new(avail.max.x, avail.max.y - transport_h));
+        let transport_band =
+            Rect::from_min_max(Pos2::new(avail.min.x, avail.max.y - transport_h), avail.max);
+
         let surround = if !self.has_media() {
             pal.panel_bg
         } else if self.params.oled_black {
@@ -1993,7 +2006,7 @@ impl LumaGlyphApp {
         } else {
             pal.viewport_bg
         };
-        painter.rect_filled(avail, 0.0, surround);
+        painter.rect_filled(canvas_avail, 0.0, surround);
 
         let dragging_file = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
         if dragging_file {
@@ -2040,24 +2053,28 @@ impl LumaGlyphApp {
         let base_h = self.ascii_px_h as f32;
         if self.auto_fit {
             let pad = 28.0;
-            let sx = ((avail.width() - pad) / base_w).max(0.1);
-            let sy = ((avail.height() - pad) / base_h).max(0.1);
+            let sx = ((canvas_avail.width() - pad) / base_w).max(0.1);
+            let sy = ((canvas_avail.height() - pad) / base_h).max(0.1);
             self.zoom = sx.min(sy);
             self.pan_offset = Vec2::ZERO;
         }
 
         let draw_size = Vec2::new(base_w * self.zoom, base_h * self.zoom);
-        let center = avail.center() + self.pan_offset;
+        let center = canvas_avail.center() + self.pan_offset;
         let dest_rect = Rect::from_center_size(center, draw_size);
 
-        if response.dragged() && !self.auto_fit && !self.timeline_drag {
+        if response.dragged()
+            && !self.auto_fit
+            && !self.timeline_drag
+            && !transport_band.contains(response.interact_pointer_pos().unwrap_or(Pos2::ZERO))
+        {
             self.pan_offset += response.drag_delta();
         }
 
         if self.params.transparent_bg {
             draw_alpha_checkerboard(
                 &painter,
-                dest_rect.intersect(avail),
+                dest_rect.intersect(canvas_avail),
                 self.prefs.checker_contrast,
                 pal.is_light,
             );
@@ -2075,13 +2092,17 @@ impl LumaGlyphApp {
         let uv_full = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
 
         if let Some(ascii_tex) = &self.ascii_tex {
-            painter
-                .with_clip_rect(avail)
-                .image(ascii_tex.id(), dest_rect, uv_full, Color32::WHITE);
+            painter.with_clip_rect(canvas_avail).image(
+                ascii_tex.id(),
+                dest_rect,
+                uv_full,
+                Color32::WHITE,
+            );
         }
 
-        // Video transport lives directly on the video surface, not in a separate toolbar.
-        self.draw_video_transport(ui, &painter, dest_rect, avail);
+        if transport_h > 0.0 {
+            self.draw_video_transport(ui, &painter, transport_band);
+        }
 
         if self.prefs.show_cell_hud {
             if let Some(hover) = response.hover_pos() {
@@ -2107,7 +2128,7 @@ impl LumaGlyphApp {
                     );
                     draw_viewport_tag(
                         &painter,
-                        Pos2::new(avail.left() + 10.0, avail.bottom() - 28.0),
+                        Pos2::new(canvas_avail.left() + 10.0, canvas_avail.bottom() - 28.0),
                         &info,
                     );
                 }
@@ -2127,61 +2148,45 @@ impl LumaGlyphApp {
         }
     }
 
-    /// On-canvas video transport: play/pause directly on the video, a scrubbable timeline,
-    /// and one-click frame export for the exact frame on screen.
-    fn draw_video_transport(
-        &mut self,
-        ui: &mut egui::Ui,
-        painter: &egui::Painter,
-        canvas_rect: Rect,
-        avail: Rect,
-    ) {
-        if !matches!(self.source_kind, SourceKind::VideoFile(_)) {
+    /// Docked video transport strip: sits in its own band directly beneath the video so it
+    /// never covers the picture. Play/pause, 5-second jumps, a scrubbable timeline, a timecode
+    /// readout, and the frame-export menu.
+    fn draw_video_transport(&mut self, ui: &mut egui::Ui, painter: &egui::Painter, band: Rect) {
+        if !matches!(self.source_kind, SourceKind::VideoFile(_)) || band.height() < 20.0 {
             return;
         }
         let pal = self.palette;
 
-        let bar_w = canvas_rect.width().clamp(360.0, 700.0);
-        let bar_h = 40.0;
-        let x0 = canvas_rect.center().x - bar_w * 0.5;
-        let y0 = (canvas_rect.bottom() - bar_h - 14.0)
-            .min(avail.bottom() - bar_h - 10.0)
-            .max(avail.top() + 10.0);
-        let bar = Rect::from_min_size(Pos2::new(x0, y0), Vec2::new(bar_w, bar_h));
-
-        painter.rect_filled(
-            bar,
-            CornerRadius::same(3),
-            Color32::from_rgba_unmultiplied(17, 17, 20, 238),
-        );
-        painter.rect_stroke(
-            bar,
-            CornerRadius::same(3),
-            Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(74, 74, 82, 225)),
-            StrokeKind::Inside,
-        );
-        painter.rect_filled(
-            Rect::from_min_size(bar.left_top(), Vec2::new(bar.width(), 2.0)),
-            0.0,
-            Color32::from_rgba_unmultiplied(96, 96, 106, 90),
+        // Docked strip chrome: flat panel fill plus a single hairline separator above.
+        painter.rect_filled(band, 0.0, pal.panel_bg);
+        painter.line_segment(
+            [
+                Pos2::new(band.left(), band.top() + 0.5),
+                Pos2::new(band.right(), band.top() + 0.5),
+            ],
+            Stroke::new(1.0_f32, pal.border_subtle),
         );
 
-        let icon_col = Color32::from_rgb(226, 228, 234);
-        let dim_col = Color32::from_rgb(196, 200, 210);
+        let bar = Rect::from_min_max(
+            Pos2::new(band.left() + 10.0, band.center().y - 15.0),
+            Pos2::new(band.right() - 10.0, band.center().y + 15.0),
+        );
+        if bar.width() < 240.0 {
+            return;
+        }
         let cy = bar.center().y;
 
-        // Play / pause control drawn as flat geometry (no glyphs, no emoji).
-        let play_rect = Rect::from_center_size(Pos2::new(bar.left() + 22.0, cy), Vec2::splat(26.0));
+        let icon_col = pal.text_primary;
+        let dim_col = pal.text_secondary;
+
+        // ---- Play / pause ----
+        let play_rect = Rect::from_center_size(Pos2::new(bar.left() + 13.0, cy), Vec2::splat(26.0));
         let play_resp = ui
             .interact(play_rect, ui.id().with("video_play_btn"), Sense::click())
             .on_hover_text("Play / Pause (Space)");
         if play_resp.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            painter.rect_filled(
-                play_rect,
-                CornerRadius::same(3),
-                Color32::from_rgba_unmultiplied(48, 48, 54, 220),
-            );
+            painter.rect_filled(play_rect, CornerRadius::same(3), pal.control_hover);
         }
         let paused = match &self.source_kind {
             SourceKind::VideoFile(st) => {
@@ -2190,23 +2195,21 @@ impl LumaGlyphApp {
             }
             _ => true,
         };
+        let c = play_rect.center();
         if paused {
             painter.add(egui::Shape::convex_polygon(
                 vec![
-                    Pos2::new(play_rect.center().x - 4.5, play_rect.center().y - 7.0),
-                    Pos2::new(play_rect.center().x - 4.5, play_rect.center().y + 7.0),
-                    Pos2::new(play_rect.center().x + 7.0, play_rect.center().y),
+                    Pos2::new(c.x - 4.0, c.y - 7.0),
+                    Pos2::new(c.x - 4.0, c.y + 7.0),
+                    Pos2::new(c.x + 7.0, c.y),
                 ],
                 icon_col,
                 Stroke::NONE,
             ));
         } else {
-            for dx in [-5.0f32, 2.0] {
+            for dx in [-4.5f32, 1.5] {
                 painter.rect_filled(
-                    Rect::from_min_size(
-                        Pos2::new(play_rect.center().x + dx, play_rect.center().y - 7.0),
-                        Vec2::new(3.5, 14.0),
-                    ),
+                    Rect::from_min_size(Pos2::new(c.x + dx, c.y - 7.0), Vec2::new(3.5, 14.0)),
                     0.5,
                     icon_col,
                 );
@@ -2218,32 +2221,46 @@ impl LumaGlyphApp {
             }
         }
 
-        // Jump back / forward five seconds.
+        // ---- Jump back / forward 5 seconds ----
+        // Two clean, non-overlapping chevrons per button, mirrored around the button centre.
         let mut jump: Option<f64> = None;
-        for delta in [-5.0f64, 5.0] {
-            let cx = bar.left() + 46.0 + if delta < 0.0 { 0.0 } else { 26.0 };
-            let r = Rect::from_center_size(Pos2::new(cx, cy), Vec2::splat(22.0));
-            let resp = ui.interact(
-                r,
-                ui.id().with(("video_jump", delta as i32)),
-                Sense::click(),
+        let tri_w = 4.0_f32;
+        let tri_h = 5.5_f32;
+        for (idx, delta) in [-5.0f64, 5.0].into_iter().enumerate() {
+            let is_back = delta < 0.0;
+            let btn = Rect::from_center_size(
+                Pos2::new(bar.left() + 48.0 + idx as f32 * 24.0, cy),
+                Vec2::new(22.0, 26.0),
             );
+            let resp = ui
+                .interact(btn, ui.id().with(("video_jump", idx)), Sense::click())
+                .on_hover_text(if is_back {
+                    "Back 5 seconds (Left Arrow)"
+                } else {
+                    "Forward 5 seconds (Right Arrow)"
+                });
             if resp.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                painter.rect_filled(
-                    r,
-                    CornerRadius::same(3),
-                    Color32::from_rgba_unmultiplied(48, 48, 54, 200),
-                );
+                painter.rect_filled(btn, CornerRadius::same(3), pal.control_hover);
             }
-            let dir = if delta < 0.0 { -1.0f32 } else { 1.0 };
-            for k in [0.0f32, 5.0] {
-                let bx = r.center().x - 5.0 + dir * k;
+            // Two chevrons, each `tri_w` wide with `gap` between them, mirrored so the pair is
+            // optically centred in the button and never overlaps itself.
+            let gap = 1.0_f32;
+            let span = 2.0 * tri_w + gap;
+            for i in 0..2 {
+                let shift = i as f32 * (tri_w + gap);
+                let (base, tip) = if is_back {
+                    let right = btn.center().x + span * 0.5 - shift;
+                    (right, right - tri_w)
+                } else {
+                    let left = btn.center().x - span * 0.5 + shift;
+                    (left, left + tri_w)
+                };
                 painter.add(egui::Shape::convex_polygon(
                     vec![
-                        Pos2::new(bx - dir * 3.5, r.center().y - 5.5),
-                        Pos2::new(bx - dir * 3.5, r.center().y + 5.5),
-                        Pos2::new(bx + dir * 2.5, r.center().y),
+                        Pos2::new(base, cy - tri_h),
+                        Pos2::new(base, cy + tri_h),
+                        Pos2::new(tip, cy),
                     ],
                     dim_col,
                     Stroke::NONE,
@@ -2254,10 +2271,10 @@ impl LumaGlyphApp {
             }
         }
 
-        // Export-frame dropdown pinned to the right edge.
-        let export_rect = Rect::from_min_size(
-            Pos2::new(bar.right() - 96.0, bar.center().y - 11.0),
-            Vec2::new(86.0, 22.0),
+        // ---- Frame export menu, right aligned ----
+        let export_rect = Rect::from_min_max(
+            Pos2::new(bar.right() - 92.0, cy - 11.0),
+            Pos2::new(bar.right(), cy + 11.0),
         );
         let mut child = ui.new_child(
             egui::UiBuilder::new()
@@ -2281,64 +2298,59 @@ impl LumaGlyphApp {
             }
         });
 
-        // Timecode readout.
-        let (position, duration, is_paused) = match &self.source_kind {
-            SourceKind::VideoFile(st) => (
-                st.position_secs(),
-                st.duration_secs(),
-                st.paused.load(Ordering::Relaxed),
-            ),
-            _ => (0.0, 0.0, true),
+        // ---- Timecode ----
+        let (position, duration) = match &self.source_kind {
+            SourceKind::VideoFile(st) => (st.position_secs(), st.duration_secs()),
+            _ => (0.0, 0.0),
         };
-        let _ = is_paused;
         let tc = format!(
             "{} / {}",
             format_timecode(position),
             format_timecode(duration)
         );
-        painter.text(
-            Pos2::new(export_rect.left() - 12.0, cy),
-            egui::Align2::RIGHT_CENTER,
-            &tc,
-            mono_font(10.6),
+        let tc_galley = painter.layout_no_wrap(tc, mono_font(10.8), dim_col);
+        let tc_x = export_rect.left() - 14.0;
+        painter.galley(
+            Pos2::new(tc_x - tc_galley.size().x, cy - tc_galley.size().y * 0.5),
+            tc_galley.clone(),
             dim_col,
         );
 
-        // Scrubbable timeline track.
-        let track_left = bar.left() + 100.0;
-        let track_right = export_rect.left() - 118.0;
+        // ---- Scrubbable timeline ----
+        let track_left = bar.left() + 96.0;
+        let track_right = tc_x - tc_galley.size().x - 14.0;
         if track_right > track_left + 40.0 {
             let track = Rect::from_min_max(
                 Pos2::new(track_left, cy - 1.5),
                 Pos2::new(track_right, cy + 1.5),
             );
             let hit = Rect::from_min_max(
-                Pos2::new(track_left - 4.0, cy - 11.0),
-                Pos2::new(track_right + 4.0, cy + 11.0),
+                Pos2::new(track_left - 4.0, cy - 9.0),
+                Pos2::new(track_right + 4.0, cy + 9.0),
             );
             let resp = ui
                 .interact(hit, ui.id().with("video_timeline"), Sense::click_and_drag())
                 .on_hover_text("Drag to scrub through the timeline");
             self.timeline_drag = resp.dragged();
 
-            painter.rect_filled(track, 1.0, Color32::from_rgba_unmultiplied(70, 70, 78, 255));
+            painter.rect_filled(track, 1.0, pal.control_bg);
             let ratio = if duration > 0.0 {
                 (position / duration).clamp(0.0, 1.0) as f32
             } else {
                 0.0
             };
-            let filled = Rect::from_min_max(
-                track.left_top(),
-                Pos2::new(track.left() + track.width() * ratio, track.bottom()),
+            painter.rect_filled(
+                Rect::from_min_max(
+                    track.left_top(),
+                    Pos2::new(track.left() + track.width() * ratio, track.bottom()),
+                ),
+                1.0,
+                pal.accent,
             );
-            painter.rect_filled(filled, 1.0, pal.accent);
             let knob_x = track.left() + track.width() * ratio;
-            painter.circle_filled(Pos2::new(knob_x, cy), 4.0, icon_col);
-            painter.circle_stroke(
-                Pos2::new(knob_x, cy),
-                4.0,
-                Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(20, 20, 24, 200)),
-            );
+            let knob = Pos2::new(knob_x, cy);
+            painter.circle_filled(knob, 4.0, pal.text_primary);
+            painter.circle_stroke(knob, 4.0, Stroke::new(1.0_f32, pal.panel_bg));
 
             if (resp.dragged() || resp.clicked()) && duration > 0.0 {
                 if let Some(p) = resp.interact_pointer_pos() {

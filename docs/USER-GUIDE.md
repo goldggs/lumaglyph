@@ -113,7 +113,8 @@ A single text field that encodes every setting above into one short `lg2:` line.
 
 ## 5. Video playback and frame export
 
-Video controls are drawn **on the video itself**, at the bottom of the picture:
+Video controls live in a **docked strip directly beneath the video**, so they never cover the
+picture:
 
 | Control | What it does |
 | :--- | :--- |
@@ -136,7 +137,7 @@ paused - and grab exactly that frame.
 Scrubbing is instant even in long files because LumaGlyph re-seeks the decoder instead of decoding
 from the beginning.
 
-![Video transport on the canvas](screenshots/v036-video-transport.png)
+![Video transport strip beneath the video](screenshots/v037-video-transport.png)
 
 ---
 

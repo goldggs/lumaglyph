@@ -51,7 +51,7 @@ That is the whole installation. The app opens into a calm empty window - press `
 > screenshots of where to click is in **[docs/INSTALL.md](docs/INSTALL.md)**. You never need a
 > GitHub account, a terminal, or any developer tools to use LumaGlyph.
 
-![LumaGlyph v0.3.6 - Fresh Empty Workstation](docs/screenshots/v036-fresh-window.png)
+![LumaGlyph v0.3.7 - Fresh Empty Workstation](docs/screenshots/v036-fresh-window.png)
 
 ---
 
@@ -66,6 +66,18 @@ That is the whole installation. The app opens into a calm empty window - press `
 | **[5. Building From Source](docs/DEVELOPING.md)** | Compile it, run the tests, or work on the code. |
 
 The same guides are built into the app: press **F1** anywhere, or use the **Help** menu.
+
+---
+
+## New in `v0.3.7` - Docked Video Transport & Cleaner Seek Controls
+
+- **Transport bar moved out of the picture:** the playback strip is now a docked band directly
+  beneath the video with a hairline separator, so it never covers the bottom rows of your artwork.
+  The canvas auto-fits the remaining space, and zoom/pan stay inside the picture area.
+- **Seek buttons redrawn:** the two "jump 5 seconds" chevrons are now a properly centred, evenly
+  spaced pair instead of offset copies (which read as a misaligned shadow).
+- **Transport colours follow the active theme** instead of hardcoded darks, so the bar stays legible
+  on Daylight Paper and other light themes.
 
 ---
 
@@ -99,7 +111,7 @@ The same guides are built into the app: press **F1** anywhere, or use the **Help
 
 ![LumaGlyph settings optimisations tab](docs/screenshots/v036-settings-optimisations.png)
 
-![LumaGlyph on-video transport with timeline and frame export](docs/screenshots/v036-video-transport.png)
+![LumaGlyph docked transport strip with timeline and frame export](docs/screenshots/v037-video-transport.png)
 
 ---
 

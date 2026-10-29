@@ -109,11 +109,11 @@ mod tests {
 
     #[test]
     fn build_metadata_is_populated_and_path_free() {
-        assert_eq!(APP_VERSION, "0.3.6");
+        assert_eq!(APP_VERSION, "0.3.7");
         assert!(!BUILD_GIT_SHA.is_empty());
         assert!(!BUILD_TARGET_TRIPLE.is_empty());
         let report = format_build_report(Some("Test GPU"), Some("ffmpeg 7.1"), "8.0 MB");
-        assert!(report.contains("LumaGlyph v0.3.6"));
+        assert!(report.contains("LumaGlyph v0.3.7"));
         assert!(!report.contains("/home/"));
         assert!(!report.contains("/Users/"));
         assert!(!report.contains("C:\\Users\\"));

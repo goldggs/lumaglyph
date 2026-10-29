@@ -72,7 +72,7 @@ share it with someone else.
 
 Open a video file. The video plays directly on the canvas as live ASCII.
 
-The playback controls sit **on the video itself**:
+The playback controls sit in a **docked strip just beneath the video**:
 
 - Play / pause button on the left, or press **Space**.
 - Two small arrows to jump back / forward 5 seconds.

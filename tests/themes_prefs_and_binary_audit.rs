@@ -733,7 +733,13 @@ fn gui_wires_video_transport_on_canvas_and_docs_entry_points() {
 
     // The transport must be drawn over the canvas, not in the side/status toolbars.
     assert!(gui_src.contains("fn draw_video_transport"));
-    assert!(gui_src.contains("draw_video_transport(ui, &painter, dest_rect, avail)"));
+    // Transport must be docked in its own band beneath the canvas, never drawn over the video.
+    assert!(gui_src.contains("draw_video_transport(ui, &painter, transport_band)"));
+    assert!(gui_src.contains("let transport_band ="));
+    assert!(gui_src.contains("let canvas_avail ="));
+    assert!(!gui_src.contains("draw_video_transport(ui, &painter, dest_rect"));
+    // Seek chevrons must be a centred pair, not offset copies that read as a misaligned shadow.
+    assert!(gui_src.contains("let span = 2.0 * tri_w + gap;"));
     assert!(gui_src.contains("video_timeline"));
     assert!(gui_src.contains("fn export_source_frame_dialog"));
     assert!(gui_src.contains("Source Video Frame (PNG)"));
